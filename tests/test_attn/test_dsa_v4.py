@@ -217,5 +217,74 @@ class TestThreeForms(unittest.TestCase):
         self.assertEqual(kl.item(), 0.0)
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class TestPacked(unittest.TestCase):
+    """Packed THD path: per-segment equivalence and boundary isolation."""
+
+    def _packed_inputs(self, cfg, seg_lens, device):
+        total = sum(seg_lens)
+        x = torch.randn(total, cfg.hidden_size, dtype=torch.bfloat16, device=device)
+        qr = torch.randn(total, cfg.q_lora_rank, dtype=torch.bfloat16, device=device)
+        q = torch.randn(
+            total, cfg.num_heads, cfg.kv_dim, dtype=torch.bfloat16, device=device
+        )
+        kv = torch.randn(total, cfg.kv_dim, dtype=torch.bfloat16, device=device)
+        sink = torch.randn(cfg.num_heads, dtype=torch.float32, device=device)
+        cu = torch.tensor(
+            [0] + list(torch.cumsum(torch.tensor(seg_lens), 0)), dtype=torch.int32
+        )
+        return x, qr, q, kv, sink, cu
+
+    def _check_matches_per_segment(self, ratio, seg_lens):
+        cfg = _make_config(ratio)
+        attn = MagiDSAV4(cfg).cuda().train()
+        x, qr, q, kv, sink, cu = self._packed_inputs(cfg, seg_lens, "cuda")
+        out_packed, kl_packed = attn.forward_packed(x, qr, q, kv, sink, cu)
+
+        bounds = cu.tolist()
+        kl_expected = torch.zeros((), dtype=torch.float32, device=x.device)
+        for start, end in zip(bounds[:-1], bounds[1:]):
+            seg = slice(start, end)
+            out_seg, kl_seg = attn._forward_single(
+                x[seg].unsqueeze(1),
+                qr[seg].unsqueeze(1),
+                q[seg].unsqueeze(1),
+                kv[seg].unsqueeze(1),
+                sink,
+                kl_reduce="sum",
+            )
+            self.assertTrue(
+                torch.equal(out_packed[seg], out_seg.squeeze(1)),
+                f"segment [{start}:{end}] mismatch",
+            )
+            kl_expected = kl_expected + kl_seg
+        kl_expected = kl_expected / sum(seg_lens)
+        self.assertAlmostEqual(kl_packed.item(), kl_expected.item(), places=6)
+
+    def test_packed_equals_per_segment_csa(self):
+        self._check_matches_per_segment(4, [5, 37, 96, 3, 64])
+
+    def test_packed_equals_per_segment_hca(self):
+        self._check_matches_per_segment(128, [130, 96, 300])
+
+    def test_packed_equals_per_segment_window(self):
+        self._check_matches_per_segment(0, [7, 33, 128])
+
+    def test_boundary_isolation(self):
+        # Perturbing sample 0 must not change sample 1's outputs.
+        cfg = _make_config(4)
+        attn = MagiDSAV4(cfg).cuda().eval()
+        seg_lens = [64, 64]
+        x, qr, q, kv, sink, cu = self._packed_inputs(cfg, seg_lens, "cuda")
+        base, _ = attn.forward_packed(x, qr, q, kv, sink, cu)
+        x2 = x.clone()
+        x2[:64] += 1.0
+        kv2 = kv.clone()
+        kv2[:64] += 1.0
+        pert, _ = attn.forward_packed(x2, qr, q, kv2, sink, cu)
+        self.assertTrue(torch.equal(base[64:], pert[64:]))
+        self.assertFalse(torch.equal(base[:64], pert[:64]))
+
+
 if __name__ == "__main__":
     unittest.main()

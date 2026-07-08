@@ -80,6 +80,65 @@ class MagiDSAV4(nn.Module):
 
         Returns (output (sq, b, num_heads * kv_dim), kl_loss scalar).
         """
+        return self._forward_single(x, qr, query, kv, attn_sink, kl_reduce="mean")
+
+    def forward_packed(
+        self,
+        x: torch.Tensor,
+        qr: Optional[torch.Tensor],
+        query: torch.Tensor,
+        kv: torch.Tensor,
+        attn_sink: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Packed variable-length (THD) reference forward.
+
+        All row tensors are flat over ``T = cu_seqlens[-1]`` total tokens:
+        x (T, hidden), qr (T, q_lora_rank), query (T, num_heads, kv_dim),
+        kv (T, kv_dim). ``cu_seqlens`` (B+1,) int are the sample boundaries.
+        Windows, compression blocks, causality and the KL loss never cross
+        a boundary; the KL scalar is token-mean over ALL T query rows,
+        matching the reference global normalization.
+
+        Returns (output (T, num_heads * kv_dim), kl_loss scalar).
+        """
+        bounds = cu_seqlens.tolist()
+        total = x.size(0)
+        assert bounds[-1] == total, "cu_seqlens[-1] must equal total rows"
+
+        outputs = []
+        kl_sum = torch.zeros((), dtype=torch.float32, device=x.device)
+        for start, end in zip(bounds[:-1], bounds[1:]):
+            if end == start:
+                continue
+            seg = slice(start, end)
+            out_seg, kl_seg = self._forward_single(
+                x[seg].unsqueeze(1),
+                qr[seg].unsqueeze(1) if qr is not None else None,
+                query[seg].unsqueeze(1),
+                kv[seg].unsqueeze(1),
+                attn_sink,
+                kl_reduce="sum",
+            )
+            outputs.append(out_seg.squeeze(1))
+            kl_sum = kl_sum + kl_seg
+        kl_loss = kl_sum / max(total, 1)
+        return torch.cat(outputs, dim=0), kl_loss
+
+    def _forward_single(
+        self,
+        x: torch.Tensor,
+        qr: Optional[torch.Tensor],
+        query: torch.Tensor,
+        kv: torch.Tensor,
+        attn_sink: torch.Tensor,
+        kl_reduce: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """One contiguous sample (or an SBHD batch of equal-length rows).
+
+        ``kl_reduce`` selects token-mean (``"mean"``, standalone SBHD call)
+        or row-sum (``"sum"``, packed caller normalizes globally).
+        """
         cfg = self.config
         sq, b = x.size(0), x.size(1)
         device = x.device
@@ -123,7 +182,9 @@ class MagiDSAV4(nn.Module):
                         cfg.indexer_loss_coeff,
                         causal_mask,
                         cfg.use_sparse_loss,
-                        cfg.calculate_per_token_loss,
+                        calculate_per_token_loss=(
+                            kl_reduce == "sum" or cfg.calculate_per_token_loss
+                        ),
                     )
                 else:
                     scores = compute_index_scores(q_idx, w_idx, k_idx) + causal_mask
