@@ -92,19 +92,26 @@ class DSAv4Indexer(nn.Module):
         return self._freqs_cache[:sq]
 
     def forward_before_topk(
-        self, x: torch.Tensor, qr: torch.Tensor
+        self,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        row_offset: int = 0,
+        block_offset: int = 0,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
         """Project detached inputs into indexer Q, compressed K, head weights.
 
-        x: (sq, b, hidden); qr: (sq, b, q_lora_rank).
+        x: (sq, b, hidden); qr: (sq, b, q_lora_rank). ``row_offset`` and
+        ``block_offset`` shift the RoPE positions of Q rows and compressed
+        blocks for context-parallel callers.
         Returns q (sq, b, H, D), k (sq // ratio, b, D) or None, weights (sq, b, H).
         """
         sq, bsz, _ = x.size()
         q = self.linear_wq_b(qr).reshape(sq, bsz, self.n_heads, self.head_dim)
-        q = apply_rope_last_dims(q, self._q_freqs(sq, x.device), self.rope_dim)
+        freqs = self._q_freqs(row_offset + sq, x.device)[row_offset:]
+        q = apply_rope_last_dims(q, freqs, self.rope_dim)
         q = rotate_activation(q)
 
-        k = self.compressor(x)
+        k = self.compressor(x, block_offset=block_offset)
         weights = self.linear_weights_proj(x) * (self.n_heads**-0.5)
         return q, k, weights
 

@@ -100,14 +100,24 @@ class DSAv4Compressor(nn.Module):
         self._freqs_cache: Optional[torch.Tensor] = None
         self._freqs_cache_len: int = 0
 
-    def _compressed_freqs(self, n_compressed: int, device: torch.device) -> torch.Tensor:
-        total = n_compressed * self.ratio
+    def _compressed_freqs(
+        self, n_compressed: int, device: torch.device, block_offset: int = 0
+    ) -> torch.Tensor:
+        """Strided phases for blocks ``block_offset .. block_offset + n - 1``.
+
+        ``block_offset`` is the global id of this rank's first block under
+        context parallelism (0 in the single-rank case).
+        """
+        total = (block_offset + n_compressed) * self.ratio
         if self._freqs_cache is None or self._freqs_cache_len < total:
             self._freqs_cache = build_yarn_freqs(
                 self.rope_dim, total, self.config.yarn, device
             )
             self._freqs_cache_len = total
-        return strided_freqs_for_compressed(self._freqs_cache, n_compressed, self.ratio)
+        strided = strided_freqs_for_compressed(
+            self._freqs_cache, block_offset + n_compressed, self.ratio
+        )
+        return strided[block_offset:]
 
     def _overlap_transform(self, tensor: torch.Tensor, fill_value: float) -> torch.Tensor:
         """[n, ratio, b, coff*d] -> [n, 2*ratio, b, d]; block i's first slots
@@ -119,9 +129,10 @@ class DSAv4Compressor(nn.Module):
         out[1:, :ratio] = tensor[:-1, :, :, :d]
         return out
 
-    def forward(self, x: torch.Tensor) -> Optional[torch.Tensor]:
+    def forward(self, x: torch.Tensor, block_offset: int = 0) -> Optional[torch.Tensor]:
         """SBHD path. ``x``: (sq, b, hidden) -> (sq // ratio, b, head_dim),
-        or None when ``sq < ratio``."""
+        or None when ``sq < ratio``. ``block_offset`` shifts the RoPE block
+        positions for context-parallel callers."""
         sq = x.size(0)
         if sq < self.ratio:
             return None
@@ -147,7 +158,7 @@ class DSAv4Compressor(nn.Module):
         kv = (kv * weights).sum(dim=1)  # [n_compressed, b, head_dim]
         kv = self.norm(kv.to(x.dtype))
 
-        freqs = self._compressed_freqs(n_compressed, x.device)
+        freqs = self._compressed_freqs(n_compressed, x.device, block_offset)
         kv = apply_rope_last_dims(kv, freqs, self.rope_dim)
 
         if self.rotate:
