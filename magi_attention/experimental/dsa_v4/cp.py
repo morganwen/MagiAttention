@@ -172,6 +172,97 @@ class _AllGatherVarCat(torch.autograd.Function):
         return local.to(device=ctx.t_device, dtype=g.dtype), None, None
 
 
+class _AGVarStart(torch.autograd.Function):
+    """Async half 1: launch the padded all-gather, return the raw padded
+    buffer (NOT safe to read until the companion wait). Backward waits for
+    the gradient all-reduce launched by ``_AGVarWait.backward`` and hands
+    each rank its local slice (FP32-accumulated)."""
+
+    @staticmethod
+    def forward(ctx, t: torch.Tensor, counts: tuple, group) -> torch.Tensor:
+        rank = dist.get_rank(group)
+        ws = dist.get_world_size(group)
+        max_n = max(counts) if counts else 0
+        pad = t.new_zeros((max_n - t.size(0), *t.shape[1:]))
+        local = torch.cat([t, pad], dim=0).contiguous()
+        full = t.new_empty((ws * max_n, *t.shape[1:]))
+        work = dist.all_gather_into_tensor(full, local.detach(), group=group, async_op=True)
+
+        holder = {"fwd_work": work}
+        full._magi_holder = holder  # noqa: SLF001 — side channel to the wait op
+        ctx.holder = holder
+        ctx.counts, ctx.rank, ctx.max_n = counts, rank, max_n
+        ctx.t_device, ctx.t_dtype = t.device, t.dtype
+        return full
+
+    @staticmethod
+    def backward(ctx, _g_unused: torch.Tensor):
+        holder = ctx.holder
+        holder["bwd_work"].wait()
+        padded = holder["bwd_padded"]
+        local = padded[ctx.rank * ctx.max_n : ctx.rank * ctx.max_n + ctx.counts[ctx.rank]]
+        return local.to(device=ctx.t_device, dtype=ctx.t_dtype), None, None
+
+
+class _AGVarWait(torch.autograd.Function):
+    """Async half 2: wait the gather, slice per-rank counts, concatenate.
+    Backward launches the FP32 gradient all-reduce asynchronously; the
+    matching ``_AGVarStart.backward`` waits on it."""
+
+    @staticmethod
+    def forward(ctx, full: torch.Tensor, counts: tuple, group) -> torch.Tensor:
+        holder = full._magi_holder
+        holder["fwd_work"].wait()
+        ws = len(counts)
+        max_n = max(counts) if counts else 0
+        pieces = [full[r * max_n : r * max_n + counts[r]] for r in range(ws)]
+        ctx.holder, ctx.counts, ctx.max_n, ctx.group = holder, counts, max_n, group
+        ctx.full_shape, ctx.full_dtype = full.shape, full.dtype
+        return torch.cat(pieces, dim=0)
+
+    @staticmethod
+    def backward(ctx, g: torch.Tensor):
+        counts, max_n = ctx.counts, ctx.max_n
+        starts = [sum(counts[:r]) for r in range(len(counts))]
+        padded = g.new_zeros(
+            (len(counts) * max_n, *g.shape[1:]), dtype=torch.float32
+        )
+        for r, (s0, c) in enumerate(zip(starts, counts)):
+            padded[r * max_n : r * max_n + c] = g[s0 : s0 + c].float()
+        work = dist.all_reduce(padded, op=dist.ReduceOp.SUM, group=ctx.group, async_op=True)
+        ctx.holder["bwd_work"] = work
+        ctx.holder["bwd_padded"] = padded
+        dummy = torch.zeros(ctx.full_shape, dtype=ctx.full_dtype, device=g.device)
+        return dummy, None, None
+
+
+class _GatherHandle:
+    """Uniform handle over the sync one-shot and async sandwich paths."""
+
+    def __init__(self, ready=None, pending=None):
+        self._ready = ready
+        self._pending = pending
+
+    def wait(self) -> torch.Tensor:
+        if self._ready is not None:
+            return self._ready
+        full, counts, group = self._pending
+        return _AGVarWait.apply(full, counts, group)
+
+
+def gather_var_start(t: torch.Tensor, counts, group, use_async: bool) -> _GatherHandle:
+    """Start a variable-count all-gather; ``.wait()`` yields the concat.
+
+    Async only off-gloo and when requested; gloo (the shared-GPU
+    correctness backend) always runs the synchronous one-shot path.
+    """
+    counts = tuple(counts)
+    if use_async and dist.get_backend(group) != "gloo":
+        full = _AGVarStart.apply(t, counts, group)
+        return _GatherHandle(pending=(full, counts, group))
+    return _GatherHandle(ready=_AllGatherVarCat.apply(t, counts, group))
+
+
 class _AllGatherConcat(torch.autograd.Function):
     """All-gather equal-shaped chunks and concatenate on dim 0.
 
@@ -214,65 +305,103 @@ def forward_cp(
     kv: torch.Tensor,
     attn_sink: torch.Tensor,
     group,
+    cuts=None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Context-parallel SBHD forward over one sample.
 
-    Every rank holds an equal contiguous slice of the global sequence;
-    the slice length must be a multiple of the compression block grid
-    (128-aligned covers both ratios). Inputs are the LOCAL rows of
-    x (sq_local, b, hidden), qr, query, kv; RoPE on query/kv is applied
-    globally by the caller as usual. Returns the LOCAL output rows and
-    this rank's share of the KL scalar, normalized by the GLOBAL token
-    count (sum across ranks reproduces the CP=1 scalar).
+    Each rank holds a contiguous slice of the global sequence. ``cuts``
+    (ws + 1 row boundaries, 128-aligned) selects the split; None means the
+    equal split (SequentialDispatch baseline). Inputs are the LOCAL rows;
+    RoPE on query/kv is applied globally by the caller. Returns the LOCAL
+    output rows and this rank's KL share normalized by the GLOBAL token
+    count. With ``config.overlap`` the compressed-stream all-gathers run
+    asynchronously, overlapped with the indexer projections and window
+    index construction.
     """
     cfg = module.config
     rank = dist.get_rank(group)
     ws = dist.get_world_size(group)
     sq_local, b = x.size(0), x.size(1)
     device = x.device
-    global_start = rank * sq_local
-    sq_global = ws * sq_local
+    if cuts is None:
+        cuts = [r * sq_local for r in range(ws + 1)]
+    assert len(cuts) == ws + 1 and cuts[rank + 1] - cuts[rank] == sq_local
+    global_start = cuts[rank]
+    sq_global = cuts[-1]
     ratio = cfg.compress_ratio
     if ratio > 1:
-        assert sq_local % ratio == 0, "CP slice must be block-aligned"
+        for c in cuts:
+            assert c % ratio == 0, "cuts must be block-aligned"
 
     halo = max(cfg.window_size, ratio if ratio > 1 else 1)
+    torch.cuda.nvtx.range_push("dsa_v4.halo")
     kv_halo = _LeftHaloExchange.apply(kv, halo, group)
+    torch.cuda.nvtx.range_pop()
 
     kl_loss = torch.zeros((), dtype=torch.float32, device=device)
 
     def compress_local(compressor, inp, needs_overlap_halo, halo_inp=None):
         block_offset = global_start // ratio
-        if needs_overlap_halo and rank > 0:
+        if needs_overlap_halo and block_offset > 0:
             comp = compressor(
                 torch.cat([halo_inp[-ratio:], inp], dim=0), block_offset=block_offset - 1
             )
             return comp[1:]
         return compressor(inp, block_offset=block_offset)
 
-    comp_global = None
-    n_comp_total = 0
+    comp_h = None
+    k_h = None
+    q_idx = w_idx = None
+    counts = tuple((cuts[r + 1] - cuts[r]) // ratio for r in range(ws)) if ratio > 1 else ()
     if module.compressor is not None:
         x_halo = _LeftHaloExchange.apply(x, ratio, group) if ratio == 4 else None
+        torch.cuda.nvtx.range_push("dsa_v4.compress")
         comp_local = compress_local(module.compressor, x, ratio == 4, x_halo)
+        torch.cuda.nvtx.range_pop()
         if x_halo is not None:
-            # Rank 0 never consumes its (zero) halo, so its backward node
-            # would be pruned and the halo-grad send/recv pairing across
-            # ranks would deadlock. A zero-weight consumption keeps every
-            # rank's autograd comm schedule identical without changing
-            # any value.
+            # Keep every rank's autograd comm schedule identical even when
+            # the halo is unused (rank 0): a pruned backward node deadlocks
+            # the peer's blocking send.
             comp_local = comp_local + x_halo.sum().to(comp_local.dtype) * 0
-        comp_global = _AllGatherConcat.apply(comp_local, group)
-        n_comp_total = comp_global.size(0)
+        torch.cuda.nvtx.range_push("dsa_v4.gather_start")
+        comp_h = gather_var_start(comp_local, counts, group, cfg.overlap)
+        torch.cuda.nvtx.range_pop()
 
-    # ---- window indices in the flat local KV space -----------------------
-    # kv_flat = [halo (halo rows) | local kv (sq_local) | compressed (global)]
+        if module.indexer is not None:
+            x_det = x.detach()
+            qr_det = qr.detach()
+            xh_det = x_halo.detach() if x_halo is not None else None
+            k_local = compress_local(module.indexer.compressor, x_det, ratio == 4, xh_det)
+            k_h = gather_var_start(k_local, counts, group, cfg.overlap)
+
+            # Independent local compute inside the all-gather window.
+            from .compressor import rotate_activation
+            from .rope import apply_rope_last_dims
+
+            torch.cuda.nvtx.range_push("dsa_v4.indexer_proj")
+            q_idx = module.indexer.linear_wq_b(qr_det).reshape(
+                sq_local, b, module.indexer.n_heads, module.indexer.head_dim
+            )
+            freqs = module.indexer._q_freqs(global_start + sq_local, device)[global_start:]
+            q_idx = apply_rope_last_dims(q_idx, freqs, module.indexer.rope_dim)
+            q_idx = rotate_activation(q_idx)
+            w_idx = module.indexer.linear_weights_proj(x_det) * (
+                module.indexer.n_heads**-0.5
+            )
+            torch.cuda.nvtx.range_pop()
+
+    # Window indices are independent of the gathers too.
     rows = torch.arange(sq_local, device=device).unsqueeze(1) + global_start
     cols = torch.arange(cfg.window_size, device=device).unsqueeze(0)
     win_gid = rows - (cfg.window_size - 1) + cols  # global ids
     win_flat = win_gid - (global_start - halo)
     win_flat = torch.where(win_gid < 0, torch.full_like(win_flat, -1), win_flat)
     window_idxs = win_flat.unsqueeze(0).expand(b, -1, -1)
+
+    torch.cuda.nvtx.range_push("dsa_v4.gather_wait")
+    comp_global = comp_h.wait() if comp_h is not None else None
+    torch.cuda.nvtx.range_pop()
+    n_comp_total = comp_global.size(0) if comp_global is not None else 0
 
     if comp_global is not None and n_comp_total > 0:
         comp_offset = halo + sq_local
@@ -281,24 +410,7 @@ def forward_cp(
         ).unsqueeze(1) // ratio  # [sq_local, 1] global visible block count
 
         if module.indexer is not None:
-            x_det = x.detach()
-            qr_det = qr.detach()
-            xh_det = x_halo.detach() if x_halo is not None else None
-            q_idx = module.indexer.linear_wq_b(qr_det).reshape(
-                sq_local, b, module.indexer.n_heads, module.indexer.head_dim
-            )
-            from .compressor import rotate_activation
-            from .rope import apply_rope_last_dims
-
-            freqs = module.indexer._q_freqs(global_start + sq_local, device)[global_start:]
-            q_idx = apply_rope_last_dims(q_idx, freqs, module.indexer.rope_dim)
-            q_idx = rotate_activation(q_idx)
-            k_local = compress_local(module.indexer.compressor, x_det, ratio == 4, xh_det)
-            k_global = _AllGatherConcat.apply(k_local, group)
-            w_idx = module.indexer.linear_weights_proj(x_det) * (
-                module.indexer.n_heads**-0.5
-            )
-
+            k_global = k_h.wait()
             mask_cols = torch.arange(n_comp_total, device=device).unsqueeze(0)
             causal_mask = (
                 torch.where(mask_cols >= visible, float("-inf"), 0.0)
@@ -371,20 +483,13 @@ def forward_cp(
         kv_flat = torch.cat([kv_halo, kv], dim=0)
         topk_idxs = window_idxs
 
-    if cfg.backend == "kernel":
-        from .kernels import sparse_attn_with_sink_kernel
-
-        output = sparse_attn_with_sink_kernel(
-            query, kv_flat, attn_sink.float(), topk_idxs.int(), cfg.softmax_scale
-        )
-    else:
-        output = sparse_attn_with_sink(
-            query, kv_flat, attn_sink.float(), topk_idxs.int(), cfg.softmax_scale
-        )
+    torch.cuda.nvtx.range_push("dsa_v4.sparse_attention")
+    output = MagiDSAV4._run_attention(query, kv_flat, attn_sink, topk_idxs, cfg)
+    torch.cuda.nvtx.range_pop()
     return output, kl_loss
 
 
-def _plan_packed_cp(bounds, sq_local, ws, ratio):
+def _plan_packed_cp(bounds, cuts, ws, ratio):
     """Host-side plan shared by every rank: per-sample block layout and
     per-rank block ownership (a block belongs to the rank holding its last
     token). Returns (sample_block_offset, per-rank counts, per-rank list of
@@ -398,13 +503,15 @@ def _plan_packed_cp(bounds, sq_local, ws, ratio):
         n_blocks.append(nb)
         acc += nb
 
+    import bisect
+
     counts = [0] * ws
     runs = [[] for _ in range(ws)]
     for s in range(len(bounds) - 1):
         S = bounds[s]
         for j in range(n_blocks[s]):
             last = S + (j + 1) * ratio - 1
-            r = min(ws - 1, last // sq_local)
+            r = min(ws - 1, bisect.bisect_right(cuts, last) - 1)
             counts[r] += 1
             if runs[r] and runs[r][-1][0] == s and runs[r][-1][2] == j - 1:
                 runs[r][-1] = (s, runs[r][-1][1], j)
@@ -422,6 +529,7 @@ def forward_cp_packed(
     attn_sink: torch.Tensor,
     cu_seqlens: torch.Tensor,
     group,
+    cuts=None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Context-parallel forward over a packed variable-length batch.
 
@@ -441,14 +549,19 @@ def forward_cp_packed(
     ws = dist.get_world_size(group)
     sq_local = x.size(0)
     device = x.device
-    start = rank * sq_local
     bounds = cu_seqlens.tolist()
     total = bounds[-1]
-    assert total == ws * sq_local, "global rows must equal ws * sq_local"
+    if cuts is None:
+        cuts = [r * (total // ws) for r in range(ws)] + [total]
+    assert len(cuts) == ws + 1 and cuts[-1] == total
+    start = cuts[rank]
+    assert cuts[rank + 1] - start == sq_local, "local rows must match this rank's cut"
     ratio = cfg.compress_ratio
 
     halo = max(cfg.window_size, 2 * ratio if ratio > 1 else 1)
+    torch.cuda.nvtx.range_push("dsa_v4p.halo")
     kv_halo = _LeftHaloExchange.apply(kv.unsqueeze(1), halo, group).squeeze(1)
+    torch.cuda.nvtx.range_pop()
 
     kl_loss = torch.zeros((), dtype=torch.float32, device=device)
 
@@ -471,7 +584,7 @@ def forward_cp_packed(
     n_comp_total = 0
     if module.compressor is not None:
         sample_block_offset, counts, runs = _plan_packed_cp(
-            bounds, sq_local, ws, ratio
+            bounds, cuts, ws, ratio
         )
         n_comp_total = sum(counts)
 
@@ -496,9 +609,22 @@ def forward_cp_packed(
                 return torch.cat(pieces, dim=0)
             return src.new_zeros((0, 1, compressor.head_dim))
 
+        torch.cuda.nvtx.range_push("dsa_v4p.compress")
         comp_local = run_compressor(module.compressor, x_ext, detached=False)
         comp_local = comp_local + x_halo.sum().to(comp_local.dtype) * 0
-        comp_global = _AllGatherVarCat.apply(comp_local, tuple(counts), group)
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("dsa_v4p.gather_start")
+        comp_h = gather_var_start(comp_local, counts, group, cfg.overlap)
+        k_h = None
+        if module.indexer is not None:
+            k_local_early = run_compressor(
+                module.indexer.compressor, x_ext, detached=True
+            )
+            k_h = gather_var_start(k_local_early, counts, group, cfg.overlap)
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("dsa_v4p.gather_wait")
+        comp_global = comp_h.wait()
+        torch.cuda.nvtx.range_pop()
 
     if comp_global is not None and n_comp_total > 0:
         comp_base = halo + sq_local
@@ -506,9 +632,9 @@ def forward_cp_packed(
             (sq_local, max(cfg.topk, 1)), -1, dtype=torch.long, device=device
         )
         if module.indexer is not None:
-            k_local = run_compressor(module.indexer.compressor, x_ext, detached=True)
-            k_global = _AllGatherVarCat.apply(k_local, tuple(counts), group)
+            k_global = k_h.wait()
             kl_sum = torch.zeros((), dtype=torch.float32, device=device)
+            torch.cuda.nvtx.range_push("dsa_v4p.indexer_fragments")
 
             frag_bounds = sorted(
                 set([start, start + sq_local] + [b for b in bounds if start < b < start + sq_local])
@@ -576,6 +702,7 @@ def forward_cp_packed(
                     torch.full_like(ids, -1),
                 )
                 compress_idxs[sl, : flat.size(1)] = flat
+            torch.cuda.nvtx.range_pop()
             kl_loss = kl_sum / total
         else:
             widths = []
@@ -614,6 +741,7 @@ def forward_cp_packed(
         kv_flat = torch.cat([kv_halo, kv], dim=0)
         topk_idxs = window_idxs
 
+    torch.cuda.nvtx.range_push("dsa_v4p.sparse_attention")
     output = MagiDSAV4._run_attention(
         query.unsqueeze(1),
         kv_flat.unsqueeze(1),
@@ -621,4 +749,5 @@ def forward_cp_packed(
         topk_idxs,
         cfg,
     )
+    torch.cuda.nvtx.range_pop()
     return output.squeeze(1), kl_loss

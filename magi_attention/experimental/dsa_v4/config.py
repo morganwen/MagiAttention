@@ -83,6 +83,12 @@ class MagiDSAV4Config:
     # Backend selection: reference is the pure-PyTorch path.
     backend: Literal["reference", "kernel"] = "reference"
 
+    # Context-parallel comm/compute overlap: launch the compressed-stream
+    # all-gathers asynchronously and overlap them with independent local
+    # compute (indexer projections, window index construction). Gloo stays
+    # synchronous regardless (correctness backend).
+    overlap: bool = False
+
     # Numerics.
     params_dtype: Optional[str] = "bfloat16"
 
