@@ -426,19 +426,20 @@ def forward_cp(
                     q_idx, k_global, w_idx, cfg.topk, ratio, pos_offset=global_start
                 ).long()
                 if module.training and torch.is_grad_enabled():
-                    kl_sum = indexer_kl_loss_selected(
+                    from .kernels import indexer_kl_loss_kernel
+
+                    kl_loss = indexer_kl_loss_kernel(
                         topk_indices,
                         q_idx,
                         w_idx,
                         k_global,
-                        query.detach(),
-                        comp_global.detach(),
+                        query,
+                        comp_global,
                         cfg.softmax_scale,
                         module.indexer.softmax_scale,
                         cfg.indexer_loss_coeff,
-                        calculate_per_token_loss=True,
+                        total_global=sq_global,
                     )
-                    kl_loss = kl_sum / sq_global
             elif module.training and torch.is_grad_enabled():
                 scores = compute_index_scores(
                     q_idx, w_idx * module.indexer.softmax_scale, k_global
@@ -680,22 +681,42 @@ def forward_cp_packed(
                 ).clamp(max=nb)
                 ok = (ids >= 0) & (ids < vis)
                 if module.training and torch.is_grad_enabled():
-                    from .reference import indexer_kl_loss_selected
+                    ids_masked = torch.where(
+                        ok, ids, torch.full_like(ids, -1)
+                    ).unsqueeze(0)
+                    comp_s = comp_global[
+                        sample_block_offset[s] : sample_block_offset[s] + nb
+                    ]
+                    if cfg.backend == "kernel":
+                        from .kernels import indexer_kl_loss_kernel
 
-                    kl_sum = kl_sum + indexer_kl_loss_selected(
-                        torch.where(ok, ids, torch.full_like(ids, -1)).unsqueeze(0),
-                        q_i,
-                        w_i,
-                        k_s,
-                        query[sl].detach().unsqueeze(1),
-                        comp_global[
-                            sample_block_offset[s] : sample_block_offset[s] + nb
-                        ].detach(),
-                        cfg.softmax_scale,
-                        module.indexer.softmax_scale,
-                        cfg.indexer_loss_coeff,
-                        calculate_per_token_loss=True,
-                    )
+                        kl_sum = kl_sum + indexer_kl_loss_kernel(
+                            ids_masked,
+                            q_i,
+                            w_i,
+                            k_s,
+                            query[sl].unsqueeze(1),
+                            comp_s,
+                            cfg.softmax_scale,
+                            module.indexer.softmax_scale,
+                            cfg.indexer_loss_coeff,
+                            total_global=1,
+                        )
+                    else:
+                        from .reference import indexer_kl_loss_selected
+
+                        kl_sum = kl_sum + indexer_kl_loss_selected(
+                            ids_masked,
+                            q_i,
+                            w_i,
+                            k_s,
+                            query[sl].detach().unsqueeze(1),
+                            comp_s.detach(),
+                            cfg.softmax_scale,
+                            module.indexer.softmax_scale,
+                            cfg.indexer_loss_coeff,
+                            calculate_per_token_loss=True,
+                        )
                 flat = torch.where(
                     ok,
                     ids + sample_block_offset[s] + comp_base,

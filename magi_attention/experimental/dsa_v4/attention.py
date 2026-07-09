@@ -170,18 +170,22 @@ class MagiDSAV4(nn.Module):
                         q_idx, k_idx, w_idx, cfg.topk, cfg.compress_ratio
                     ).long()
                     if self.training and torch.is_grad_enabled():
-                        kl_loss = indexer_kl_loss_selected(
+                        from .kernels import indexer_kl_loss_kernel
+
+                        kl_loss = indexer_kl_loss_kernel(
                             topk_indices,
                             q_idx,
                             w_idx,
                             k_idx,
-                            query.detach(),
-                            compressed_kv.detach(),
+                            query,
+                            compressed_kv,
                             cfg.softmax_scale,
                             self.indexer.softmax_scale,
                             cfg.indexer_loss_coeff,
-                            calculate_per_token_loss=(
-                                kl_reduce == "sum" or cfg.calculate_per_token_loss
+                            total_global=(
+                                1
+                                if (kl_reduce == "sum" or cfg.calculate_per_token_loss)
+                                else sq * b
                             ),
                         )
                     compress_idxs = validate_and_offset_topk(

@@ -203,3 +203,141 @@ def sparse_attn_with_sink_kernel(
         q_flat, kv_flat, attn_sink.float(), idx_flat, softmax_scale
     )  # (sq, np, d_v)
     return out.reshape(sq, 1, -1)
+
+
+class _KernelIndexerKL(torch.autograd.Function):
+    """Selected-columns indexer KL with a fully analytic kernel backward.
+
+    Forward runs entirely under no_grad — the torch target (detached trunk)
+    plus cuDNN's sparse_indexer_score_recompute for the predict — so no
+    autograd graph (and no gather scatter-add backward, the profiled 60%
+    hotspot) is ever built. Backward scales gradients precomputed by
+    cuDNN's indexer_backward_wrapper: d_index_q / d_weights / d_index_k in
+    one kernel, mirroring the Megatron Path C recipe.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        q_idx: torch.Tensor,  # (sq, 1, H, D) bf16, differentiable
+        w_idx: torch.Tensor,  # (sq, 1, H) bf16, RAW (unscaled), differentiable
+        k_global: torch.Tensor,  # (skc, 1, D) bf16, differentiable
+        query_det: torch.Tensor,  # (sq, 1, np, hn) detached
+        comp_det: torch.Tensor,  # (skc, 1, hn) detached
+        topk_indices: torch.Tensor,  # (1, sq, K) long, -1 invalid
+        softmax_scale: float,
+        indexer_scale: float,
+        loss_coeff: float,
+        total_global: int,
+    ) -> torch.Tensor:
+        dsa = _ensure_dsa()
+        sq = q_idx.size(0)
+        skc = k_global.size(0)
+
+        with torch.no_grad():
+            idxs = topk_indices.to(torch.int32)
+            # Pad the selected width to the kernel block (128) with -1.
+            k_in = idxs.size(-1)
+            k_pad = max(128, (k_in + 127) // 128 * 128)
+            if k_pad != k_in:
+                idxs = torch.nn.functional.pad(idxs, (0, k_pad - k_in), value=-1)
+            idxs = idxs.contiguous()  # (1, sq, K)
+            valid = idxs >= 0
+            safe = idxs.clamp(min=0).long()
+
+            # predict probabilities at selected columns (cuDNN recompute).
+            w_scaled = (w_idx.float() * indexer_scale).to(w_idx.dtype)
+            predict = dsa.sparse_indexer_score_recompute_wrapper(
+                q_idx.permute(1, 0, 2, 3).contiguous(),  # (1, sq, H, D)
+                k_global.permute(1, 0, 2).contiguous(),  # (1, skc, D)
+                w_scaled.permute(1, 0, 2).contiguous(),  # (1, sq, H)
+                idxs,
+                qhead_per_kv_head=q_idx.size(2),
+                topk_indices_global=True,
+            )["predict"].view(1, sq, idxs.size(-1))
+
+            # target probabilities: per-head softmax over the selected set,
+            # head-summed, L1-normalized (identical math to the reference).
+            ckv_sel = comp_det.permute(1, 0, 2)[
+                torch.zeros(1, 1, 1, dtype=torch.long, device=idxs.device), safe
+            ]  # (1, sq, K, hn)
+            q_f = query_det.permute(1, 0, 2, 3).float()  # (1, sq, np, hn)
+            t = torch.einsum("bqnh,bqkh->bqnk", q_f, ckv_sel.float()) * softmax_scale
+            row_has = valid.any(dim=-1, keepdim=True)
+            t = t.masked_fill(~valid.unsqueeze(2), float("-inf"))
+            t = t.masked_fill(~row_has.unsqueeze(2), 0.0)
+            target = (
+                torch.softmax(t, dim=-1, dtype=torch.float32)
+                * row_has.unsqueeze(2).float()
+            ).sum(dim=2)
+            target = target / target.sum(dim=-1, keepdim=True).clamp(min=1e-10)
+
+            pred_f = predict.float().clamp(min=0)
+            kl = target * (
+                torch.log(target + 1e-10) - torch.log(pred_f + 1e-10)
+            )
+            kl = torch.where(valid, kl, torch.zeros_like(kl))
+            loss = kl.sum() * (loss_coeff / total_global)
+
+            # Precompute indexer gradients at unit upstream grad; backward
+            # only scales. The kernel consumes scores in-place: clone.
+            ig = dsa.indexer_backward_wrapper(
+                q_idx.permute(1, 0, 2, 3).contiguous(),
+                w_idx.permute(1, 0, 2).contiguous(),  # RAW weights
+                k_global.permute(1, 0, 2).contiguous(),
+                target.clone().contiguous(),
+                pred_f.clone().contiguous(),
+                idxs,
+                grad_loss=torch.ones((), device=q_idx.device, dtype=torch.float32),
+                sm_scale=indexer_scale,
+                loss_coeff=loss_coeff * sq / total_global,
+                topk_indices_global=True,
+            )
+            dq = ig["d_index_q"].view(1, sq, q_idx.size(2), q_idx.size(3))
+            dw = ig["d_weights"].view(1, sq, q_idx.size(2))
+            dk = ig["d_index_k"].view(1, skc, k_global.size(2))
+
+        ctx.save_for_backward(dq, dw, dk)
+        ctx.shapes = (q_idx.shape, w_idx.shape, k_global.shape)
+        return loss
+
+    @staticmethod
+    def backward(ctx, d_kl: torch.Tensor):
+        dq, dw, dk = ctx.saved_tensors
+        qs, ws_, ks = ctx.shapes
+        gq = (dq * d_kl).permute(1, 0, 2, 3).reshape(qs).to(torch.bfloat16)
+        gw = (dw * d_kl).permute(1, 0, 2).reshape(ws_).to(torch.bfloat16)
+        gk = (dk * d_kl).permute(1, 0, 2).reshape(ks).to(torch.bfloat16)
+        return gq, gw, gk, None, None, None, None, None, None, None
+
+
+def indexer_kl_loss_kernel(
+    topk_indices: torch.Tensor,
+    q_idx: torch.Tensor,
+    w_idx: torch.Tensor,
+    k_idx: torch.Tensor,
+    query: torch.Tensor,
+    compressed_kv: torch.Tensor,
+    softmax_scale: float,
+    indexer_scale: float,
+    loss_coeff: float,
+    total_global: int,
+) -> torch.Tensor:
+    """Kernel-path drop-in for ``indexer_kl_loss_selected`` (b == 1).
+
+    Returns the KL SUM-over-rows normalized by ``total_global`` (the CP
+    global token count; pass local rows for the single-device token-mean).
+    """
+    assert q_idx.size(1) == 1, "kernel KL path requires batch 1"
+    return _KernelIndexerKL.apply(
+        q_idx,
+        w_idx,
+        k_idx,
+        query.detach(),
+        compressed_kv.detach(),
+        topk_indices,
+        softmax_scale,
+        indexer_scale,
+        loss_coeff,
+        total_global,
+    )
