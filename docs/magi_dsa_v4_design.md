@@ -7,7 +7,7 @@
 
 - compressor 输入口径：吃 hidden，不吃投影后的 KV。参考实现 Compressor 的内容投影和门控投影都是 hidden_size 到 coff 乘 head_dim（csa.py:852、:866），主压缩流与 indexer 压缩流都从 hidden 出发。Magi_DSA 照此办理，config 携带 hidden_size。
 - indexer 输入口径，对 AGENTS.md 的一处契约修正：indexer 的 Qi、Ki、Weights 都不是外部输入，而是 runtime 内部投影生成。参考实现 CSAIndexer 持有 wq_b（q_lora_rank 到 64 乘 128）、weights_proj（hidden 到 64）和自己的 rotate 压缩器（csa.py:1191 起），输入是 hidden x 和 q 的 latent qr。Magi_DSA 的 API 输入相应为 x 与 qr，indexer 参数归 runtime 所有，梯度经 autograd 落在自有参数上，对外返回 dx、dqr。此修正待用户确认后回写 AGENTS.md。
-- sink 梯度路径：sink 等价于一条 value 为零向量的额外注意力条目。设 p_sink 为它的注意力概率，d_sink 对每个头 h 为对所有 query 求和的 −p_sink(q,h) 乘 dO(q,h) 点乘 O(q,h)。reference 路径由 autograd 自动产生；kernel 路径若 cudnn-fe 不产 d_sink，wrapper 用保存的 LSE 求 p_sink = exp(sink − lse_total) 按上式补算。两条路径都要过 sink 专项验收。
+- sink 梯度路径，已实测关闭：cudnn-fe 的 sparse_attention_backward_wrapper 原生返回 d_sink，在 V4-Flash 真实维度上与 autograd 对拍通过，无需 LSE 补算。理论备忘：sink 等价于一条 value 为零向量的额外注意力条目，d_sink 对每个头 h 为对所有 query 求和的 −p_sink(q,h) 乘 dO(q,h) 点乘 O(q,h)，补算公式留作交叉校验用。
 - KL 精确口径，逐项对齐参考实现 compute_dsa_indexer_loss（dsa.py:231）：
   - predict 是 index_scores 的 softmax。index_scores 等于对 head 求和的 weights 乘 relu(Qi 点乘 Ki)，fp32（dsa.py:_compute_index_scores）。进 KL 前 weights 额外乘 indexer softmax_scale，即 index_head_dim 的负二分之一次方（csa.py:1591）。top-k 选择用不乘 scale 的分数，因缩放不改变排序。
   - target 是主注意力分数的逐头 softmax：q 点乘压缩 KV 乘主 softmax_scale，压缩条按块级因果掩码，逐头 softmax 后对头求和再 L1 归一。
