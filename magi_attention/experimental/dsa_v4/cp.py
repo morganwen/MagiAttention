@@ -52,6 +52,12 @@ def _next_tag() -> int:
     return _HALO_TAG[0]
 
 
+def _wire_tag(group, tag: int) -> int:
+    """gloo matches by explicit tag; NCCL does not support tags and its P2P
+    is stream-ordered FIFO per pair, so ordering alone is sufficient there."""
+    return tag if dist.get_backend(group) == "gloo" else 0
+
+
 class _LeftHaloExchange(torch.autograd.Function):
     """Each rank receives the last ``h`` rows of its left neighbor.
 
@@ -77,14 +83,14 @@ class _LeftHaloExchange(torch.autograd.Function):
                     _stage_for_comm(x[-h:], group),
                     dist.get_global_rank(group, rank + 1),
                     group=group,
-                    tag=tag,
+                    tag=_wire_tag(group, tag),
                 )
 
         def do_recv():
             if rank > 0:
                 buf = _stage_for_comm(halo, group)
                 dist.recv(
-                    buf, dist.get_global_rank(group, rank - 1), group=group, tag=tag
+                    buf, dist.get_global_rank(group, rank - 1), group=group, tag=_wire_tag(group, tag)
                 )
                 halo.copy_(buf.to(device=x.device, dtype=x.dtype))
 
@@ -106,14 +112,14 @@ class _LeftHaloExchange(torch.autograd.Function):
                     _stage_for_comm(g_halo, group),
                     dist.get_global_rank(group, rank - 1),
                     group=group,
-                    tag=tag,
+                    tag=_wire_tag(group, tag),
                 )
 
         def do_recv():
             if rank + 1 < ws:
                 buf = _stage_for_comm(grad_x[-h:], group)
                 dist.recv(
-                    buf, dist.get_global_rank(group, rank + 1), group=group, tag=tag
+                    buf, dist.get_global_rank(group, rank + 1), group=group, tag=_wire_tag(group, tag)
                 )
                 grad_x[-h:] = buf.to(device=ctx.x_device, dtype=g_halo.dtype)
 
@@ -302,7 +308,14 @@ def forward_cp(
         kv_flat = torch.cat([kv_halo, kv], dim=0)
         topk_idxs = window_idxs
 
-    output = sparse_attn_with_sink(
-        query, kv_flat, attn_sink.float(), topk_idxs.int(), cfg.softmax_scale
-    )
+    if cfg.backend == "kernel":
+        from .kernels import sparse_attn_with_sink_kernel
+
+        output = sparse_attn_with_sink_kernel(
+            query, kv_flat, attn_sink.float(), topk_idxs.int(), cfg.softmax_scale
+        )
+    else:
+        output = sparse_attn_with_sink(
+            query, kv_flat, attn_sink.float(), topk_idxs.int(), cfg.softmax_scale
+        )
     return output, kl_loss

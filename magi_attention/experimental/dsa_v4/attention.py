@@ -202,7 +202,14 @@ class MagiDSAV4(nn.Module):
             kv_full = kv
             topk_idxs = window_idxs
 
-        output = sparse_attn_with_sink(
-            query, kv_full, attn_sink.float(), topk_idxs.int(), cfg.softmax_scale
-        )
+        if cfg.backend == "kernel":
+            from .kernels import sparse_attn_with_sink_kernel
+
+            output = sparse_attn_with_sink_kernel(
+                query, kv_full, attn_sink.float(), topk_idxs.int(), cfg.softmax_scale
+            )
+        else:
+            output = sparse_attn_with_sink(
+                query, kv_full, attn_sink.float(), topk_idxs.int(), cfg.softmax_scale
+            )
         return output, kl_loss
