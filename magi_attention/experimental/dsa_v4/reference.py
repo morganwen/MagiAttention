@@ -163,14 +163,70 @@ def validate_and_offset_topk(
 ) -> torch.Tensor:
     """Reject causally-invalid selections and shift into the flat KV space.
 
-    topk_indices (b, sq, k) block ids; a selection at query position i is
-    valid only if id < (i + 1) // ratio. Invalid slots become -1.
+    topk_indices (b, sq, k) block ids (may carry -1 padding from the kernel
+    selector); a selection at query position i is valid only if
+    0 <= id < (i + 1) // ratio. Invalid slots become -1.
     """
     sq = topk_indices.size(1)
     n_valid = (
         torch.arange(1, sq + 1, device=topk_indices.device).unsqueeze(1) // ratio
     )  # [sq, 1]
-    valid = topk_indices < n_valid.unsqueeze(0)
+    valid = (topk_indices >= 0) & (topk_indices < n_valid.unsqueeze(0))
     return torch.where(
         valid, topk_indices + offset, torch.full_like(topk_indices, -1)
     )
+
+
+def indexer_kl_loss_selected(
+    topk_indices: torch.Tensor,
+    q_idx: torch.Tensor,
+    w_idx: torch.Tensor,
+    k_idx: torch.Tensor,
+    query: torch.Tensor,
+    compressed_kv: torch.Tensor,
+    softmax_scale: float,
+    indexer_scale: float,
+    loss_coeff: float,
+    calculate_per_token_loss: bool = False,
+) -> torch.Tensor:
+    """KL loss restricted to the selected columns (sparse-loss semantics).
+
+    Mathematically identical to ``indexer_kl_loss`` with ``sparse_loss=True``
+    — a softmax over -inf-masked columns equals a softmax over the selected
+    set — but never materializes the dense (sq, n_compressed) matrices. Used
+    with the kernel selector, whose indices are stop-gradient; the predict
+    logits are recomputed differentiably at the selected columns only.
+
+    topk_indices (b, sq, k) LOCAL block ids, -1 invalid. q_idx (sq, b, H, D),
+    w_idx (sq, b, H), k_idx (sk, b, D): differentiable indexer projections.
+    query (sq, b, np, hn) and compressed_kv (sk, b, hn) must be detached.
+    """
+    b = query.size(1)
+    valid = topk_indices >= 0
+    safe = topk_indices.clamp(min=0).long()
+    batch = torch.arange(b, device=query.device).view(b, 1, 1)
+
+    k_sel = k_idx.permute(1, 0, 2)[batch, safe]  # (b, sq, k, D)
+    q_b = q_idx.permute(1, 0, 2, 3).float()  # (b, sq, H, D)
+    s = torch.relu(torch.einsum("bqhd,bqkd->bqhk", q_b, k_sel.float()))
+    s = s * (w_idx.permute(1, 0, 2).float() * indexer_scale).unsqueeze(-1)
+    pred_logits = s.sum(dim=2)  # (b, sq, k)
+
+    row_has = valid.any(dim=-1, keepdim=True)  # (b, sq, 1)
+    pred_logits = pred_logits.masked_fill(~valid, float("-inf"))
+    pred_logits = pred_logits.masked_fill(~row_has, 0.0)
+    predict = torch.softmax(pred_logits, dim=-1, dtype=torch.float32) * row_has.float()
+
+    ckv_sel = compressed_kv.permute(1, 0, 2)[batch, safe]  # (b, sq, k, hn)
+    q_f = query.permute(1, 0, 2, 3).float()  # (b, sq, np, hn)
+    t = torch.einsum("bqnh,bqkh->bqnk", q_f, ckv_sel.float()) * softmax_scale
+    t = t.masked_fill(~valid.unsqueeze(2), float("-inf"))
+    t = t.masked_fill(~row_has.unsqueeze(2), 0.0)
+    target = torch.softmax(t, dim=-1, dtype=torch.float32) * row_has.unsqueeze(2).float()
+    target = target.sum(dim=2)  # (b, sq, k)
+    target = target / target.sum(dim=-1, keepdim=True).clamp(min=1e-10)
+
+    kl = target * (torch.log(target + 1e-10) - torch.log(predict + 1e-10))
+    kl_per_row = kl.sum(dim=-1)
+    kl_div = kl_per_row.sum() if calculate_per_token_loss else kl_per_row.mean()
+    return kl_div * loss_coeff

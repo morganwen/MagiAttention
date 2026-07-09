@@ -162,6 +162,37 @@ class MagiDSAV4(nn.Module):
                 x_det = x.detach()
                 qr_det = qr.detach()
                 q_idx, k_idx, w_idx = self.indexer.forward_before_topk(x_det, qr_det)
+                if cfg.backend == "kernel":
+                    from .kernels import indexer_select_kernel
+                    from .reference import indexer_kl_loss_selected
+
+                    topk_indices = indexer_select_kernel(
+                        q_idx, k_idx, w_idx, cfg.topk, cfg.compress_ratio
+                    ).long()
+                    if self.training and torch.is_grad_enabled():
+                        kl_loss = indexer_kl_loss_selected(
+                            topk_indices,
+                            q_idx,
+                            w_idx,
+                            k_idx,
+                            query.detach(),
+                            compressed_kv.detach(),
+                            cfg.softmax_scale,
+                            self.indexer.softmax_scale,
+                            cfg.indexer_loss_coeff,
+                            calculate_per_token_loss=(
+                                kl_reduce == "sum" or cfg.calculate_per_token_loss
+                            ),
+                        )
+                    compress_idxs = validate_and_offset_topk(
+                        topk_indices, cfg.compress_ratio, offset
+                    )
+                    topk_idxs = torch.cat([window_idxs, compress_idxs], dim=-1)
+                    kv_full_sel = kv_full
+                    output = self._run_attention(
+                        query, kv_full_sel, attn_sink, topk_idxs, cfg
+                    )
+                    return output, kl_loss
                 causal_mask = build_block_causal_mask(
                     sq, n_compressed, cfg.compress_ratio, b, device
                 )
@@ -202,14 +233,17 @@ class MagiDSAV4(nn.Module):
             kv_full = kv
             topk_idxs = window_idxs
 
+        output = self._run_attention(query, kv_full, attn_sink, topk_idxs, cfg)
+        return output, kl_loss
+
+    @staticmethod
+    def _run_attention(query, kv_full, attn_sink, topk_idxs, cfg):
         if cfg.backend == "kernel":
             from .kernels import sparse_attn_with_sink_kernel
 
-            output = sparse_attn_with_sink_kernel(
+            return sparse_attn_with_sink_kernel(
                 query, kv_full, attn_sink.float(), topk_idxs.int(), cfg.softmax_scale
             )
-        else:
-            output = sparse_attn_with_sink(
-                query, kv_full, attn_sink.float(), topk_idxs.int(), cfg.softmax_scale
-            )
-        return output, kl_loss
+        return sparse_attn_with_sink(
+            query, kv_full, attn_sink.float(), topk_idxs.int(), cfg.softmax_scale
+        )

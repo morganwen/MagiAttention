@@ -126,6 +126,57 @@ class _KernelSparseAttn(torch.autograd.Function):
         return result["dq"], result["dkv"], result["d_sink"], None, None
 
 
+def indexer_select_kernel(
+    q_idx: torch.Tensor,
+    k_idx: torch.Tensor,
+    weights: torch.Tensor,
+    topk: int,
+    ratio: int,
+    pos_offset: int = 0,
+) -> torch.Tensor:
+    """Indexer scoring + top-k selection on cuDNN kernels (stop-gradient).
+
+    q_idx (sq, b, H, D) bf16; k_idx (sk, b, D) bf16; weights (sq, b, H)
+    bf16 (head scale already applied). ``ratio`` drives the kernel's
+    block-causal mask; ``pos_offset`` is the global position of row 0
+    (context parallelism), forwarded as ``q_causal_offsets``.
+    Returns (b, sq, topk) int32 local block ids, -1 invalid.
+    """
+    dsa = _ensure_dsa()
+    sq, b, h, d = q_idx.shape
+    sk = k_idx.shape[0]
+
+    q_b = q_idx.permute(1, 0, 2, 3).contiguous()  # (b, sq, H, D)
+    k_b = k_idx.permute(1, 0, 2).unsqueeze(2).contiguous()  # (b, sk, 1, D)
+    w_b = weights.permute(1, 0, 2).contiguous()  # (b, sq, H)
+
+    kwargs = {}
+    if pos_offset:
+        kwargs["q_causal_offsets"] = torch.full(
+            (b,), pos_offset, dtype=torch.int32, device=q_idx.device
+        )
+    scores = dsa.indexer_forward_wrapper(q_b, k_b, w_b, ratio=ratio, **kwargs)[
+        "scores"
+    ]  # (b, sq, sk) fp32, -inf outside the causal range
+    scores_flat = scores.reshape(b * sq, -1)[:, :sk].contiguous()
+
+    rows = torch.arange(sq, device=q_idx.device) + pos_offset
+    seq_lens = ((rows + 1) // ratio).clamp(max=sk).to(torch.int32).repeat(b)
+
+    topk_k = min(topk, sk)
+    res = dsa.indexer_top_k_wrapper(
+        scores_flat, seq_lens, top_k=topk_k, next_n=1, return_val=False
+    )
+    idx = res["indices"]  # (b*sq, topk_k) int32, -1 invalid
+    if topk_k < topk:
+        pad = torch.full(
+            (b * sq, topk - topk_k), -1, dtype=torch.int32, device=q_idx.device
+        )
+        idx = torch.cat([idx, pad], dim=-1)
+    idx = idx.masked_fill(idx >= seq_lens.unsqueeze(1), -1)
+    return idx.view(b, sq, -1)
+
+
 def sparse_attn_with_sink_kernel(
     query: torch.Tensor,
     kv_full: torch.Tensor,
