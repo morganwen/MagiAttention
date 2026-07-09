@@ -12,7 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Magi_DSA V4: DeepSeek V4 hybrid sparse attention runtime."""
+"""Magi_DSA V4: DeepSeek V4 hybrid sparse attention runtime.
+
+API v1 frozen 2026-07-09 after full-layer drop-in parity inside Megatron's
+DSv4HybridSelfAttention (all three layer forms, outputs and every shared
+parameter gradient matching). Inputs: hidden x, query latent qr, RoPE-applied
+main query and latent KV, learnable sink; indexer projections and compressed
+entries are runtime-internal.
+"""
+
+__api_version__ = "1.0.0"
 
 from .attention import MagiDSAV4
 from .compressor import DSAv4Compressor
