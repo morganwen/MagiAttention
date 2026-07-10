@@ -60,7 +60,9 @@ def build_block_causal_mask(
 class DSAv4Indexer(nn.Module):
     """Learned top-k retrieval over compressed positions."""
 
-    def __init__(self, config: MagiDSAV4Config, dtype: torch.dtype = torch.bfloat16) -> None:
+    def __init__(
+        self, config: MagiDSAV4Config, dtype: torch.dtype = torch.bfloat16
+    ) -> None:
         super().__init__()
         assert config.has_indexer, "indexer requires compress_ratio == 4"
         self.config = config
@@ -105,15 +107,31 @@ class DSAv4Indexer(nn.Module):
         blocks for context-parallel callers.
         Returns q (sq, b, H, D), k (sq // ratio, b, D) or None, weights (sq, b, H).
         """
+        q, weights = self.project_queries(x, qr, row_offset=row_offset)
+        k = self.compressor(x, block_offset=block_offset)
+        return q, k, weights
+
+    def project_queries(
+        self,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        row_offset: int = 0,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Project one sample-relative query fragment without recompressing K.
+
+        Fragment-balanced context parallelism computes compressed Indexer keys
+        on their block owners and broadcasts them separately.  This helper
+        keeps the Q/weight projection shared with :meth:`forward_before_topk`
+        while allowing the distributed runtime to consume those global keys.
+        """
         sq, bsz, _ = x.size()
         q = self.linear_wq_b(qr).reshape(sq, bsz, self.n_heads, self.head_dim)
         freqs = self._q_freqs(row_offset + sq, x.device)[row_offset:]
         q = apply_rope_last_dims(q, freqs, self.rope_dim)
         q = rotate_activation(q)
 
-        k = self.compressor(x, block_offset=block_offset)
         weights = self.linear_weights_proj(x) * (self.n_heads**-0.5)
-        return q, k, weights
+        return q, weights
 
     @torch.no_grad()
     def select_topk(

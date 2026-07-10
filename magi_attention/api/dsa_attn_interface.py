@@ -78,9 +78,12 @@ class DsaPackedMeta:
 class MagiDSAInput:
     """All tensors consumed by one packed Magi_DSA forward call.
 
-    Shapes are ``x[T, hidden]``, ``qr[T, q_lora_rank]``,
-    ``q[T, 64, 512]``, ``latent_kv[T, 512]`` and ``sink[64]``.  Runtime
-    validation enforces CUDA BF16 row tensors and an FP32 sink.
+    Shapes are ``x[T_local, hidden]``, ``qr[T_local, q_lora_rank]``,
+    ``q[T_local, 64, 512]``, ``latent_kv[T_local, 512]`` and ``sink[64]``.
+    For CP=1, ``T_local`` is the global packed token count. For CP=2, rows
+    follow this rank's immutable fragment order while ``packed_meta`` still
+    describes the global sample boundaries. Runtime validation enforces CUDA
+    BF16 row tensors and an FP32 sink.
     """
 
     x: torch.Tensor
@@ -97,8 +100,9 @@ def calc_dsa(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run packed DeepSeek V4 hybrid attention through ``runtime_mgr``.
 
-    Returns an output of shape ``[T, 64, 512]`` and a differentiable FP32 KL
-    scalar.  The manager owns compressor and Indexer parameters.
+    Returns an owner-local output of shape ``[T_local, 64, 512]`` and a
+    differentiable FP32 KL contribution normalized by the global query-token
+    count. The manager owns compressor and Indexer parameters.
     """
 
     if not isinstance(runtime_mgr, MagiDSARuntimeMgr):

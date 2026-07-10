@@ -28,6 +28,7 @@ from magi_attention.meta.solver.dsa_solver import DsaPlanSolver
 
 if TYPE_CHECKING:
     from magi_attention.api.dsa_attn_interface import MagiDSAInput
+    from magi_attention.functional.dist_dsa import DsaForwardPlan
 
 
 @dataclass(frozen=True)
@@ -43,9 +44,9 @@ class DsaStaticPlan:
 class MagiDSARuntimeMgr(nn.Module):
     """Own one fixed-ratio Magi_DSA module and its static CP plan.
 
-    CP=1 currently executes the packed attention path. Step 2 adds immutable,
-    per-layout fragment plans for CP=1/2; CP=2 data movement remains disabled
-    until GroupCast/GroupReduce are connected in step 3.
+    CP=1 executes the packed attention path directly.  CP=2 caches immutable
+    fragment, communication and device-remap plans per packed layout while all
+    invocation-owned tensors and collective work stay outside the manager.
     """
 
     _FIXED_CONFIG = {
@@ -62,11 +63,16 @@ class MagiDSARuntimeMgr(nn.Module):
         self,
         config: MagiDSAV4Config,
         cp_group: dist.ProcessGroup | None = None,
+        *,
+        dispatch_policy: str = "balanced",
     ) -> None:
         super().__init__()
         self._validate_config(config)
+        if dispatch_policy not in ("sequential", "balanced"):
+            raise ValueError("dispatch_policy must be 'sequential' or 'balanced'")
         self.config = config
         self.cp_group = cp_group
+        self.dispatch_policy = dispatch_policy
 
         if cp_group is None:
             cp_rank, cp_size = 0, 1
@@ -84,7 +90,7 @@ class MagiDSARuntimeMgr(nn.Module):
             cp_rank=cp_rank,
             cp_size=cp_size,
             compress_ratio=config.compress_ratio,
-            communication_ready=cp_size == 1,
+            communication_ready=cp_size in (1, 2),
         )
         token_memory_bytes = 2 * (
             config.hidden_size
@@ -104,16 +110,21 @@ class MagiDSARuntimeMgr(nn.Module):
             ),
         )
         self.dsa_module = MagiDSAV4(config, dtype=torch.bfloat16)
+        self._forward_plan_cache: dict[tuple[str, int], "DsaForwardPlan"] = {}
 
     @property
     def plan_cache_size(self) -> int:
         return self._plan_solver.cache_size
 
+    @property
+    def forward_plan_cache_size(self) -> int:
+        return len(self._forward_plan_cache)
+
     def get_dispatch_plan(
         self,
         packed_meta: "DsaPackedMeta",
         *,
-        policy: str = "balanced",
+        policy: str | None = None,
     ) -> DsaDispatchPlan:
         """Return the cached immutable plan for one packed sample layout."""
 
@@ -122,6 +133,9 @@ class MagiDSARuntimeMgr(nn.Module):
         if not isinstance(packed_meta, DsaPackedMeta):
             raise TypeError("packed_meta must be a DsaPackedMeta")
         packed_meta.validate()
+        policy = self.dispatch_policy if policy is None else policy
+        if policy not in ("sequential", "balanced"):
+            raise ValueError("policy must be 'sequential' or 'balanced'")
         bounds = packed_meta.cu_seqlens.detach().cpu().tolist()
         sample_lengths = tuple(
             int(end - begin) for begin, end in zip(bounds, bounds[1:])
@@ -139,6 +153,35 @@ class MagiDSARuntimeMgr(nn.Module):
             self.cp_group,
             policy=policy,
         )
+
+    def get_forward_plan(
+        self,
+        dispatch_plan: DsaDispatchPlan,
+        device: torch.device | str | int,
+    ) -> "DsaForwardPlan":
+        """Return cached CP communication and packing metadata for one device."""
+
+        if self.plan.cp_size == 1:
+            raise RuntimeError("CP=1 does not need a distributed forward plan")
+        resolved = torch.device(device)
+        if resolved.type != "cuda":
+            raise ValueError(f"DSA forward plans require CUDA, got {resolved}")
+        device_index = (
+            torch.cuda.current_device() if resolved.index is None else resolved.index
+        )
+        key = (dispatch_plan.plan_hash, device_index)
+        cached = self._forward_plan_cache.get(key)
+        if cached is None:
+            from magi_attention.functional.dist_dsa import build_dsa_forward_plan
+
+            cached = build_dsa_forward_plan(
+                dispatch_plan,
+                self.plan.cp_rank,
+                self.cp_group,
+                torch.device("cuda", device_index),
+            )
+            self._forward_plan_cache[key] = cached
+        return cached
 
     @classmethod
     def _validate_config(cls, config: MagiDSAV4Config) -> None:
@@ -185,10 +228,7 @@ class MagiDSARuntimeMgr(nn.Module):
             )
 
     def validate_input(self, dsa_input: "MagiDSAInput") -> None:
-        from magi_attention.api.dsa_attn_interface import (
-            DsaPackedMeta,
-            MagiDSAInput,
-        )
+        from magi_attention.api.dsa_attn_interface import DsaPackedMeta, MagiDSAInput
 
         if not isinstance(dsa_input, MagiDSAInput):
             raise TypeError("dsa_input must be a MagiDSAInput")

@@ -489,6 +489,12 @@ def build_dsa_comm_plan(
         dispatch_plan, dispatch_plan.overlap_transfers, token_rows
     )
     compressed_destinations = _compressed_destinations(dispatch_plan, compressed_rows)
+    indexer_rows = (
+        compressed_rows
+        if dispatch_plan.compress_ratio == 4
+        else tuple(() for _ in range(dispatch_plan.cp_size))
+    )
+    indexer_destinations = _compressed_destinations(dispatch_plan, indexer_rows)
 
     return DsaCommPlan(
         window_kv=_build_comm_meta(
@@ -520,8 +526,8 @@ def build_dsa_comm_plan(
             dispatch_plan,
             rank,
             group,
-            compressed_rows,
-            compressed_destinations,
+            indexer_rows,
+            indexer_destinations,
         ),
     )
 

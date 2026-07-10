@@ -22,10 +22,7 @@ import torch
 
 from magi_attention.api import DsaPackedMeta, MagiDSAInput, calc_dsa
 from magi_attention.dsa_runtime_mgr import MagiDSARuntimeMgr
-from magi_attention.experimental.dsa_v4 import (
-    DSAv4Compressor,
-    MagiDSAV4Config,
-)
+from magi_attention.experimental.dsa_v4 import DSAv4Compressor, MagiDSAV4Config
 from magi_attention.testing.precision import assert_close as assert_precision_close
 
 
@@ -146,7 +143,7 @@ class TestDsaContract:
         with pytest.raises(ValueError):
             MagiDSARuntimeMgr(cfg)
 
-    def test_runtime_builds_cp2_plan_without_collectives(self):
+    def test_runtime_builds_cp2_forward_capability(self):
         sentinel_group = object()
         with (
             patch(
@@ -159,7 +156,11 @@ class TestDsaContract:
         assert runtime.plan.cp_rank == 1
         assert runtime.plan.cp_size == 2
         assert runtime.plan.compress_ratio == 0
-        assert not runtime.plan.communication_ready
+        assert runtime.plan.communication_ready
+
+    def test_runtime_rejects_unknown_dispatch_policy(self):
+        with pytest.raises(ValueError, match="dispatch_policy"):
+            MagiDSARuntimeMgr(_make_config(0), dispatch_policy="unknown")
 
     def test_runtime_caches_fragment_plan_by_packed_layout_and_policy(self):
         runtime = MagiDSARuntimeMgr(_make_config(4))

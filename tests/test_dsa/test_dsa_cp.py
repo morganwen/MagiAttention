@@ -27,11 +27,14 @@ from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
 from torch.testing._internal.common_utils import run_tests
 
 import magi_attention.functional.dsa_comm as dsa_comm
+from magi_attention.api import DsaPackedMeta, MagiDSAInput, calc_dsa
 from magi_attention.comm.primitive.grpcoll._config import GrpCollConfig
 from magi_attention.comm.primitive.grpcoll._mgr import grpcoll_buffer_mgr
 from magi_attention.comm.primitive.grpcoll.utils import (
     sanity_check_for_group_cast_meta_args_per_rank,
 )
+from magi_attention.dsa_runtime_mgr import MagiDSARuntimeMgr
+from magi_attention.experimental.dsa_v4 import MagiDSAV4Config
 from magi_attention.functional.dsa_comm import (
     DsaPayloadKind,
     DsaTypedPayload,
@@ -141,6 +144,25 @@ class TestDsaCommMetadata:
                 assert sum(meta.collective_arg.input_split_size_list) == 0
                 assert sum(meta.collective_arg.output_split_size_list) == 0
                 assert len(meta.collective_arg.input_split_size_list) >= 1
+
+    def test_non_indexer_layers_keep_compressed_ki_route_empty(self):
+        ratio128 = build_dsa_dispatch_plan(
+            [256],
+            [
+                [DsaFragmentSpec(0, 0, 128)],
+                [DsaFragmentSpec(0, 128, 256)],
+            ],
+            compress_ratio=128,
+            policy="sequential",
+        )
+        for rank in range(2):
+            comm_plan = build_dsa_comm_plan(
+                ratio128, rank, object()  # type: ignore[arg-type]
+            )
+            assert comm_plan.compressed_kv.local_row_count == 1
+            assert comm_plan.compressed_kv.receive_row_count == 1
+            assert comm_plan.compressed_ki.local_row_count == 0
+            assert comm_plan.compressed_ki.receive_row_count == 0
 
     def test_production_transport_only_calls_group_collective_primitives(self):
         source = inspect.getsource(dsa_comm)
@@ -369,6 +391,122 @@ class TestDsaCommTransport(DistTestBase):
         if use_native:
             grpcoll_buffer_mgr.release_group(self.process_group)
 
+    @staticmethod
+    def _forward_config(ratio: int, backend: str) -> MagiDSAV4Config:
+        return MagiDSAV4Config(
+            compress_ratio=ratio,
+            hidden_size=64,
+            q_lora_rank=64,
+            softmax_scale=512**-0.5,
+            backend=backend,
+        )
+
+    @staticmethod
+    def _global_forward_input(config: MagiDSAV4Config) -> MagiDSAInput:
+        lengths = (256, 256)
+        total = sum(lengths)
+        torch.manual_seed(20260710 + config.compress_ratio)
+
+        def make(*shape):
+            return torch.randn(*shape, dtype=torch.bfloat16, device="cuda")
+
+        return MagiDSAInput(
+            x=make(total, config.hidden_size),
+            qr=make(total, config.q_lora_rank),
+            q=make(total, config.num_heads, config.kv_dim),
+            latent_kv=make(total, config.kv_dim),
+            sink=torch.randn(config.num_heads, dtype=torch.float32, device="cuda"),
+            packed_meta=DsaPackedMeta(torch.tensor([0, 256, 512], dtype=torch.int32)),
+        )
+
+    @staticmethod
+    def _local_forward_input(global_input, dispatch_plan, rank):
+        offsets = (0, *torch.tensor(dispatch_plan.sample_lengths).cumsum(0).tolist())
+        row_ids = [
+            offsets[fragment.sample_id] + position
+            for fragment in dispatch_plan.ranks[rank].fragments
+            for position in range(fragment.q_begin, fragment.q_end)
+        ]
+        index = torch.tensor(row_ids, dtype=torch.int64, device="cuda")
+        return (
+            MagiDSAInput(
+                x=global_input.x.index_select(0, index).contiguous(),
+                qr=global_input.qr.index_select(0, index).contiguous(),
+                q=global_input.q.index_select(0, index).contiguous(),
+                latent_kv=global_input.latent_kv.index_select(0, index).contiguous(),
+                sink=global_input.sink.clone(),
+                packed_meta=global_input.packed_meta,
+            ),
+            index,
+        )
+
+    def _run_full_forward(self, *, ratio: int, policy: str, backend: str):
+        torch.cuda.set_device(self.rank % torch.cuda.device_count())
+        config = self._forward_config(ratio, backend)
+        torch.manual_seed(1103 + ratio)
+        runtime = MagiDSARuntimeMgr(
+            config,
+            cp_group=self.process_group,
+            dispatch_policy=policy,
+        ).cuda()
+        torch.manual_seed(1103 + ratio)
+        reference_runtime = MagiDSARuntimeMgr(config).cuda()
+        reference_runtime.load_state_dict(runtime.state_dict())
+        runtime.train()
+        reference_runtime.train()
+
+        global_input = self._global_forward_input(config)
+        dispatch_plan = runtime.get_dispatch_plan(global_input.packed_meta)
+        local_input, local_rows = self._local_forward_input(
+            global_input, dispatch_plan, self.rank
+        )
+
+        local_output, local_kl = calc_dsa(local_input, runtime)
+        reference_output, reference_kl = calc_dsa(global_input, reference_runtime)
+        expected_output = reference_output.index_select(0, local_rows)
+        torch.testing.assert_close(
+            local_output,
+            expected_output,
+            rtol=2e-2,
+            atol=2e-3,
+        )
+        assert local_output.shape == (
+            dispatch_plan.ranks[self.rank].token_count,
+            config.num_heads,
+            config.kv_dim,
+        )
+        assert local_kl.shape == torch.Size([])
+        assert local_kl.dtype == torch.float32
+
+        global_kl = local_kl.detach().clone()
+        dist.all_reduce(global_kl, group=self.process_group)
+        torch.testing.assert_close(global_kl, reference_kl, rtol=2e-2, atol=2e-5)
+        assert runtime.forward_plan_cache_size == 1
+        if ratio == 4 and policy == "balanced":
+            assert any(rank.fragment_count > 1 for rank in dispatch_plan.ranks)
+
+        del (
+            local_output,
+            reference_output,
+            expected_output,
+            local_kl,
+            reference_kl,
+            local_input,
+            global_input,
+            runtime,
+            reference_runtime,
+        )
+        torch.cuda.empty_cache()
+
+    @staticmethod
+    def _kernel_dependencies_available() -> bool:
+        try:
+            from cudnn import DSA  # noqa: F401
+            from flash_mla import flash_mla_sparse_fwd  # noqa: F401
+        except ImportError:
+            return False
+        return True
+
     @skip_if_lt_x_gpu(2)
     @with_comms
     def test_a2av_reference_pack_forward_and_reverse(self):
@@ -401,6 +539,31 @@ class TestDsaCommTransport(DistTestBase):
             self.skipTest(f"native grpcoll extension is unavailable: {error}")
         with switch_envvar_context("MAGI_ATTENTION_NATIVE_GRPCOLL", enable=True):
             self._run_transport(use_native=True)
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_cp2_full_reference_forward_matches_cp1(self):
+        with switch_envvar_context("MAGI_ATTENTION_NATIVE_GRPCOLL", enable=False):
+            for policy in ("sequential", "balanced"):
+                for ratio in (0, 4, 128):
+                    self._run_full_forward(
+                        ratio=ratio,
+                        policy=policy,
+                        backend="reference",
+                    )
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_cp2_full_kernel_forward_matches_cp1(self):
+        if not self._kernel_dependencies_available():
+            self.skipTest("FlashMLA and cudnn-frontend DSA packages are required")
+        with switch_envvar_context("MAGI_ATTENTION_NATIVE_GRPCOLL", enable=False):
+            for ratio in (0, 4, 128):
+                self._run_full_forward(
+                    ratio=ratio,
+                    policy="balanced",
+                    backend="kernel",
+                )
 
 
 if __name__ == "__main__":

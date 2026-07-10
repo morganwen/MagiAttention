@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SM90 correctness and watchdog tests for DSA device packing kernels."""
+"""SM90/SM10x correctness and watchdog tests for DSA packing kernels."""
 
 from __future__ import annotations
 
@@ -34,8 +34,11 @@ def _dependencies_available() -> bool:
         return False
 
 
-def _sm90_available() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9
+def _supported_arch_available() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] in (
+        9,
+        10,
+    )
 
 
 pytestmark = [
@@ -98,7 +101,7 @@ def test_static_mapping_builders_reject_invalid_host_plans() -> None:
         api["copy_map"]([], -1, "cuda")
 
 
-@pytest.mark.skipif(not _sm90_available(), reason="step 4 is validated on SM90/H100")
+@pytest.mark.skipif(not _supported_arch_available(), reason="requires SM90 or SM10x")
 @pytest.mark.parametrize(
     ("dtype", "feature_shape"),
     (
@@ -136,7 +139,7 @@ def test_destination_to_source_copy_matches_torch(
     assert torch.equal(actual, expected)
 
 
-@pytest.mark.skipif(not _sm90_available(), reason="step 4 is validated on SM90/H100")
+@pytest.mark.skipif(not _supported_arch_available(), reason="requires SM90 or SM10x")
 def test_copy_zero_rows_and_contract_rejections() -> None:
     api = _packing_api()
     device = torch.device("cuda")
@@ -152,7 +155,7 @@ def test_copy_zero_rows_and_contract_rejections() -> None:
         api["copy"](torch.empty((3, 128), dtype=torch.bfloat16, device=device), mapping)
 
 
-@pytest.mark.skipif(not _sm90_available(), reason="step 4 is validated on SM90/H100")
+@pytest.mark.skipif(not _supported_arch_available(), reason="requires SM90 or SM10x")
 def test_block_and_token_remap_stays_int32_and_device_resident() -> None:
     api = _packing_api()
     device = torch.device("cuda")
@@ -196,7 +199,7 @@ def _reference_csr(
     return expected
 
 
-@pytest.mark.skipif(not _sm90_available(), reason="step 4 is validated on SM90/H100")
+@pytest.mark.skipif(not _supported_arch_available(), reason="requires SM90 or SM10x")
 @pytest.mark.parametrize("feature_dim", (128, 130, 512))
 @pytest.mark.parametrize("accumulate", (False, True))
 def test_fp32_csr_reduce_matches_fixed_order_reference(
@@ -226,7 +229,7 @@ def test_fp32_csr_reduce_matches_fixed_order_reference(
     assert torch.equal(actual, repeated)
 
 
-@pytest.mark.skipif(not _sm90_available(), reason="step 4 is validated on SM90/H100")
+@pytest.mark.skipif(not _supported_arch_available(), reason="requires SM90 or SM10x")
 def test_fp32_csr_extreme_fan_in_and_zero_rows() -> None:
     api = _packing_api()
     device = torch.device("cuda")
@@ -255,7 +258,7 @@ def test_fp32_csr_extreme_fan_in_and_zero_rows() -> None:
     assert torch.equal(preserved, destination[:2])
 
 
-@pytest.mark.skipif(not _sm90_available(), reason="step 4 is validated on SM90/H100")
+@pytest.mark.skipif(not _supported_arch_available(), reason="requires SM90 or SM10x")
 def test_post_compile_kernel_watchdogs() -> None:
     api = _packing_api()
     device = torch.device("cuda")
