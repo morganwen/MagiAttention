@@ -73,7 +73,8 @@ mean_pack(max_rank_indexer_time)_sequential
 - 当前 DSA 计算原型：worktree `agents/worktrees/magi-dsa-v4`，commit `98e043cafebbdcbce6835e26849d96624136ef70`。
 - Magi-MSA 结构参考：`/home/scratch.wewen_gpu/Magi-MSA`，commit `9670ae222b4a93ce63994982c111604f9f0d6265`。
 - Megatron dsv4 数值参考：`/home/scratch.wewen_gpu/megatron-lm`，commit `c6449f0b2`。
-- FlashMLA：`b7643bd54521f563b839b98289b5cd048c062ba2`；cudnn-frontend 1.27.0；`nvidia-cutlass-dsl==4.5.2`。
+- FlashMLA：`b7643bd54521f563b839b98289b5cd048c062ba2`；`nvidia-cutlass-dsl==4.5.2`。
+- cudnn-frontend 当前安装包版本为 1.27.0，但 `agents/docker/magi-dsa-dev/Dockerfile` 仍从未固定 commit 的 Git URL 安装；精确 commit 待步骤 0 冻结并写入 Dockerfile。
 - CUTLASS 子仓：`81a43e6d92cdd8c20d22392f9579604ed5f710a1`；FA4 子仓：`ee1d15159cda6f3f97bfab9e487da146a8254970`。
 - DeepSeek V4 官方 HF config revision：待冻结。
 
@@ -92,6 +93,17 @@ magi_attention/kernel/cutedsl/dsa_pack.py      # SM90 copy/remap/CSR
 
 当前 `experimental/dsa_v4` 保留为计算原型；runtime 稳定前不同时做目录搬迁。
 
+## 现有 Kernel 位置与复用边界
+
+- MagiAttention 的统一 wrapper 已在 `agents/worktrees/magi-dsa-v4/magi_attention/experimental/dsa_v4/kernels.py`：
+  - `_KernelSparseAttn`：FlashMLA sparse forward + cuDNN sparse backward/d_sink。
+  - `indexer_select_kernel`：cuDNN Indexer forward + top-k。
+  - `_KernelIndexerKL` / `indexer_kl_loss_kernel`：cuDNN score recompute + Indexer backward。
+- FlashMLA 冻结源码在开发镜像 `magi-dsa-dev:v2:/opt/FlashMLA`；SM90 sparse forward 本体在 `csrc/sm90/prefill/sparse/`，Python 入口是 `flash_mla_sparse_fwd`。
+- cuDNN DSA 安装在镜像的 `/usr/local/lib/python3.12/dist-packages/cudnn/deepseek_sparse_attention/`，使用其中的 `indexer_forward`、`indexer_top_k`、`score_recompute`、`indexer_backward` 和 `sparse_attention_backward/dsa_bwd_sm90.py`。
+- compressor 和 Indexer projection 当前在 `experimental/dsa_v4/compressor.py`、`indexer.py`，是 PyTorch module；compressor backward 由 autograd 产生，不新增 compressor kernel，除非性能实测证明需要并经计划更新。
+- 步骤 5/6 只把现有 wrapper 接入新的 CP runtime，不重写或 fork FlashMLA/cuDNN kernel。唯一计划内新增的计算辅助 kernel 是步骤 4 的 `dsa_pack.py`，负责 packing、remap 和 FP32 CSR reduction。
+
 ## 当前状态
 
 - 已完成：三形态 PyTorch reference、compressor、Indexer、FlashMLA/cuDNN kernel、packed 原型、连续 CP=2 对拍和初版 profile。
@@ -105,7 +117,7 @@ magi_attention/kernel/cutedsl/dsa_pack.py      # SM90 copy/remap/CSR
 ### 步骤 0：清理并冻结设计输入
 
 - 修改：本 `PLAN.md`、`docs/magi_dsa_v4_design.md`。
-- 动作：删除旧 P2P/allgather 正式方案描述；冻结 HF revision、子仓状态、H100 镜像和当前有效测试命令；保存现有 dirty grpcoll 探针。
+- 动作：删除旧 P2P/allgather 正式方案描述；冻结 HF revision、子仓状态、H100 镜像和当前有效测试命令；查明 cudnn-frontend 精确 commit 并把 Dockerfile 改为 commit pin；保存现有 dirty grpcoll 探针。
 - 出口：所有 revision 可复现，设计文档与本计划一致，主 worktree 用户改动未丢失。
 
 ### 步骤 1：建立公共 API 和 runtime 空骨架
@@ -144,6 +156,7 @@ magi_attention/kernel/cutedsl/dsa_pack.py      # SM90 copy/remap/CSR
 ### 步骤 5：接通完整 forward
 
 - 修改：`functional/dist_dsa.py`、`dsa_runtime_mgr.py` 和现有 DSA kernel wrapper。
+- Kernel 复用：直接调用现有 `indexer_select_kernel`、`indexer_kl_loss_kernel` 和 `_KernelSparseAttn` 的 FlashMLA forward；本步骤不新写 sparse/Indexer kernel。
 - 动作顺序：
   1. dispatch 本 rank Q/x/qr/KV fragments。
   2. 启动 window KV、overlap x GroupCast。
@@ -157,6 +170,7 @@ magi_attention/kernel/cutedsl/dsa_pack.py      # SM90 copy/remap/CSR
 ### 步骤 6：接通完整 backward 和 saved-state
 
 - 修改：`functional/dist_dsa.py`、`functional/dsa_comm.py`。
+- Kernel 复用：继续使用 `_KernelSparseAttn.backward` 的 cuDNN sparse backward/d_sink，以及 `_KernelIndexerKL` 的 score recompute/Indexer backward；compressor backward 保持 PyTorch autograd。
 - 动作顺序：重收 KV/x并重算压缩条；运行 KL backward 并 GroupReduce dKi；运行 sparse backward；FP32 CSR 合并 dKV；GroupReduce 回 owner；执行两个 compressor backward；GroupReduce d_sink 和内部参数梯度。
 - 测试：dx、dqr、dQ、dKV、compressor/Indexer 参数梯度、d_sink 与 CP=1 reference 对齐；saved-tensor hooks 确认未保存 compressed/remote/packed tensor；释放 forward 临时 buffer 后 backward 仍通过。
 - 出口：全部梯度正确，参数梯度明确为 CP-reduced，saved-state 满足冻结合同。
@@ -188,3 +202,4 @@ magi_attention/kernel/cutedsl/dsa_pack.py      # SM90 copy/remap/CSR
 - 2026-07-09：Indexer candidate 必须优于 sequential，但不设单项 5% 绝对门槛；完整路径继续执行 5% 门槛。
 - 2026-07-09：KL 返回每 rank 的可微 local contribution；d_sink 和内部参数梯度由 DSA 内部 GroupReduce，结果标记为 CP-reduced。
 - 2026-07-09：正式 CP 通信使用 GroupCast/GroupReduce；compressed KV/Ki 保持静态全组可见。
+- 2026-07-09：步骤 5/6 复用现有 FlashMLA/cuDNN wrapper，不重写外部 kernel；新增 kernel 仅限步骤 4 的 SM90 packing/remap/CSR。
