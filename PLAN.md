@@ -136,8 +136,8 @@ tests/test_dsa/
 - 证据：`agents/tests/magi-dsa-v4`、`agents/profiles/magi-dsa-v4`、`agents/perf/magi-dsa-v4`。
 - 未完成：独立 runtime、非连续 fragment plan、真实 Indexer-balanced solver、正式 GroupCast/GroupReduce、SM90 packing、saved-state 收紧、最终并发/死锁/性能验收。
 - 当前 `magi_comm.py` 是未提交技术探针，不直接作为生产实现；重构前先提交或备份，禁止覆盖/reset。
-- 已完成：步骤 0；grpcoll dirty probe 已保存为 `agents/backups/magi-dsa-v4-grpcoll-probe-20260709.patch`（SHA256 `b6a6b8fadb48a38dc2c9b38bb1abd1fab8d5d86f27fedb67d298bded836416ee`）。
-- 当前进行：步骤 1。
+- 已完成：步骤 0、步骤 1；grpcoll dirty probe 已保存为 `agents/backups/magi-dsa-v4-grpcoll-probe-20260709.patch`（SHA256 `b6a6b8fadb48a38dc2c9b38bb1abd1fab8d5d86f27fedb67d298bded836416ee`）。
+- 下一步：步骤 2。
 
 ## 具体实施步骤
 
@@ -150,7 +150,7 @@ tests/test_dsa/
 完成记录（2026-07-09）：
 
 - worktree：`agents/worktrees/magi-dsa-v4-plan-grpcoll`；步骤基线 `b3a7aa2df6057f4ae7a512587e284a9ea487e97d`。
-- commit：`Freeze reproducible DSA design inputs`（本步骤原子提交；精确 hash 在步骤 1 完成记录回填）。
+- commit：`3c49075f`（`Freeze reproducible DSA design inputs`）。
 - 验证：重建 `magi-dsa-dev:v1`/`v2`；`pip check` 返回 `No broken requirements found`；镜像内核对 cudnn-frontend/FHT/FlashMLA/CUTLASS DSL revision。
 - 报告：`docs/magi_dsa_v4_design.md`、`agents/docker/magi-dsa-*/Dockerfile`、`agents/backups/magi-dsa-v4-grpcoll-probe-20260709.patch`。
 
@@ -161,6 +161,14 @@ tests/test_dsa/
 - 动作：定义 `MagiDSAInput`、`DsaPackedMeta`、`MagiDSARuntimeMgr`、`calc_dsa`；先让 CP=1 调用现有 `MagiDSAV4` kernel path，CP=2 暂只创建 plan 不通信。
 - 测试：字段 shape/dtype/config 拒绝测试；CP=1 三种 ratio 的 O、KL 和全部梯度与当前 API 一致。
 - 出口：公共接口可运行，后续不再直接调用 `forward_cp(_packed)`。
+
+完成记录（2026-07-09）：
+
+- worktree：`agents/worktrees/magi-dsa-v4-plan-grpcoll`；步骤 0 commit `3c49075f`。
+- commit：`Add public Magi DSA runtime API`（本步骤原子提交；精确 hash 由后续步骤记录）。
+- 测试：冻结镜像 `sha256:9c51e29d1fda8fc1a6e2a8e16c7b0773309e91dcbd44cf6d0182e5e3327c1029` 上运行 `python -m pytest -q tests/test_dsa/test_dsa_api.py`，结果 `21 passed`（reference/kernel、ratio 0/4/128、packed、O/KL、全部输入/参数梯度）；运行 `PYTHONPATH=. python tests/test_attn/test_dsa_v4.py`，结果 `17 tests OK`。
+- 静态检查：Black 与 isort 对新增 Python 文件检查通过；`python -m compileall` 通过。
+- 报告：`tests/test_dsa/README.md`、`tests/test_dsa/README_zh.md`；CP=2 只构造 `DsaStaticPlan(communication_ready=False)`，未引入 collective。
 
 ### 步骤 2：实现 fragment plan 和 Indexer solver
 

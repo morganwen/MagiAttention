@@ -35,6 +35,12 @@ from magi_attention.dist_attn_runtime_mgr import DistAttnRuntimeKey
 from magi_attention.functional import flex_flash_attn_func
 from magi_attention.meta.solver.dispatch_solver import ToppHeapDispatchAlg
 
+from .dsa_attn_interface import (
+    DsaPackedMeta,
+    MagiDSAInput,
+    MagiDSARuntimeMgr,
+    calc_dsa,
+)
 from .functools import (
     compute_pad_size,
     infer_attn_mask_from_cu_seqlens,
@@ -73,6 +79,7 @@ __all__ = [
     "roll",
     "roll_simple",
     "calc_attn",
+    "calc_dsa",
     "clear_cache",
     "get_most_recent_key",
     "get_position_ids",
@@ -92,6 +99,8 @@ __all__ = [
     "AttnRanges",
     "DistAttnRuntimeKey",
     "GeneralAttnMaskType",
+    "DsaPackedMeta",
+    "MagiDSAInput",
     # ---- config classes ----
     "DistAttnConfig",
     "DispatchConfig",
@@ -113,4 +122,5 @@ __all__ = [
     # ---- runtime manager ----
     "DistAttnRuntimeDictManager",
     "dist_attn_runtime_dict_mgr",
+    "MagiDSARuntimeMgr",
 ]

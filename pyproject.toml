@@ -91,4 +91,9 @@ exclude = [
 [tool.ruff]
 lint.ignore = ["E731"]
 
+[tool.pytest.ini_options]
+markers = [
+    "dsa_kernel: requires the frozen FlashMLA/cuDNN DSA kernel environment",
+]
+
 [tool.setuptools_scm]
