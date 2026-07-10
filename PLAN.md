@@ -104,6 +104,31 @@ magi_attention/kernel/cutedsl/dsa_pack.py      # SM90 copy/remap/CSR
 - compressor 和 Indexer projection 当前在 `experimental/dsa_v4/compressor.py`、`indexer.py`，是 PyTorch module；compressor backward 由 autograd 产生，不新增 compressor kernel，除非性能实测证明需要并经计划更新。
 - 步骤 5/6 只把现有 wrapper 接入新的 CP runtime，不重写或 fork FlashMLA/cuDNN kernel。唯一计划内新增的计算辅助 kernel 是步骤 4 的 `dsa_pack.py`，负责 packing、remap 和 FP32 CSR reduction。
 
+## 正式测试目录与职责
+
+最终测试固定放在：
+
+```text
+tests/test_dsa/
+├── README.md
+├── README_zh.md
+├── test_dsa_api.py
+├── test_dsa_cp.py
+├── test_dsa_dispatch.py
+├── test_dsa_solver.py
+└── test_dsa_pack_kernel.py
+```
+
+- `README.md` / `README_zh.md`：记录镜像、H100 要求、编译与运行分离、watchdog、环境变量、单卡/双卡命令和测试过滤方式。
+- `test_dsa_api.py`：CP=1 public API、三形态、reference/kernel、forward/backward、compressor、Indexer、sink、KL、packed、saved-state 和 projection/RoPE 梯度链。
+- `test_dsa_cp.py`：DistTestBase CP=2，对比同一 global input 的 CP=1 reference；覆盖 sequential/balanced、非连续 fragments、GroupCast/Reduce、全部梯度、2×2 overlap、并发和故障收敛。
+- `test_dsa_dispatch.py`：fragment 覆盖、128 对齐、block owner、transfer table、window/overlap 路由、恢复顺序、空 rank 和随机计划。
+- `test_dsa_solver.py`：sample-relative 成本公式、ratio 分形态、确定性、plan cache、Indexer 比较门槛和 overlap-aware E2E 目标。
+- `test_dsa_pack_kernel.py`：SM90 copy/remap/CSR kernel 与 torch reference 对拍，覆盖零 row、重复 source、极端 fan-in、tail、越界和 watchdog。
+- 数值测试使用 `magi_attention.testing.precision` 校准容差；CP 测试使用 `DistTestBase`，不为 CP 单独放宽容差。
+- 当前 `tests/test_attn/test_dsa_v4.py`、`test_dsa_v4_cp.py` 在新目录测试全绿前保留；随后把有效用例迁入前两个文件，避免双份长期维护。
+- `agents/tests/magi-dsa-v4` 只算探索证据。kernel、Megatron parity、packed CP 等稳定用例必须迁入 `tests/test_dsa` 才算正式验收。
+
 ## 当前状态
 
 - 已完成：三形态 PyTorch reference、compressor、Indexer、FlashMLA/cuDNN kernel、packed 原型、连续 CP=2 对拍和初版 profile。
@@ -123,6 +148,7 @@ magi_attention/kernel/cutedsl/dsa_pack.py      # SM90 copy/remap/CSR
 ### 步骤 1：建立公共 API 和 runtime 空骨架
 
 - 新增：`api/dsa_attn_interface.py`、`dsa_runtime_mgr.py`、`functional/dist_dsa.py`。
+- 新增测试：`tests/test_dsa/README.md`、`README_zh.md`、`test_dsa_api.py`；先迁入当前单卡三形态、packed、sink 和 compressor 用例。
 - 动作：定义 `MagiDSAInput`、`DsaPackedMeta`、`MagiDSARuntimeMgr`、`calc_dsa`；先让 CP=1 调用现有 `MagiDSAV4` kernel path，CP=2 暂只创建 plan 不通信。
 - 测试：字段 shape/dtype/config 拒绝测试；CP=1 三种 ratio 的 O、KL 和全部梯度与当前 API 一致。
 - 出口：公共接口可运行，后续不再直接调用 `forward_cp(_packed)`。
@@ -130,6 +156,7 @@ magi_attention/kernel/cutedsl/dsa_pack.py      # SM90 copy/remap/CSR
 ### 步骤 2：实现 fragment plan 和 Indexer solver
 
 - 新增：`meta/collection/dsa_meta.py`、`meta/solver/dsa_dispatch.py`、`meta/solver/dsa_solver.py`。
+- 新增测试：`tests/test_dsa/test_dsa_dispatch.py`、`test_dsa_solver.py`。
 - 动作：
   1. 定义 `DsaFragmentSpec(sample_id,q_begin,q_end)`、compressed block owner、rank plan 和 restore map。
   2. 实现 128 对齐 sequential plan。
@@ -142,6 +169,7 @@ magi_attention/kernel/cutedsl/dsa_pack.py      # SM90 copy/remap/CSR
 ### 步骤 3：实现 GroupCast/GroupReduce 和 reference packing
 
 - 新增：`functional/dsa_comm.py`；先用 torch reference map 验证，不进入性能计时。
+- 新增测试：`tests/test_dsa/test_dsa_cp.py` 的 transport-only 用例；此时不运行完整 attention。
 - 动作：为 window KV、overlap x、compressed KV、compressed Ki 分别生成 `GroupCollectiveArg`；forward GroupCast 得到 unique receive buffer，backward 用对称 GroupReduce 回 owner。
 - 测试：CP=2 transport-only；逐项验证 send/recv rows、重复 fragment FP32 求和、零长度路线、非相邻 owner、A2AV fallback 和 native grpcoll 语义一致。
 - 出口：DSA 生产通信代码不直接调用 torch collectives/all2allv；四类 payload 的 forward/reverse 都与 host reference 一致。
@@ -149,6 +177,7 @@ magi_attention/kernel/cutedsl/dsa_pack.py      # SM90 copy/remap/CSR
 ### 步骤 4：实现 SM90 packing/remap/CSR kernel
 
 - 新增：`kernel/cutedsl/dsa_pack.py` 和正式 kernel 单测。
+- 新增测试：`tests/test_dsa/test_dsa_pack_kernel.py`。
 - 动作：实现 int32 destination→source copy、block/token remap、FP32 CSR reduce；支持 D=128、D=512 和 hidden width，128-bit 对齐快路。
 - 测试：与步骤 3 reference 对拍；覆盖重复 source、极端 fan-in、零 row、非连续 map、tail 和越界拒绝；应用 10/30 秒 watchdog。
 - 出口：CP transport 使用 SM90 kernel，无 D2H top-k/remap，同输入重复运行稳定。
@@ -165,6 +194,7 @@ magi_attention/kernel/cutedsl/dsa_pack.py      # SM90 copy/remap/CSR
   5. packing/remap 后拼接 window 与压缩索引。
   6. 一次 FlashMLA sparse forward，返回 local O 和 KL contribution。
 - 测试：CP=1/CP=2、三种 ratio、packed 多 sample、非连续 fragments；比较 top-k、O、FP32 LSE 和 KL。
+- 落位：单卡用例写入 `test_dsa_api.py`，双卡用例写入 `test_dsa_cp.py`；把稳定的 `agents/tests` kernel/Megatron parity forward 用例迁入正式目录。
 - 出口：sequential 与 balanced forward 都和同一 CP=1 global reference 对齐。
 
 ### 步骤 6：接通完整 backward 和 saved-state
@@ -173,6 +203,7 @@ magi_attention/kernel/cutedsl/dsa_pack.py      # SM90 copy/remap/CSR
 - Kernel 复用：继续使用 `_KernelSparseAttn.backward` 的 cuDNN sparse backward/d_sink，以及 `_KernelIndexerKL` 的 score recompute/Indexer backward；compressor backward 保持 PyTorch autograd。
 - 动作顺序：重收 KV/x并重算压缩条；运行 KL backward 并 GroupReduce dKi；运行 sparse backward；FP32 CSR 合并 dKV；GroupReduce 回 owner；执行两个 compressor backward；GroupReduce d_sink 和内部参数梯度。
 - 测试：dx、dqr、dQ、dKV、compressor/Indexer 参数梯度、d_sink 与 CP=1 reference 对齐；saved-tensor hooks 确认未保存 compressed/remote/packed tensor；释放 forward 临时 buffer 后 backward 仍通过。
+- 落位：CP=1 backward/saved-state 写入 `test_dsa_api.py`；CP=2 全梯度和 owner reduce 写入 `test_dsa_cp.py`。
 - 出口：全部梯度正确，参数梯度明确为 CP-reduced，saved-state 满足冻结合同。
 
 ### 步骤 7：实现 overlap、并发和故障收敛
@@ -180,6 +211,7 @@ magi_attention/kernel/cutedsl/dsa_pack.py      # SM90 copy/remap/CSR
 - 修改：runtime per-call state 和 stream/event 编排。
 - 动作：实现两个独立开关：compressed GroupCast 与 Indexer projection；dKi GroupReduce 与 sparse backward。为每次调用独占 work/event/buffer slot。
 - 测试：2×2 开关矩阵、gradient accumulation、两个并发 microbatch、reentrant backward、空 rank、kernel/collective 异常、提前退出；CP watchdog 60 秒。
+- 落位：runtime/communication 压力用例写入 `test_dsa_cp.py`；kernel watchdog 留在 `test_dsa_pack_kernel.py`。
 - 出口：四种开关数值一致，无共享状态污染，所有故障在 watchdog 内收敛。
 
 ### 步骤 8：H100 校准、最终 solver 和性能验收
@@ -190,7 +222,7 @@ magi_attention/kernel/cutedsl/dsa_pack.py      # SM90 copy/remap/CSR
 
 ### 步骤 9：文档、原子提交与集成
 
-- 动作：同步 API、config、tensor contract、communication plan、saved-state、测试和性能结果；整理可审查原子 commits。
+- 动作：同步 API、config、tensor contract、communication plan、saved-state、测试和性能结果；更新 `docs/source/user_guide/magi_api.md` 和 `tests/test_dsa/README*`；整理可审查原子 commits。
 - 迁移：检查主工作区用户改动后 cherry-pick；集成复测；子仓指针单独核对。
 - 出口：所有冻结合同有测试或报告证据，才能标记完成。
 
@@ -203,3 +235,4 @@ magi_attention/kernel/cutedsl/dsa_pack.py      # SM90 copy/remap/CSR
 - 2026-07-09：KL 返回每 rank 的可微 local contribution；d_sink 和内部参数梯度由 DSA 内部 GroupReduce，结果标记为 CP-reduced。
 - 2026-07-09：正式 CP 通信使用 GroupCast/GroupReduce；compressed KV/Ki 保持静态全组可见。
 - 2026-07-09：步骤 5/6 复用现有 FlashMLA/cuDNN wrapper，不重写外部 kernel；新增 kernel 仅限步骤 4 的 SM90 packing/remap/CSR。
+- 2026-07-09：正式 DSA 测试按 Magi-MSA 的五类结构建立在 `tests/test_dsa`；现有测试和 `agents/tests` 稳定用例迁入后才计入验收。
