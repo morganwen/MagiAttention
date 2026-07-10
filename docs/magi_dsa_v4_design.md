@@ -138,6 +138,12 @@ docker run --rm --gpus all --ipc=host \
   -v /home/scratch.wewen_gpu:/ws -w /ws/MagiAttention/agents/worktrees/magi-dsa-v4-plan-grpcoll \
   magi-dsa-dev:v2 timeout 60 pytest -q tests/test_dsa/test_dsa_cp.py
 
+# 步骤 3 native grpcoll 完整出口（已编译扩展的本地验证镜像）
+docker run --rm --gpus all --ipc=host \
+  --ulimit memlock=-1 --ulimit stack=67108864 \
+  -w /tmp/native-test magi-dsa-native-step3:final \
+  timeout 60 pytest -q test_dsa_cp.py
+
 # 已有 DSA 原型回归
 docker run --rm --gpus all --ipc=host \
   -v /home/scratch.wewen_gpu:/ws -w /ws/MagiAttention/agents/worktrees/magi-dsa-v4-plan-grpcoll \

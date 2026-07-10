@@ -51,6 +51,11 @@ single case is reported as skipped. The native case also checks the internal
 BF16 D=128 to D=256 transport padding used by compressed Ki. No attention
 kernel runs in this file yet.
 
+The completed native verification image is `magi-dsa-native-step3:final`
+(`sha256:87ee9e4e72fe1d641ac481b6960819c42aa2004cdd2458b2c6e1173f1fcbb677`),
+built from the frozen image plus the pinned repository extension and
+`nvidia-nvshmem-cu13==3.6.5`. It reports `7 passed` for this file.
+
 The CPU-only fragment and solver tests run in the same frozen environment:
 
 ```bash

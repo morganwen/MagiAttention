@@ -47,6 +47,11 @@ A2AV fallback、非连续路线、FP32 反向归约和空路线不依赖可选�
 skip 该单项。native 用例同时检查 compressed Ki 从 BF16 D=128 到 transport
 D=256 的内部 padding。此文件当前不运行 attention kernel。
 
+完成 native 验证的本地镜像是 `magi-dsa-native-step3:final`
+（`sha256:87ee9e4e72fe1d641ac481b6960819c42aa2004cdd2458b2c6e1173f1fcbb677`），
+由冻结镜像、pinned 仓库扩展和 `nvidia-nvshmem-cu13==3.6.5` 构建；本文件
+结果为 `7 passed`。
+
 fragment 与 solver 是 CPU-only 测试，在同一冻结镜像中运行：
 
 ```bash
