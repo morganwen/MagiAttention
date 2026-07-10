@@ -134,12 +134,13 @@ tests/test_dsa/
 
 - 已完成：三形态 PyTorch reference、compressor、Indexer、FlashMLA/cuDNN kernel、packed 原型、连续 CP=2 对拍和初版 profile。
 - 证据：`agents/tests/magi-dsa-v4`、`agents/profiles/magi-dsa-v4`、`agents/perf/magi-dsa-v4`。
-- 未完成：SM90 packing、完整 CP forward/backward、saved-state 收紧、最终并发/死锁/性能验收。
+- 未完成：完整 CP backward、saved-state 收紧、最终并发/死锁/性能验收。
 - 当前 `magi_comm.py` 是未提交技术探针，不直接作为生产实现；重构前先提交或备份，禁止覆盖/reset。
-- 已完成：步骤 0、步骤 1、步骤 2、步骤 3、步骤 4；grpcoll dirty probe 已保存为 `agents/backups/magi-dsa-v4-grpcoll-probe-20260709.patch`（SHA256 `b6a6b8fadb48a38dc2c9b38bb1abd1fab8d5d86f27fedb67d298bded836416ee`）。
+- 已完成：步骤 0、步骤 1、步骤 2、步骤 3、步骤 4、步骤 5；grpcoll dirty probe 已保存为 `agents/backups/magi-dsa-v4-grpcoll-probe-20260709.patch`（SHA256 `b6a6b8fadb48a38dc2c9b38bb1abd1fab8d5d86f27fedb67d298bded836416ee`）。
 - 步骤 3 实现 commits：`29a9ffa3`、`f81d121e`；A2AV fallback 与真实 native grpcoll 的 CP=2 transport-only 全部通过。
 - 步骤 4 实现 commit：`c9856309`；SM90 copy/remap/FP32 CSR、A2AV fallback 与真实 native grpcoll 的 CP=2 transport-only 全部通过。
-- 下一步：步骤 5。
+- 步骤 5 实现 commit：`9bf41223`；B300/SM103 上 CP=2 reference/kernel 完整 forward、sequential/balanced、ratio=0/4/128 与 CP=1 对拍全部通过。
+- 下一步：步骤 6。
 
 ## 具体实施步骤
 
@@ -250,6 +251,16 @@ tests/test_dsa/
 - 测试：CP=1/CP=2、三种 ratio、packed 多 sample、非连续 fragments；比较 top-k、O、FP32 LSE 和 KL。
 - 落位：单卡用例写入 `test_dsa_api.py`，双卡用例写入 `test_dsa_cp.py`；把稳定的 `agents/tests` kernel/Megatron parity forward 用例迁入正式目录。
 - 出口：sequential 与 balanced forward 都和同一 CP=1 global reference 对齐。
+
+完成记录（2026-07-10）：
+
+- worktree：`agents/worktrees/magi-dsa-v4-plan-grpcoll`；步骤 4 关闭记录 commit `7572de87`。
+- 实现 commit：`9bf41223`（`Connect complete Magi DSA CP forward`）。
+- 实现：`MagiDSARuntimeMgr` 增加 sequential/balanced dispatch policy 和按 plan hash/device 缓存的只读 forward plan；CP=2 按 rank fragment 顺序接收 owner-local 输入，使用四类独立 typed GroupCast，按静态 overlap/window transfer table 收集 X/KV，在 compressed block owner 上生成 KV/Ki，再按 global logical block id 重排。window 索引由 device LUT remap，ratio=4 的 top-k 保持 device-resident 并按 sample/fragment 计算 local KL contribution，ratio=128 生成完整 causal compressed prefix；最终 window 与 compressed rows 进入一次 sparse attention。work、buffer 和 receive tensor 保持 per-call，不进入 runtime cache。
+- B300 验证镜像：`magi-dsa-b300-step5:dev`（image id `sha256:5ecfa64c2164301e301e8e7348aeaf12e99dde0b4d2bdf0ada7f5dfdd314425a`），基于 NGC 26.06 digest `sha256:43c018d6a12963f1a1bad85ef8574b5c2a978eec2be0ebcacfb87f69e0d210e1`，冻结 FlashMLA/cudnn-frontend/FHT/CUTLASS DSL revision，FlashMLA 仅构建 SM100 family；实际设备为双 NVIDIA B300 SXM6 AC、compute capability 10.3。
+- 正式测试：`pytest -q tests/test_dsa/test_dsa_api.py tests/test_dsa/test_dsa_dispatch.py tests/test_dsa/test_dsa_solver.py tests/test_dsa/test_dsa_pack_kernel.py tests/test_dsa/test_dsa_cp.py` 为 `76 passed`；覆盖 B300 packing/remap/CSR、CP=1 reference/kernel 全梯度、CP=2 A2AV full forward、sequential/balanced、ratio=0/4/128、packed 多 sample、非连续 fragments、O 和 KL 对拍。
+- 回归：`python tests/test_attn/test_dsa_v4.py` 为 `17 tests OK`；`pytest -q tests/test_attn/test_dsa_v4_cp.py` 为 `2 passed`。Black、isort、compileall 和 `git diff --check` 通过；生产 `dist_dsa.py`/`dsa_comm.py` 不含 torch P2P/all-gather/all-reduce/all-to-all，也不含动态 `.item()`/`.cpu()`/D2H。
+- 边界：本步骤只关闭 forward；GroupCast 在步骤 6 前仍不承担 autograd reverse，完整 dKV、compressor/Indexer-K 参数梯度、d_sink/replicated parameter GroupReduce 和 saved-state 收紧继续属于步骤 6。
 
 ### 步骤 6：接通完整 backward 和 saved-state
 
