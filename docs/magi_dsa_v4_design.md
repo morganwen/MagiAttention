@@ -87,6 +87,11 @@ forward 先用 torch `index_select` reference map 打包 owner-local unique rows
 只做一次目标 dtype 转换。reference map 是步骤 4 SM90 CuTe DSL kernel 的明确
 替换缝，不改变 collective metadata/API。
 
+native grpcoll 的 BF16 transport row 要求 256-element 对齐；compressed Ki 的
+逻辑宽度固定为 128，因此仅在 native send/receive buffer 内部右侧补零到 256，
+接收后立即裁回 128。A2AV、logical row id 和对外 tensor schema 均不改变；反向
+FP32 的 128-element row 已满足该 dtype 的 native 对齐要求。
+
 `DsaCommBufferSlot`、`DsaGroupCastWork`、`DsaGroupReduceWork` 和 native handle
 dictionary 都按单次调用、单 payload 创建，不进入 runtime 共享静态对象。生产
 DSA 通信源码只调用 `group_cast` / `group_reduce`；A2AV 是该 primitive 的内建

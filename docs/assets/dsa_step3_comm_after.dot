@@ -61,7 +61,7 @@ digraph DsaStep3CommAfter {
       color="#D97706"
     ];
     cki [
-      label="COMPRESSED_KI\nowner rows → every CP peer",
+      label="COMPRESSED_KI\nowner rows → every CP peer\nnative BF16: D128 → padded D256 → D128",
       fillcolor="#FCE7F3",
       color="#DB2777"
     ];

@@ -44,7 +44,8 @@ docker run --rm --gpus all --ipc=host \
 
 A2AV fallback、非连续路线、FP32 反向归约和空路线不依赖可选的
 `magi_attn_comm` 编译扩展。扩展已安装时会执行 native grpcoll 对拍；否则只
-skip 该单项。此文件当前不运行 attention kernel。
+skip 该单项。native 用例同时检查 compressed Ki 从 BF16 D=128 到 transport
+D=256 的内部 padding。此文件当前不运行 attention kernel。
 
 fragment 与 solver 是 CPU-only 测试，在同一冻结镜像中运行：
 

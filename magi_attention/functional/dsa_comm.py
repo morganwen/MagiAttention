@@ -25,14 +25,18 @@ only :class:`DsaCommMeta` is suitable for caching as static plan state.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Iterator, Sequence
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 
+from magi_attention import env
 from magi_attention.comm.primitive.grpcoll import group_cast, group_reduce
+from magi_attention.comm.primitive.grpcoll._buffer import GrpCollBuffer
 from magi_attention.comm.work import WorkWithPostProcessFn
 from magi_attention.meta.collection.comm_meta import GroupCollectiveArg
 from magi_attention.meta.collection.dsa_meta import (
@@ -163,6 +167,7 @@ class DsaCommBufferSlot:
     kind: DsaPayloadKind
     send_buffer: torch.Tensor
     receive_buffer: torch.Tensor
+    logical_row_shape: tuple[int, ...]
     reduce_output_buffer: torch.Tensor | None = None
 
 
@@ -189,7 +194,10 @@ class DsaGroupCastWork:
                 f"expected {tuple(self.buffers.receive_buffer.shape)}"
             )
         self.buffers.receive_buffer = receive
-        self._result = DsaTypedPayload(self.meta.kind, receive)
+        logical_receive = _restore_logical_row_shape(
+            receive, self.buffers.logical_row_shape
+        )
+        self._result = DsaTypedPayload(self.meta.kind, logical_receive)
         return self._result
 
 
@@ -481,6 +489,39 @@ def _index_tensor(indices: Sequence[int], device: torch.device) -> torch.Tensor:
     return torch.tensor(indices, dtype=torch.int64, device=device)
 
 
+def _pad_native_hidden_size(tensor: torch.Tensor) -> torch.Tensor:
+    """Pad one native-grpcoll row to its dtype-specific vector alignment."""
+
+    if not env.comm.is_native_grpcoll_enable():
+        return tensor
+    hidden_size = math.prod(tensor.shape[1:])
+    alignment = GrpCollBuffer.get_hidden_size_alignment(tensor.dtype)
+    padded_hidden_size = (hidden_size + alignment - 1) // alignment * alignment
+    flattened = tensor.reshape(tensor.size(0), hidden_size)
+    if padded_hidden_size == hidden_size:
+        return flattened.contiguous()
+    return F.pad(flattened, (0, padded_hidden_size - hidden_size)).contiguous()
+
+
+def _restore_logical_row_shape(
+    tensor: torch.Tensor,
+    logical_row_shape: Sequence[int],
+) -> torch.Tensor:
+    logical_hidden_size = math.prod(logical_row_shape)
+    transport_hidden_size = math.prod(tensor.shape[1:])
+    flattened = tensor.reshape(tensor.size(0), transport_hidden_size)
+    if flattened.size(1) < logical_hidden_size:
+        raise RuntimeError(
+            f"transport row width {flattened.size(1)} is smaller than logical "
+            f"row width {logical_hidden_size}"
+        )
+    return (
+        flattened[:, :logical_hidden_size]
+        .reshape(tensor.size(0), *logical_row_shape)
+        .contiguous()
+    )
+
+
 def reference_pack_dsa_payload(
     payload: DsaTypedPayload,
     meta: DsaCommMeta,
@@ -531,11 +572,17 @@ def start_dsa_group_cast(
 ) -> DsaGroupCastWork:
     """Reference-pack and launch one typed forward GroupCast."""
 
-    send_buffer = reference_pack_dsa_payload(payload, meta)
-    receive_buffer = payload.tensor.new_empty(
-        (meta.receive_row_count, *payload.tensor.shape[1:])
+    logical_send_buffer = reference_pack_dsa_payload(payload, meta)
+    send_buffer = _pad_native_hidden_size(logical_send_buffer)
+    receive_buffer = send_buffer.new_empty(
+        (meta.receive_row_count, *send_buffer.shape[1:])
     )
-    buffers = DsaCommBufferSlot(meta.kind, send_buffer, receive_buffer)
+    buffers = DsaCommBufferSlot(
+        meta.kind,
+        send_buffer,
+        receive_buffer,
+        tuple(payload.tensor.shape[1:]),
+    )
     native_handle_dict: dict[str, Any] = {"group_cast": None, "group_reduce": None}
     work = group_cast(
         input=send_buffer.detach(),

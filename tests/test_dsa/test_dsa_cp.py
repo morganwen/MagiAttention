@@ -184,37 +184,48 @@ class TestDsaCommMetadata:
         comm_plan = build_dsa_comm_plan(
             _noncontiguous_cp2_plan(), 0, object()  # type: ignore[arg-type]
         )
+        widths = {
+            DsaPayloadKind.WINDOW_KV: 512,
+            DsaPayloadKind.OVERLAP_X: 256,
+            DsaPayloadKind.COMPRESSED_KV: 512,
+            DsaPayloadKind.COMPRESSED_KI: 128,
+        }
         cast_works = []
-        for meta in comm_plan:
-            local = DsaTypedPayload(
-                meta.kind,
-                torch.zeros(
-                    (meta.local_row_count, 16),
-                    dtype=torch.bfloat16,
-                    device="cuda",
-                ),
-            )
-            cast_work = start_dsa_group_cast(local, meta, async_op=True)
-            remote = cast_work.wait()
-            reduce_work = start_dsa_group_reduce(
-                DsaTypedPayload(meta.kind, remote.tensor.float()),
-                DsaTypedPayload(
+        logical_receive_widths = []
+        with switch_envvar_context("MAGI_ATTENTION_NATIVE_GRPCOLL", enable=True):
+            for meta in comm_plan:
+                local = DsaTypedPayload(
                     meta.kind,
-                    torch.ones(
-                        (meta.local_row_count, 16),
-                        dtype=torch.float32,
+                    torch.zeros(
+                        (meta.local_row_count, widths[meta.kind]),
+                        dtype=torch.bfloat16,
                         device="cuda",
                     ),
-                ),
-                cast_work,
-                async_op=True,
-            )
-            reduce_work.wait()
-            cast_works.append(cast_work)
+                )
+                cast_work = start_dsa_group_cast(local, meta, async_op=True)
+                remote = cast_work.wait()
+                logical_receive_widths.append(remote.tensor.size(1))
+                reduce_work = start_dsa_group_reduce(
+                    DsaTypedPayload(meta.kind, remote.tensor.float()),
+                    DsaTypedPayload(
+                        meta.kind,
+                        torch.ones(
+                            (meta.local_row_count, widths[meta.kind]),
+                            dtype=torch.float32,
+                            device="cuda",
+                        ),
+                    ),
+                    cast_work,
+                    async_op=True,
+                )
+                reduce_work.wait()
+                cast_works.append(cast_work)
 
         expected_names = [kind.value for kind in DsaPayloadKind]
         assert [call["buffer_name"] for call in cast_calls] == expected_names
         assert [call["buffer_name"] for call in reduce_calls] == expected_names
+        assert [call["input"].size(1) for call in cast_calls] == [512, 256, 512, 256]
+        assert logical_receive_widths == [512, 256, 512, 128]
         assert len({id(work.native_handle_dict) for work in cast_works}) == 4
         for meta, cast_call, reduce_call, cast_work in zip(
             comm_plan, cast_calls, reduce_calls, cast_works

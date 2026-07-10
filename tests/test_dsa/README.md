@@ -47,7 +47,9 @@ docker run --rm --gpus all --ipc=host \
 The A2AV fallback, non-contiguous routes, FP32 reverse reduction, and empty
 routes run without the optional compiled `magi_attn_comm` extension. The native
 grpcoll parity case executes when that extension is installed; otherwise that
-single case is reported as skipped. No attention kernel runs in this file yet.
+single case is reported as skipped. The native case also checks the internal
+BF16 D=128 to D=256 transport padding used by compressed Ki. No attention
+kernel runs in this file yet.
 
 The CPU-only fragment and solver tests run in the same frozen environment:
 
