@@ -43,7 +43,7 @@ magi_attention/functional/dist_dsa.py
 - `MagiDSAInput` 具名保存 `x`、`qr`、`q`、`latent_kv`、FP32 `sink` 和 `packed_meta`。
 - 行张量均为 packed THD：`x [T,hidden_size]`、`qr [T,q_lora_rank]`、`q [T,64,512]`、`latent_kv [T,512]`、`sink [64]`。
 - `calc_dsa(input, runtime_mgr)` 返回 `O [T,64,512]` 与可微 FP32 标量 `kl_loss`。
-- 一个 `MagiDSARuntimeMgr` 只服务其 config 固定的一种 ratio，并持有 compressor/Indexer 参数。步骤 1 的 CP=1 路径复用 `MagiDSAV4.forward_packed`；CP=2 只建立静态占位 plan 并明确拒绝计算，不发起通信。
+- 一个 `MagiDSARuntimeMgr` 只服务其 config 固定的一种 ratio，并持有 compressor/Indexer 参数。CP=1 计算路径继续复用 `MagiDSAV4.forward_packed`；步骤 2 按 packed layout/policy 缓存真实 fragment plan。CP=2 在 plan 求解与元数据广播后明确停在 tensor 数据移动之前。
 - ratio=0 不构建 compressor/Indexer；ratio=128 只构建 compressor；ratio=4 同时构建 compressor 和 Indexer。
 
 V1 固定配置为：Hq=64、Hkv=1、D=512、rope dim=64、window=128、Hidx=64、Didx=128、topk=512，主路径 BF16，sink FP32。`hidden_size`、`q_lora_rank` 和 `softmax_scale` 由模型配置提供。
@@ -65,7 +65,15 @@ V1 固定配置为：Hq=64、Hkv=1、D=512、rope dim=64、window=128、Hidx=64�
 - backward 使用 forward 的对称 GroupReduce；窗口与压缩条落到同一原 token 的梯度先用 FP32 accumulator 合并。
 - collective 进入顺序在全部 rank 一致；空路线仍传合法零长度 metadata。
 
-步骤 1 不实现 CP 数据移动。步骤 2 建立 fragment/solver plan，步骤 3 才接入 GroupCast/GroupReduce reference packing。
+步骤 2 已建立不可变的 host plan：`DsaFragmentSpec` 使用 sample-relative
+坐标；完整 plan 显式保存每 rank fragments、compressed block owner、分段
+restore map，以及 window KV / compressor overlap x 的 unique-row transfer
+table。sequential baseline 按 128 对齐连续切分；balanced solver 先最小化
+ratio=4 最慢 rank 的 Indexer scan cost，再在允许 slack 内按 token、通信、
+fragment overhead 和显存预测选择完整 E2E 最小的候选。rank 0 确定性求解后
+广播 plan，runtime 按 packed layout 与 policy 缓存。
+
+步骤 2 不移动 CP 数据；步骤 3 才接入 GroupCast/GroupReduce reference packing。
 
 ## Saved-state 与并发
 
@@ -85,6 +93,12 @@ V1 固定配置为：Hq=64、Hkv=1、D=512、rope dim=64、window=128、Hidx=64�
 docker run --rm --gpus all --ipc=host \
   -v /home/scratch.wewen_gpu:/ws -w /ws/MagiAttention/agents/worktrees/magi-dsa-v4-plan-grpcoll \
   magi-dsa-dev:v2 timeout 300 pytest -q tests/test_dsa/test_dsa_api.py
+
+# 步骤 2 host fragment/solver plan（不需要 GPU）
+docker run --rm \
+  -v /home/scratch.wewen_gpu:/ws -w /ws/MagiAttention/agents/worktrees/magi-dsa-v4-plan-grpcoll \
+  magi-dsa-dev:v2 timeout 300 pytest -q \
+  tests/test_dsa/test_dsa_dispatch.py tests/test_dsa/test_dsa_solver.py
 
 # 已有 DSA 原型回归
 docker run --rm --gpus all --ipc=host \

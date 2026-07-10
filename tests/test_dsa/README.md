@@ -30,7 +30,18 @@ docker run --rm --gpus all --ipc=host \
 Useful filters include `-k contract`, `-k compressor`, `-k reference`, and
 `-k kernel`.  A compiled kernel execution over 10 seconds is treated as a
 deadlock; later kernel unit tests use a 30-second watchdog and CP tests use a
-60-second watchdog.  CP=2 data movement is intentionally not part of step 1.
+60-second watchdog. CP=2 data movement is intentionally deferred to step 3;
+step 2 only builds and validates immutable host-side plans.
+
+The CPU-only fragment and solver tests run in the same frozen environment:
+
+```bash
+docker run --rm \
+  -v /home/scratch.wewen_gpu:/ws \
+  -w /ws/MagiAttention/agents/worktrees/magi-dsa-v4-plan-grpcoll \
+  magi-dsa-dev:v2 timeout 300 \
+  pytest -q tests/test_dsa/test_dsa_dispatch.py tests/test_dsa/test_dsa_solver.py
+```
 
 The final directory responsibilities are:
 

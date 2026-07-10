@@ -27,13 +27,15 @@ def dist_dsa_func(
     dsa_input: "MagiDSAInput",
     runtime_mgr: "MagiDSARuntimeMgr",
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Execute the step-1 CP=1 path without introducing a new autograd op."""
+    """Resolve the fragment plan, then execute the current CP=1 compute path."""
 
     runtime_mgr.validate_input(dsa_input)
+    dispatch_plan = runtime_mgr.get_dispatch_plan(dsa_input.packed_meta)
     if runtime_mgr.plan.cp_size != 1:
         raise NotImplementedError(
-            "CP=2 Magi_DSA communication is introduced in steps 2-6; "
-            "the step-1 runtime created its static plan and launched no collective"
+            "CP=2 DSA fragment plan is ready "
+            f"(hash={dispatch_plan.plan_hash[:12]}); tensor data movement starts "
+            "with GroupCast/GroupReduce in step 3"
         )
 
     output_flat, kl_loss = runtime_mgr.dsa_module.forward_packed(

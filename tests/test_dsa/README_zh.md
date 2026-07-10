@@ -28,7 +28,18 @@ docker run --rm --gpus all --ipc=host \
 
 可用 `-k contract`、`-k compressor`、`-k reference`、`-k kernel` 过滤。
 编译后单个 kernel 执行超过 10 秒视为死锁；后续 kernel 单测使用 30 秒
-watchdog，CP 测试使用 60 秒 watchdog。步骤 1 不包含 CP=2 数据通信。
+watchdog，CP 测试使用 60 秒 watchdog。CP=2 数据移动推迟到步骤 3；步骤 2
+只构建并验证不可变的 host plan。
+
+fragment 与 solver 是 CPU-only 测试，在同一冻结镜像中运行：
+
+```bash
+docker run --rm \
+  -v /home/scratch.wewen_gpu:/ws \
+  -w /ws/MagiAttention/agents/worktrees/magi-dsa-v4-plan-grpcoll \
+  magi-dsa-dev:v2 timeout 300 \
+  pytest -q tests/test_dsa/test_dsa_dispatch.py tests/test_dsa/test_dsa_solver.py
+```
 
 最终目录职责：`test_dsa_api.py` 覆盖 CP=1 公共 API；`test_dsa_cp.py`
 覆盖 CP=2；`test_dsa_dispatch.py` 与 `test_dsa_solver.py` 覆盖静态计划；

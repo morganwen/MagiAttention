@@ -15,5 +15,23 @@
 from .calc_meta import CalcMeta
 from .comm_meta import CommMeta
 from .dispatch_meta import DispatchMeta
+from .dsa_meta import (
+    DsaCompressedBlockSpec,
+    DsaDispatchPlan,
+    DsaFragmentSpec,
+    DsaRankPlan,
+    DsaRestoreSpec,
+    DsaTransferSpec,
+)
 
-__all__ = ["DispatchMeta", "CalcMeta", "CommMeta"]
+__all__ = [
+    "DispatchMeta",
+    "CalcMeta",
+    "CommMeta",
+    "DsaCompressedBlockSpec",
+    "DsaDispatchPlan",
+    "DsaFragmentSpec",
+    "DsaRankPlan",
+    "DsaRestoreSpec",
+    "DsaTransferSpec",
+]

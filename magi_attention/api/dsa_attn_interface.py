@@ -25,10 +25,10 @@ from magi_attention.dsa_runtime_mgr import MagiDSARuntimeMgr
 class DsaPackedMeta:
     """Packed sample boundaries for one DSA invocation.
 
-    ``cu_seqlens`` is the global logical sample layout.  In CP=1 its last
-    element must equal the number of packed input rows.  CP fragment metadata
-    will be added by the dispatch plan in step 2; it is deliberately not
-    encoded as positional arguments here.
+    ``cu_seqlens`` is the global logical sample layout. In CP=1 its last
+    element must equal the number of packed input rows. CP fragment metadata
+    is derived and cached by the runtime's dispatch solver; it is deliberately
+    not encoded as positional arguments here.
     """
 
     cu_seqlens: torch.Tensor

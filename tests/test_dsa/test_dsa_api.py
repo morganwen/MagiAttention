@@ -161,6 +161,20 @@ class TestDsaContract:
         assert runtime.plan.compress_ratio == 0
         assert not runtime.plan.communication_ready
 
+    def test_runtime_caches_fragment_plan_by_packed_layout_and_policy(self):
+        runtime = MagiDSARuntimeMgr(_make_config(4))
+        packed_meta = DsaPackedMeta(torch.tensor([0, 257, 270], dtype=torch.int32))
+        balanced = runtime.get_dispatch_plan(packed_meta)
+        assert balanced.sample_lengths == (257, 13)
+        assert balanced.compress_ratio == 4
+        assert balanced.cp_size == 1
+        assert runtime.get_dispatch_plan(packed_meta) is balanced
+        assert runtime.plan_cache_size == 1
+
+        sequential = runtime.get_dispatch_plan(packed_meta, policy="sequential")
+        assert sequential.policy == "sequential"
+        assert runtime.plan_cache_size == 2
+
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="H100/CUDA required")
     def test_input_rejects_shape_dtype_and_device_mismatch(self):
         runtime = MagiDSARuntimeMgr(_make_config(0)).cuda()

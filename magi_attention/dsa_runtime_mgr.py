@@ -22,6 +22,9 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from magi_attention.experimental.dsa_v4 import MagiDSAV4, MagiDSAV4Config
+from magi_attention.meta.collection.dsa_meta import DsaDispatchPlan
+from magi_attention.meta.solver.dsa_dispatch import DsaCostModel
+from magi_attention.meta.solver.dsa_solver import DsaPlanSolver
 
 if TYPE_CHECKING:
     from magi_attention.api.dsa_attn_interface import MagiDSAInput
@@ -29,7 +32,7 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class DsaStaticPlan:
-    """Step-1 plan skeleton, replaced by fragment plans in step 2."""
+    """Runtime-wide facts; packed-input fragment plans are cached separately."""
 
     cp_rank: int
     cp_size: int
@@ -40,9 +43,9 @@ class DsaStaticPlan:
 class MagiDSARuntimeMgr(nn.Module):
     """Own one fixed-ratio Magi_DSA module and its static CP plan.
 
-    Step 1 executes only the CP=1 packed path.  A manager constructed with a
-    larger process group still creates a deterministic plan skeleton, but
-    calculation raises before any collective is launched.
+    CP=1 currently executes the packed attention path. Step 2 adds immutable,
+    per-layout fragment plans for CP=1/2; CP=2 data movement remains disabled
+    until GroupCast/GroupReduce are connected in step 3.
     """
 
     _FIXED_CONFIG = {
@@ -83,7 +86,59 @@ class MagiDSARuntimeMgr(nn.Module):
             compress_ratio=config.compress_ratio,
             communication_ready=cp_size == 1,
         )
+        token_memory_bytes = 2 * (
+            config.hidden_size
+            + config.q_lora_rank
+            + 2 * config.num_heads * config.kv_dim
+            + config.kv_dim
+        )
+        compressed_block_memory_bytes = 2 * (config.kv_dim + config.indexer_dim)
+        remote_row_memory_bytes = 2 * max(config.hidden_size, config.kv_dim)
+        self._plan_solver = DsaPlanSolver(
+            alignment=128,
+            window_size=config.window_size,
+            cost_model=DsaCostModel(
+                token_memory_bytes=token_memory_bytes,
+                compressed_block_memory_bytes=compressed_block_memory_bytes,
+                remote_row_memory_bytes=remote_row_memory_bytes,
+            ),
+        )
         self.dsa_module = MagiDSAV4(config, dtype=torch.bfloat16)
+
+    @property
+    def plan_cache_size(self) -> int:
+        return self._plan_solver.cache_size
+
+    def get_dispatch_plan(
+        self,
+        packed_meta: "DsaPackedMeta",
+        *,
+        policy: str = "balanced",
+    ) -> DsaDispatchPlan:
+        """Return the cached immutable plan for one packed sample layout."""
+
+        from magi_attention.api.dsa_attn_interface import DsaPackedMeta
+
+        if not isinstance(packed_meta, DsaPackedMeta):
+            raise TypeError("packed_meta must be a DsaPackedMeta")
+        packed_meta.validate()
+        bounds = packed_meta.cu_seqlens.detach().cpu().tolist()
+        sample_lengths = tuple(
+            int(end - begin) for begin, end in zip(bounds, bounds[1:])
+        )
+        if self.cp_group is None:
+            return self._plan_solver.solve(
+                sample_lengths,
+                self.plan.cp_size,
+                self.config.compress_ratio,
+                policy=policy,
+            )
+        return self._plan_solver.solve_distributed(
+            sample_lengths,
+            self.config.compress_ratio,
+            self.cp_group,
+            policy=policy,
+        )
 
     @classmethod
     def _validate_config(cls, config: MagiDSAV4Config) -> None:
