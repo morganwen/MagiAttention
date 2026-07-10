@@ -294,6 +294,50 @@ def test_public_api_reference_matches_legacy_full_gradients(ratio):
     _run_public_legacy_parity(ratio, backend="reference")
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="H100/CUDA required")
+def test_public_api_saved_state_excludes_compressed_and_packed_tensors():
+    torch.manual_seed(20260710)
+    cfg = _make_config(4, backend="reference")
+    runtime = MagiDSARuntimeMgr(cfg).cuda().train()
+    dsa_input = _make_input(cfg, [5, 27])
+    saved = []
+
+    def pack(tensor):
+        saved.append(tensor)
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        output, kl_loss = calc_dsa(dsa_input, runtime)
+
+    assert len(saved) == 9
+    for actual, expected in zip(
+        saved[:5],
+        (
+            dsa_input.x,
+            dsa_input.qr,
+            dsa_input.q,
+            dsa_input.latent_kv,
+            dsa_input.sink,
+        ),
+    ):
+        assert actual.data_ptr() == expected.data_ptr()
+    assert saved[5].data_ptr() == output.data_ptr()
+    assert saved[6].dtype == torch.float32  # LSE (empty for reference seam)
+    assert saved[7].dtype == torch.int32  # topk_idx
+    assert saved[7].size(0) == dsa_input.x.size(0)
+    assert saved[8].dtype == torch.int32  # per-sample topk_length
+    assert saved[8].numel() == dsa_input.packed_meta.num_samples
+    compressed_rows = sum(length // cfg.compress_ratio for length in (5, 27))
+    forbidden_shapes = {
+        (compressed_rows, cfg.kv_dim),
+        (compressed_rows, cfg.indexer_dim),
+    }
+    assert all(tuple(tensor.shape) not in forbidden_shapes for tensor in saved)
+
+    torch.cuda.empty_cache()
+    (output.float().sum() + kl_loss).backward()
+
+
 def _kernel_dependencies_available() -> bool:
     try:
         from cudnn import DSA  # noqa: F401

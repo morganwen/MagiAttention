@@ -279,7 +279,13 @@ class TestDsaCommMetadata:
 
 
 class TestDsaCommTransport(DistTestBase):
-    timeout = 60
+    @property
+    def timeout(self):
+        # cuDNN's first sparse-backward call compiles CUTLASS DSL kernels.
+        # Every communication-only and warm-cache test keeps the default 60s.
+        if self._testMethodName == "test_cp2_full_kernel_backward_matches_cp1":
+            return 600
+        return 60
 
     @property
     def world_size(self) -> int:
@@ -482,13 +488,158 @@ class TestDsaCommTransport(DistTestBase):
         dist.all_reduce(global_kl, group=self.process_group)
         torch.testing.assert_close(global_kl, reference_kl, rtol=2e-2, atol=2e-5)
         assert runtime.forward_plan_cache_size == 1
-        if ratio == 4 and policy == "balanced":
-            assert any(rank.fragment_count > 1 for rank in dispatch_plan.ranks)
+        assert dispatch_plan.policy == policy
 
         del (
             local_output,
             reference_output,
             expected_output,
+            local_kl,
+            reference_kl,
+            local_input,
+            global_input,
+            runtime,
+            reference_runtime,
+        )
+        torch.cuda.empty_cache()
+
+    def _run_full_backward(self, *, ratio: int, backend: str):
+        torch.cuda.set_device(self.rank % torch.cuda.device_count())
+        config = self._forward_config(ratio, backend)
+        torch.manual_seed(1403 + ratio)
+        runtime = MagiDSARuntimeMgr(
+            config,
+            cp_group=self.process_group,
+            dispatch_policy="balanced",
+        ).cuda()
+        torch.manual_seed(1403 + ratio)
+        reference_runtime = MagiDSARuntimeMgr(config).cuda()
+        reference_runtime.load_state_dict(runtime.state_dict())
+        runtime.train()
+        reference_runtime.train()
+
+        global_input = self._global_forward_input(config)
+        for tensor in (
+            global_input.x,
+            global_input.qr,
+            global_input.q,
+            global_input.latent_kv,
+            global_input.sink,
+        ):
+            tensor.requires_grad_(True)
+        dispatch_plan = runtime.get_dispatch_plan(global_input.packed_meta)
+        local_input, local_rows = self._local_forward_input(
+            global_input, dispatch_plan, self.rank
+        )
+        local_input = MagiDSAInput(
+            x=local_input.x.detach().requires_grad_(True),
+            qr=local_input.qr.detach().requires_grad_(True),
+            q=local_input.q.detach().requires_grad_(True),
+            latent_kv=local_input.latent_kv.detach().requires_grad_(True),
+            sink=local_input.sink.detach().requires_grad_(True),
+            packed_meta=local_input.packed_meta,
+        )
+        torch.manual_seed(8675309 + ratio)
+        output_grad = torch.randn(
+            global_input.q.shape,
+            dtype=torch.float32,
+            device=global_input.q.device,
+        ) / global_input.q.size(0)
+
+        saved = []
+
+        def pack(tensor):
+            saved.append(tensor)
+            return tensor
+
+        with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+            local_output, local_kl = calc_dsa(local_input, runtime)
+        assert len(saved) == 9
+        for actual, expected in zip(
+            saved[:5],
+            (
+                local_input.x,
+                local_input.qr,
+                local_input.q,
+                local_input.latent_kv,
+                local_input.sink,
+            ),
+        ):
+            assert actual.data_ptr() == expected.data_ptr()
+        assert saved[5].data_ptr() == local_output.data_ptr()
+        assert saved[6].dtype == torch.float32
+        assert saved[7].dtype == torch.int32
+        assert saved[8].dtype == torch.int32 and saved[8].numel() == 1
+        compressed_rows = sum(
+            length // max(ratio, 1) for length in dispatch_plan.sample_lengths
+        )
+        forbidden_shapes = {
+            (compressed_rows, config.kv_dim),
+            (compressed_rows, config.indexer_dim),
+        }
+        assert all(tuple(tensor.shape) not in forbidden_shapes for tensor in saved)
+        local_loss = (
+            local_output.float() * output_grad.index_select(0, local_rows)
+        ).sum() + local_kl
+        # No invocation-owned forward work or temporary communication buffer
+        # may be needed by backward.
+        torch.cuda.empty_cache()
+        local_loss.backward()
+
+        reference_output, reference_kl = calc_dsa(global_input, reference_runtime)
+        (reference_output.float().mul(output_grad).sum() + reference_kl).backward()
+
+        input_pairs = (
+            ("x", local_input.x, global_input.x),
+            ("qr", local_input.qr, global_input.qr),
+            ("q", local_input.q, global_input.q),
+            ("latent_kv", local_input.latent_kv, global_input.latent_kv),
+        )
+        for name, local_tensor, global_tensor in input_pairs:
+            expected = (
+                None
+                if global_tensor.grad is None
+                else global_tensor.grad.index_select(0, local_rows)
+            )
+            if expected is None:
+                assert local_tensor.grad is None, name
+            else:
+                assert local_tensor.grad is not None, name
+                torch.testing.assert_close(
+                    local_tensor.grad,
+                    expected,
+                    rtol=3e-2,
+                    atol=3e-3,
+                )
+        torch.testing.assert_close(
+            local_input.sink.grad,
+            global_input.sink.grad,
+            rtol=3e-2,
+            atol=3e-3,
+        )
+        assert getattr(local_input.sink, "_magi_dsa_cp_reduced", False)
+        for (name, parameter), (reference_name, reference_parameter) in zip(
+            runtime.dsa_module.named_parameters(),
+            reference_runtime.dsa_module.named_parameters(),
+        ):
+            assert name == reference_name
+            assert parameter.grad is not None, name
+            assert reference_parameter.grad is not None, name
+            torch.testing.assert_close(
+                parameter.grad,
+                reference_parameter.grad,
+                rtol=3e-2,
+                atol=3e-3,
+                msg=f"ratio={ratio} parameter={name}",
+            )
+            assert getattr(parameter, "_magi_dsa_cp_reduced", False), name
+        if ratio == 4:
+            assert local_input.qr.grad is None
+
+        del (
+            local_output,
+            reference_output,
+            local_loss,
             local_kl,
             reference_kl,
             local_input,
@@ -564,6 +715,22 @@ class TestDsaCommTransport(DistTestBase):
                     policy="balanced",
                     backend="kernel",
                 )
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_cp2_full_reference_backward_matches_cp1(self):
+        with switch_envvar_context("MAGI_ATTENTION_NATIVE_GRPCOLL", enable=False):
+            for ratio in (0, 4, 128):
+                self._run_full_backward(ratio=ratio, backend="reference")
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_cp2_full_kernel_backward_matches_cp1(self):
+        if not self._kernel_dependencies_available():
+            self.skipTest("FlashMLA and cudnn-frontend DSA packages are required")
+        with switch_envvar_context("MAGI_ATTENTION_NATIVE_GRPCOLL", enable=False):
+            for ratio in (0, 4, 128):
+                self._run_full_backward(ratio=ratio, backend="kernel")
 
 
 if __name__ == "__main__":

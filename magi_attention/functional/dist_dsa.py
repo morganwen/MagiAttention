@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Magi_DSA packed context-parallel forward orchestration.
+"""Magi_DSA packed forward/backward orchestration.
 
 CP=2 inputs are owner-local rows in the immutable fragment order selected by
 the runtime solver.  Window KV and ratio-4 overlap X use their static transfer
@@ -20,9 +20,11 @@ tables; compressed KV and Indexer K are broadcast to every peer.  All dynamic
 Indexer selections stay on the device and one packed sparse-attention call
 produces this rank's local output.
 
-Step 5 intentionally owns forward only.  The typed GroupCast work objects are
-kept invocation-local so step 6 can pair them with symmetric GroupReduce in a
-custom backward without changing the static plan or public API.
+The custom autograd boundaries retain only original owner-local inputs plus
+O/LSE/top-k state.  Backward reissues every typed GroupCast, recomputes the
+compressors, reverses row routes with FP32 CSR + GroupReduce, and reduces
+replicated sink/parameter gradients internally without retaining forward work
+objects or remote/compressed buffers.
 """
 
 from __future__ import annotations
@@ -40,7 +42,9 @@ from magi_attention.functional.dsa_comm import (
     DsaTypedPayload,
     build_dsa_comm_plan,
     materialize_dsa_comm_plan,
+    reduce_replicated_dsa_gradient,
     start_dsa_group_cast,
+    start_dsa_group_reduce,
 )
 from magi_attention.meta.collection.dsa_meta import (
     DsaDispatchPlan,
@@ -52,7 +56,10 @@ if TYPE_CHECKING:
     from magi_attention.api.dsa_attn_interface import MagiDSAInput
     from magi_attention.dsa_runtime_mgr import MagiDSARuntimeMgr
     from magi_attention.experimental.dsa_v4.compressor import DSAv4Compressor
-    from magi_attention.kernel.cutedsl.dsa_pack import DsaDeviceCopyMap
+    from magi_attention.kernel.cutedsl.dsa_pack import (
+        DsaDeviceCopyMap,
+        DsaDeviceReduceMap,
+    )
 
 
 @dataclass(frozen=True)
@@ -74,8 +81,10 @@ class DsaForwardPlan:
     comm_plan: DsaCommPlan
     device_comm_plan: DsaDeviceCommPlan
     compressor_source_map: "DsaDeviceCopyMap"
+    compressor_source_restore: "DsaDeviceReduceMap"
     compressor_runs: tuple[DsaCompressorRun, ...]
     compressed_global_map: "DsaDeviceCopyMap"
+    compressed_available_restore: "DsaDeviceReduceMap"
     window_indices: torch.Tensor
     dense_compressed_indices: torch.Tensor
     sample_block_offsets: tuple[int, ...]
@@ -95,6 +104,15 @@ def _unique_row_lookup(name: str, row_ids: tuple[int, ...]) -> dict[int, int]:
     if len(lookup) != len(row_ids):
         raise RuntimeError(f"{name} contains duplicate logical rows")
     return lookup
+
+
+def _inverse_reduce_rows(
+    destination_to_source: list[int], source_row_count: int
+) -> list[list[int]]:
+    rows: list[list[int]] = [[] for _ in range(source_row_count)]
+    for destination_row, source_row in enumerate(destination_to_source):
+        rows[source_row].append(destination_row)
+    return rows
 
 
 def _local_query_rows(
@@ -133,6 +151,7 @@ def build_dsa_forward_plan(
 
     from magi_attention.kernel.cutedsl.dsa_pack import (
         make_dsa_device_copy_map,
+        make_dsa_device_reduce_map,
         make_dsa_device_remap_lut,
         remap_dsa_indices,
     )
@@ -184,6 +203,11 @@ def build_dsa_forward_plan(
         len(overlap_ids),
         device,
     )
+    compressor_source_restore = make_dsa_device_reduce_map(
+        _inverse_reduce_rows(compressor_source_rows, len(overlap_ids)),
+        len(compressor_source_rows),
+        device,
+    )
 
     # Every rank receives all remote compressed rows. Reorder the stable
     # local+remote concatenation into packed-global logical block order once.
@@ -202,6 +226,11 @@ def build_dsa_forward_plan(
     compressed_global_map = make_dsa_device_copy_map(
         compressed_global_rows,
         len(compressed_ids),
+        device,
+    )
+    compressed_available_restore = make_dsa_device_reduce_map(
+        _inverse_reduce_rows(compressed_global_rows, len(compressed_ids)),
+        len(compressed_global_rows),
         device,
     )
 
@@ -265,8 +294,10 @@ def build_dsa_forward_plan(
         comm_plan=comm_plan,
         device_comm_plan=device_comm_plan,
         compressor_source_map=compressor_source_map,
+        compressor_source_restore=compressor_source_restore,
         compressor_runs=tuple(compressor_runs),
         compressed_global_map=compressed_global_map,
+        compressed_available_restore=compressed_available_restore,
         window_indices=window_indices,
         dense_compressed_indices=dense_compressed_indices,
         sample_block_offsets=block_offsets,
@@ -300,6 +331,8 @@ def _ratio4_indices_and_kl(
     forward_plan: DsaForwardPlan,
     compressed_kv: torch.Tensor,
     compressed_ki: torch.Tensor,
+    *,
+    force_kl: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run fragment-local Indexer selection against sample-global keys."""
 
@@ -390,7 +423,7 @@ def _ratio4_indices_and_kl(
         valid = (local_ids >= 0) & (local_ids < visible)
         local_ids = torch.where(valid, local_ids, torch.full_like(local_ids, -1))
 
-        if runtime_mgr.training and torch.is_grad_enabled():
+        if runtime_mgr.training and (torch.is_grad_enabled() or force_kl):
             if cfg.backend == "kernel":
                 from magi_attention.experimental.dsa_v4.kernels import (
                     indexer_kl_loss_kernel,
@@ -440,20 +473,70 @@ def _ratio4_indices_and_kl(
     return selected_rows, kl_loss
 
 
-def _dist_dsa_forward(
+def _run_attention_forward_state(
+    q: torch.Tensor,
+    kv_full: torch.Tensor,
+    sink: torch.Tensor,
+    topk_indices: torch.Tensor,
+    runtime_mgr: "MagiDSARuntimeMgr",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run sparse attention while retaining only its backward ABI state."""
+
+    cfg = runtime_mgr.config
+    if cfg.backend == "kernel":
+        from magi_attention.experimental.dsa_v4.kernels import (
+            _ensure_flash_mla,
+            _topk_alignment,
+        )
+
+        alignment = _topk_alignment()
+        padded_width = (topk_indices.size(1) + alignment - 1) // alignment * alignment
+        kernel_indices = topk_indices
+        if padded_width != topk_indices.size(1):
+            kernel_indices = torch.nn.functional.pad(
+                topk_indices,
+                (0, padded_width - topk_indices.size(1)),
+                value=-1,
+            )
+        output, _max_logits, lse = _ensure_flash_mla()(
+            q.contiguous(),
+            kv_full.unsqueeze(1),
+            kernel_indices.contiguous().unsqueeze(1),
+            cfg.softmax_scale,
+            d_v=q.size(-1),
+            attn_sink=sink.float(),
+        )
+        return output, lse.float()
+
+    output_flat = runtime_mgr.dsa_module._run_attention(
+        q.unsqueeze(1),
+        kv_full.unsqueeze(1),
+        sink,
+        topk_indices.unsqueeze(0),
+        cfg,
+    ).squeeze(1)
+    output = output_flat.reshape(q.size(0), cfg.num_heads, cfg.kv_dim)
+    # The reference backward is an explicit testing seam and recomputes the
+    # reference attention.  Production kernel backward consumes real FP32 LSE.
+    return output, torch.empty(0, dtype=torch.float32, device=q.device)
+
+
+def _dist_dsa_forward_state(
     dsa_input: "MagiDSAInput",
     runtime_mgr: "MagiDSARuntimeMgr",
-    dispatch_plan: DsaDispatchPlan,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    forward_plan: DsaForwardPlan,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Execute CP=2 forward and return the frozen minimal backward state."""
+
     from magi_attention.kernel.cutedsl.dsa_pack import copy_dsa_rows
 
+    dispatch_plan = forward_plan.dispatch_plan
     rank_plan = dispatch_plan.ranks[runtime_mgr.plan.cp_rank]
     if dsa_input.q.size(0) != rank_plan.token_count:
         raise ValueError(
             f"rank {runtime_mgr.plan.cp_rank} must provide {rank_plan.token_count} "
             f"fragment-ordered rows, got {dsa_input.q.size(0)}"
         )
-    forward_plan = runtime_mgr.get_forward_plan(dispatch_plan, dsa_input.q.device)
     comm_plan = forward_plan.comm_plan
     device_plan = forward_plan.device_comm_plan
 
@@ -537,6 +620,7 @@ def _dist_dsa_forward(
             forward_plan,
             compressed_global,
             compressed_ki_global,
+            force_kl=True,
         )
     elif dispatch_plan.compress_ratio == 128 and compressed_global.size(0):
         compressed_indices = forward_plan.dense_compressed_indices
@@ -549,19 +633,929 @@ def _dist_dsa_forward(
     topk_indices = torch.cat(
         [forward_plan.window_indices, compressed_indices], dim=-1
     ).contiguous()
-    output_flat = module._run_attention(
-        dsa_input.q.unsqueeze(1),
-        kv_full.unsqueeze(1),
+    output, lse = _run_attention_forward_state(
+        dsa_input.q,
+        kv_full,
         dsa_input.sink,
-        topk_indices.unsqueeze(0),
-        runtime_mgr.config,
-    ).squeeze(1)
-    output = output_flat.reshape(
-        dsa_input.q.size(0),
-        runtime_mgr.config.num_heads,
-        runtime_mgr.config.kv_dim,
+        topk_indices,
+        runtime_mgr,
     )
-    return output, kl_loss
+    return output, kl_loss, lse, topk_indices
+
+
+def _attention_backward(
+    q: torch.Tensor,
+    kv_full: torch.Tensor,
+    sink: torch.Tensor,
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    topk_indices: torch.Tensor,
+    d_output: torch.Tensor,
+    runtime_mgr: "MagiDSARuntimeMgr",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Apply the kernel ABI, or the differentiable reference testing seam."""
+
+    cfg = runtime_mgr.config
+    if cfg.backend == "kernel":
+        from magi_attention.experimental.dsa_v4.kernels import (
+            _ensure_dsa,
+            _topk_alignment,
+        )
+
+        alignment = _topk_alignment()
+        padded_width = (topk_indices.size(1) + alignment - 1) // alignment * alignment
+        kernel_indices = topk_indices
+        if padded_width != topk_indices.size(1):
+            kernel_indices = torch.nn.functional.pad(
+                topk_indices,
+                (0, padded_width - topk_indices.size(1)),
+                value=-1,
+            )
+        result = _ensure_dsa().sparse_attention_backward_wrapper(
+            q,
+            kv_full,
+            output,
+            d_output.contiguous(),
+            lse,
+            sink,
+            kernel_indices.contiguous(),
+            softmax_scale=cfg.softmax_scale,
+            topk_length=None,
+        )
+        return result["dq"], result["dkv"], result["d_sink"]
+
+    from magi_attention.experimental.dsa_v4.reference import sparse_attn_with_sink
+
+    with torch.enable_grad():
+        q_ref = q.detach().requires_grad_(True)
+        kv_ref = kv_full.detach().requires_grad_(True)
+        sink_ref = sink.detach().requires_grad_(True)
+        output_ref = sparse_attn_with_sink(
+            q_ref.unsqueeze(1),
+            kv_ref.unsqueeze(1),
+            sink_ref,
+            topk_indices.unsqueeze(0),
+            cfg.softmax_scale,
+        ).squeeze(1)
+        output_ref = output_ref.reshape_as(output)
+        dq, dkv, d_sink = torch.autograd.grad(
+            output_ref,
+            (q_ref, kv_ref, sink_ref),
+            d_output,
+        )
+    return dq, dkv, d_sink
+
+
+def _saved_topk_kl(
+    x: torch.Tensor,
+    qr: torch.Tensor,
+    q: torch.Tensor,
+    compressed_kv: torch.Tensor,
+    compressed_ki: torch.Tensor,
+    topk_indices: torch.Tensor,
+    runtime_mgr: "MagiDSARuntimeMgr",
+    forward_plan: DsaForwardPlan,
+) -> torch.Tensor:
+    """Recompute Indexer scores for KL backward without selecting top-k."""
+
+    cfg = runtime_mgr.config
+    indexer = runtime_mgr.dsa_module.indexer
+    if indexer is None:
+        return torch.zeros((), dtype=torch.float32, device=x.device)
+    compressed_selected = topk_indices[:, cfg.window_size : cfg.window_size + cfg.topk]
+    total_global = max(forward_plan.dispatch_plan.total_tokens, 1)
+    kl_loss = torch.zeros((), dtype=torch.float32, device=x.device)
+    local_begin = 0
+    for fragment in forward_plan.dispatch_plan.ranks[
+        runtime_mgr.plan.cp_rank
+    ].fragments:
+        local_end = local_begin + fragment.token_count
+        sample_begin = forward_plan.sample_block_offsets[fragment.sample_id]
+        sample_end = forward_plan.sample_block_offsets[fragment.sample_id + 1]
+        if sample_end == sample_begin:
+            local_begin = local_end
+            continue
+        selected_global = compressed_selected[local_begin:local_end]
+        selected_block = selected_global - forward_plan.available_token_count
+        local_ids = torch.where(
+            selected_global >= 0,
+            selected_block - sample_begin,
+            torch.full_like(selected_global, -1),
+        ).unsqueeze(0)
+        q_idx, w_idx = indexer.project_queries(
+            x[local_begin:local_end].detach().unsqueeze(1),
+            qr[local_begin:local_end].detach().unsqueeze(1),
+            row_offset=fragment.q_begin,
+        )
+        k_sample = compressed_ki[sample_begin:sample_end].unsqueeze(1)
+        comp_sample = compressed_kv[sample_begin:sample_end].detach().unsqueeze(1)
+        if cfg.backend == "kernel":
+            from magi_attention.experimental.dsa_v4.kernels import (
+                indexer_kl_loss_kernel,
+            )
+
+            kl_fragment = indexer_kl_loss_kernel(
+                local_ids,
+                q_idx,
+                w_idx,
+                k_sample,
+                q[local_begin:local_end].detach().unsqueeze(1),
+                comp_sample,
+                cfg.softmax_scale,
+                indexer.softmax_scale,
+                cfg.indexer_loss_coeff,
+                total_global=total_global,
+            )
+        else:
+            from magi_attention.experimental.dsa_v4.reference import (
+                indexer_kl_loss_selected,
+            )
+
+            kl_fragment = indexer_kl_loss_selected(
+                local_ids,
+                q_idx,
+                w_idx,
+                k_sample,
+                q[local_begin:local_end].detach().unsqueeze(1),
+                comp_sample,
+                cfg.softmax_scale,
+                indexer.softmax_scale,
+                cfg.indexer_loss_coeff,
+                calculate_per_token_loss=True,
+            )
+            kl_fragment = kl_fragment / total_global
+        kl_loss = kl_loss + kl_fragment
+        local_begin = local_end
+    if local_begin != forward_plan.local_token_count:
+        raise RuntimeError("KL recompute did not cover every local query row")
+    return kl_loss
+
+
+def _add_parameter_gradients(
+    accumulators: list[torch.Tensor | None],
+    gradients: tuple[torch.Tensor | None, ...],
+) -> None:
+    for index, gradient in enumerate(gradients):
+        if gradient is None:
+            continue
+        value = gradient.float()
+        if accumulators[index] is None:
+            accumulators[index] = value
+        else:
+            accumulators[index] = accumulators[index] + value
+
+
+class _DistDsa(torch.autograd.Function):
+    """CP=2 autograd boundary with recompute-and-reverse communication."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        runtime_mgr: "MagiDSARuntimeMgr",
+        forward_plan: DsaForwardPlan,
+        packed_meta,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        q: torch.Tensor,
+        latent_kv: torch.Tensor,
+        sink: torch.Tensor,
+        *parameters: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from magi_attention.api.dsa_attn_interface import MagiDSAInput
+
+        dsa_input = MagiDSAInput(
+            x=x,
+            qr=qr,
+            q=q,
+            latent_kv=latent_kv,
+            sink=sink,
+            packed_meta=packed_meta,
+        )
+        output, kl_loss, lse, topk_indices = _dist_dsa_forward_state(
+            dsa_input,
+            runtime_mgr,
+            forward_plan,
+        )
+        topk_length = torch.tensor(
+            topk_indices.size(1), dtype=torch.int32, device=topk_indices.device
+        )
+        ctx.runtime_mgr = runtime_mgr
+        ctx.forward_plan = forward_plan
+        ctx.parameter_count = len(parameters)
+        ctx.compute_kl = runtime_mgr.training
+        ctx.save_for_backward(
+            x,
+            qr,
+            q,
+            latent_kv,
+            sink,
+            output,
+            lse,
+            topk_indices,
+            topk_length,
+        )
+        return output, kl_loss
+
+    @staticmethod
+    def backward(ctx, d_output: torch.Tensor | None, d_kl: torch.Tensor | None):
+        (
+            x,
+            qr,
+            q,
+            latent_kv,
+            sink,
+            output,
+            lse,
+            topk_indices,
+            topk_length,
+        ) = ctx.saved_tensors
+        del topk_length
+        runtime_mgr = ctx.runtime_mgr
+        forward_plan = ctx.forward_plan
+        module = runtime_mgr.dsa_module
+        cfg = runtime_mgr.config
+        comm_plan = forward_plan.comm_plan
+        device_plan = forward_plan.device_comm_plan
+        parameters = tuple(module.parameters())
+        if len(parameters) != ctx.parameter_count:
+            raise RuntimeError("DSA parameter set changed between forward and backward")
+        parameter_grads: list[torch.Tensor | None] = [None] * len(parameters)
+
+        from magi_attention.kernel.cutedsl.dsa_pack import (
+            copy_dsa_rows,
+            reduce_dsa_rows_csr,
+        )
+
+        # Forward work/buffers are intentionally gone. Reissue all four routes
+        # from original owner-local inputs, then recompute both compressors.
+        window_work = start_dsa_group_cast(
+            DsaTypedPayload(DsaPayloadKind.WINDOW_KV, latent_kv),
+            comm_plan.window_kv,
+            device_map=device_plan.window_kv,
+            async_op=True,
+        )
+        overlap_work = start_dsa_group_cast(
+            DsaTypedPayload(DsaPayloadKind.OVERLAP_X, x),
+            comm_plan.overlap_x,
+            device_map=device_plan.overlap_x,
+            async_op=True,
+        )
+        remote_overlap = overlap_work.wait().tensor
+        overlap_available = torch.cat([x, remote_overlap], dim=0).contiguous()
+        compressor_source_data = copy_dsa_rows(
+            overlap_available,
+            forward_plan.compressor_source_map,
+        )
+
+        with torch.enable_grad():
+            compressor_source = compressor_source_data.detach().requires_grad_(True)
+            if module.compressor is None:
+                compressed_local = x.new_empty((0, cfg.kv_dim))
+            else:
+                compressed_local = _run_owner_compressor(
+                    module.compressor,
+                    compressor_source,
+                    forward_plan,
+                )
+            if module.indexer is None:
+                compressed_ki_local = x.new_empty((0, cfg.indexer_dim))
+            else:
+                compressed_ki_local = _run_owner_compressor(
+                    module.indexer.compressor,
+                    compressor_source_data.detach(),
+                    forward_plan,
+                )
+
+        compressed_work = start_dsa_group_cast(
+            DsaTypedPayload(DsaPayloadKind.COMPRESSED_KV, compressed_local),
+            comm_plan.compressed_kv,
+            device_map=device_plan.compressed_kv,
+            async_op=True,
+        )
+        compressed_ki_work = start_dsa_group_cast(
+            DsaTypedPayload(DsaPayloadKind.COMPRESSED_KI, compressed_ki_local),
+            comm_plan.compressed_ki,
+            device_map=device_plan.compressed_ki,
+            async_op=True,
+        )
+        remote_window = window_work.wait().tensor
+        remote_compressed = compressed_work.wait().tensor
+        remote_compressed_ki = compressed_ki_work.wait().tensor
+        token_available = torch.cat([latent_kv, remote_window], dim=0).contiguous()
+        compressed_available = torch.cat(
+            [compressed_local.detach(), remote_compressed], dim=0
+        ).contiguous()
+        compressed_global = copy_dsa_rows(
+            compressed_available,
+            forward_plan.compressed_global_map,
+        )
+
+        # KL first: score recompute/backward creates dKi, then the symmetric
+        # compressed-Ki GroupReduce returns it to the compressor owner.
+        if ctx.compute_kl and module.indexer is not None and compressed_global.size(0):
+            compressed_ki_available = torch.cat(
+                [compressed_ki_local.detach(), remote_compressed_ki], dim=0
+            ).contiguous()
+            compressed_ki_global_data = copy_dsa_rows(
+                compressed_ki_available,
+                forward_plan.compressed_global_map,
+            )
+            with torch.enable_grad():
+                compressed_ki_global = (
+                    compressed_ki_global_data.detach().requires_grad_(True)
+                )
+                kl_recomputed = _saved_topk_kl(
+                    x,
+                    qr,
+                    q,
+                    compressed_global,
+                    compressed_ki_global,
+                    topk_indices,
+                    runtime_mgr,
+                    forward_plan,
+                )
+                kl_upstream = (
+                    torch.zeros((), dtype=torch.float32, device=x.device)
+                    if d_kl is None
+                    else d_kl.float()
+                )
+                kl_grads = torch.autograd.grad(
+                    kl_recomputed,
+                    (compressed_ki_global, *parameters),
+                    kl_upstream,
+                    allow_unused=True,
+                )
+            d_compressed_ki_global = kl_grads[0].float()
+            _add_parameter_gradients(parameter_grads, kl_grads[1:])
+            d_compressed_ki_available = reduce_dsa_rows_csr(
+                d_compressed_ki_global,
+                forward_plan.compressed_available_restore,
+            )
+            ki_local_count = comm_plan.compressed_ki.local_row_count
+            d_compressed_ki_local = d_compressed_ki_available[:ki_local_count]
+            d_remote_compressed_ki = d_compressed_ki_available[ki_local_count:]
+        else:
+            d_compressed_ki_local = x.new_zeros(
+                (comm_plan.compressed_ki.local_row_count, cfg.indexer_dim),
+                dtype=torch.float32,
+            )
+            d_remote_compressed_ki = x.new_zeros(
+                (comm_plan.compressed_ki.receive_row_count, cfg.indexer_dim),
+                dtype=torch.float32,
+            )
+        owner_d_compressed_ki = (
+            start_dsa_group_reduce(
+                DsaTypedPayload(DsaPayloadKind.COMPRESSED_KI, d_remote_compressed_ki),
+                DsaTypedPayload(DsaPayloadKind.COMPRESSED_KI, d_compressed_ki_local),
+                compressed_ki_work,
+                output_dtype=torch.float32,
+            )
+            .wait()
+            .tensor
+        )
+
+        kv_full = torch.cat([token_available, compressed_global], dim=0)
+        if d_output is None:
+            d_output = torch.zeros_like(output)
+        dq, dkv_full, d_sink_local = _attention_backward(
+            q,
+            kv_full,
+            sink,
+            output,
+            lse,
+            topk_indices,
+            d_output,
+            runtime_mgr,
+        )
+        available_count = forward_plan.available_token_count
+        d_token_available = dkv_full[:available_count].float()
+        d_compressed_global = dkv_full[available_count:].float()
+        d_compressed_available = reduce_dsa_rows_csr(
+            d_compressed_global,
+            forward_plan.compressed_available_restore,
+        )
+        compressed_local_count = comm_plan.compressed_kv.local_row_count
+        d_compressed_local = d_compressed_available[:compressed_local_count]
+        d_remote_compressed = d_compressed_available[compressed_local_count:]
+        owner_d_compressed = (
+            start_dsa_group_reduce(
+                DsaTypedPayload(DsaPayloadKind.COMPRESSED_KV, d_remote_compressed),
+                DsaTypedPayload(DsaPayloadKind.COMPRESSED_KV, d_compressed_local),
+                compressed_work,
+                output_dtype=torch.float32,
+            )
+            .wait()
+            .tensor
+        )
+
+        local_token_count = forward_plan.local_token_count
+        d_local_kv = d_token_available[:local_token_count]
+        d_remote_window = d_token_available[local_token_count:]
+        owner_d_kv = (
+            start_dsa_group_reduce(
+                DsaTypedPayload(DsaPayloadKind.WINDOW_KV, d_remote_window),
+                DsaTypedPayload(DsaPayloadKind.WINDOW_KV, d_local_kv),
+                window_work,
+                output_dtype=latent_kv.dtype,
+            )
+            .wait()
+            .tensor
+        )
+
+        # PyTorch owns both compressor backwards. The main compressor returns
+        # a source-row gradient; the detached Indexer compressor returns only
+        # its parameter gradients.
+        d_compressor_source = torch.zeros_like(
+            compressor_source_data, dtype=torch.float32
+        )
+        if module.compressor is not None and compressed_local.numel():
+            main_grads = torch.autograd.grad(
+                compressed_local,
+                (compressor_source, *parameters),
+                owner_d_compressed.to(compressed_local.dtype),
+                allow_unused=True,
+            )
+            if main_grads[0] is not None:
+                d_compressor_source = main_grads[0].float()
+            _add_parameter_gradients(parameter_grads, main_grads[1:])
+        if module.indexer is not None and compressed_ki_local.numel():
+            indexer_compressor_grads = torch.autograd.grad(
+                compressed_ki_local,
+                parameters,
+                owner_d_compressed_ki.to(compressed_ki_local.dtype),
+                allow_unused=True,
+            )
+            _add_parameter_gradients(parameter_grads, indexer_compressor_grads)
+
+        d_overlap_available = reduce_dsa_rows_csr(
+            d_compressor_source,
+            forward_plan.compressor_source_restore,
+        )
+        overlap_local_count = comm_plan.overlap_x.local_row_count
+        d_local_x = d_overlap_available[:overlap_local_count]
+        d_remote_overlap = d_overlap_available[overlap_local_count:]
+        owner_d_x = (
+            start_dsa_group_reduce(
+                DsaTypedPayload(DsaPayloadKind.OVERLAP_X, d_remote_overlap),
+                DsaTypedPayload(DsaPayloadKind.OVERLAP_X, d_local_x),
+                overlap_work,
+                output_dtype=x.dtype,
+            )
+            .wait()
+            .tensor
+        )
+
+        d_sink = reduce_replicated_dsa_gradient(
+            d_sink_local,
+            runtime_mgr.cp_group,
+            output_dtype=sink.dtype,
+        )
+        setattr(sink, "_magi_dsa_cp_reduced", True)
+        reduced_parameter_grads: list[torch.Tensor] = []
+        for parameter, local_gradient in zip(parameters, parameter_grads):
+            if local_gradient is None:
+                local_gradient = torch.zeros_like(parameter, dtype=torch.float32)
+            reduced = reduce_replicated_dsa_gradient(
+                local_gradient,
+                runtime_mgr.cp_group,
+                output_dtype=parameter.dtype,
+            )
+            setattr(parameter, "_magi_dsa_cp_reduced", True)
+            reduced_parameter_grads.append(reduced)
+
+        d_x = owner_d_x if module.compressor is not None else None
+        return (
+            None,
+            None,
+            None,
+            d_x,
+            None,
+            dq,
+            owner_d_kv,
+            d_sink,
+            *reduced_parameter_grads,
+        )
+
+
+def _dist_dsa_forward(
+    dsa_input: "MagiDSAInput",
+    runtime_mgr: "MagiDSARuntimeMgr",
+    dispatch_plan: DsaDispatchPlan,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    forward_plan = runtime_mgr.get_forward_plan(dispatch_plan, dsa_input.q.device)
+    parameters = tuple(runtime_mgr.dsa_module.parameters())
+    # This invocation owns the CP reduction for these replicated gradients;
+    # mark the public tensors before saved-tensor hooks can wrap them.
+    setattr(dsa_input.sink, "_magi_dsa_cp_reduced", True)
+    for parameter in parameters:
+        setattr(parameter, "_magi_dsa_cp_reduced", True)
+    return _DistDsa.apply(
+        runtime_mgr,
+        forward_plan,
+        dsa_input.packed_meta,
+        dsa_input.x,
+        dsa_input.qr,
+        dsa_input.q,
+        dsa_input.latent_kv,
+        dsa_input.sink,
+        *parameters,
+    )
+
+
+def _single_forward_state(
+    x: torch.Tensor,
+    qr: torch.Tensor,
+    q: torch.Tensor,
+    latent_kv: torch.Tensor,
+    sink: torch.Tensor,
+    bounds: tuple[int, ...],
+    runtime_mgr: "MagiDSARuntimeMgr",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, tuple[int, ...]]:
+    """CP=1 packed forward with the same minimal kernel backward ABI."""
+
+    from magi_attention.experimental.dsa_v4.indexer import (
+        build_block_causal_mask,
+        compute_index_scores,
+    )
+    from magi_attention.experimental.dsa_v4.reference import (
+        get_compress_topk_idxs,
+        get_window_topk_idxs,
+        indexer_kl_loss,
+        validate_and_offset_topk,
+    )
+
+    cfg = runtime_mgr.config
+    module = runtime_mgr.dsa_module
+    outputs: list[torch.Tensor] = []
+    lse_pieces: list[torch.Tensor] = []
+    index_pieces: list[torch.Tensor] = []
+    widths: list[int] = []
+    kl_sum = torch.zeros((), dtype=torch.float32, device=x.device)
+
+    for start, end in zip(bounds[:-1], bounds[1:]):
+        sq = end - start
+        if sq == 0:
+            widths.append(0)
+            continue
+        x_sample = x[start:end].unsqueeze(1)
+        qr_sample = qr[start:end].unsqueeze(1)
+        q_sample = q[start:end]
+        kv_sample = latent_kv[start:end]
+        window = get_window_topk_idxs(cfg.window_size, 1, sq, x.device)
+        compressed = None
+        if module.compressor is not None:
+            compressed = module.compressor(x_sample)
+
+        if compressed is None or compressed.size(0) == 0:
+            kv_full = kv_sample
+            indices = window
+        else:
+            n_compressed = compressed.size(0)
+            kv_full = torch.cat([kv_sample, compressed.squeeze(1)], dim=0)
+            if module.indexer is not None:
+                q_idx, k_idx, w_idx = module.indexer.forward_before_topk(
+                    x_sample.detach(),
+                    qr_sample.detach(),
+                )
+                if cfg.backend == "kernel":
+                    from magi_attention.experimental.dsa_v4.kernels import (
+                        indexer_kl_loss_kernel,
+                        indexer_select_kernel,
+                    )
+
+                    selected = indexer_select_kernel(
+                        q_idx,
+                        k_idx,
+                        w_idx,
+                        cfg.topk,
+                        cfg.compress_ratio,
+                    ).long()
+                    if runtime_mgr.training:
+                        kl_sum = kl_sum + indexer_kl_loss_kernel(
+                            selected,
+                            q_idx,
+                            w_idx,
+                            k_idx,
+                            q_sample.unsqueeze(1),
+                            compressed,
+                            cfg.softmax_scale,
+                            module.indexer.softmax_scale,
+                            cfg.indexer_loss_coeff,
+                            total_global=1,
+                        )
+                else:
+                    causal_mask = build_block_causal_mask(
+                        sq,
+                        n_compressed,
+                        cfg.compress_ratio,
+                        1,
+                        x.device,
+                    )
+                    scores = compute_index_scores(
+                        q_idx,
+                        w_idx * module.indexer.softmax_scale,
+                        k_idx,
+                    )
+                    scores = scores + causal_mask
+                    selected = module.indexer.select_topk(scores, n_compressed)
+                    if runtime_mgr.training:
+                        kl_sum = kl_sum + indexer_kl_loss(
+                            scores,
+                            selected,
+                            q_sample.detach().unsqueeze(1),
+                            compressed.detach(),
+                            cfg.softmax_scale,
+                            cfg.indexer_loss_coeff,
+                            causal_mask,
+                            cfg.use_sparse_loss,
+                            calculate_per_token_loss=True,
+                        )
+                compressed_indices = validate_and_offset_topk(
+                    selected,
+                    cfg.compress_ratio,
+                    sq,
+                )
+            else:
+                compressed_indices = get_compress_topk_idxs(
+                    cfg.compress_ratio,
+                    1,
+                    sq,
+                    sq,
+                    x.device,
+                )
+            indices = torch.cat([window, compressed_indices], dim=-1)
+
+        indices_flat = indices.squeeze(0).to(torch.int32).contiguous()
+        output_sample, lse_sample = _run_attention_forward_state(
+            q_sample,
+            kv_full,
+            sink,
+            indices_flat,
+            runtime_mgr,
+        )
+        outputs.append(output_sample)
+        index_pieces.append(indices_flat)
+        widths.append(indices_flat.size(1))
+        if lse_sample.numel():
+            lse_pieces.append(lse_sample)
+
+    output = torch.cat(outputs, dim=0)
+    lse = (
+        torch.cat(lse_pieces, dim=0)
+        if lse_pieces
+        else torch.empty(0, dtype=torch.float32, device=x.device)
+    )
+    max_width = max(widths, default=0)
+    topk_indices = torch.full(
+        (x.size(0), max_width),
+        -1,
+        dtype=torch.int32,
+        device=x.device,
+    )
+    row_begin = 0
+    piece_index = 0
+    for sample_width, start, end in zip(widths, bounds[:-1], bounds[1:]):
+        if end != start:
+            topk_indices[row_begin : row_begin + end - start, :sample_width] = (
+                index_pieces[piece_index]
+            )
+            row_begin += end - start
+            piece_index += 1
+    return output, kl_sum / max(x.size(0), 1), lse, topk_indices, tuple(widths)
+
+
+class _SingleDsa(torch.autograd.Function):
+    """CP=1 recompute boundary enforcing the frozen saved-state contract."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        runtime_mgr: "MagiDSARuntimeMgr",
+        bounds: tuple[int, ...],
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        q: torch.Tensor,
+        latent_kv: torch.Tensor,
+        sink: torch.Tensor,
+        *parameters: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        output, kl_loss, lse, topk_indices, widths = _single_forward_state(
+            x,
+            qr,
+            q,
+            latent_kv,
+            sink,
+            bounds,
+            runtime_mgr,
+        )
+        topk_length = torch.tensor(widths, dtype=torch.int32, device=x.device)
+        ctx.runtime_mgr = runtime_mgr
+        ctx.bounds = bounds
+        ctx.widths = widths
+        ctx.parameter_count = len(parameters)
+        ctx.compute_kl = runtime_mgr.training
+        ctx.save_for_backward(
+            x,
+            qr,
+            q,
+            latent_kv,
+            sink,
+            output,
+            lse,
+            topk_indices,
+            topk_length,
+        )
+        return output, kl_loss
+
+    @staticmethod
+    def backward(ctx, d_output: torch.Tensor | None, d_kl: torch.Tensor | None):
+        (
+            x,
+            qr,
+            q,
+            latent_kv,
+            sink,
+            output,
+            lse,
+            topk_indices,
+            topk_length,
+        ) = ctx.saved_tensors
+        del topk_length
+        runtime_mgr = ctx.runtime_mgr
+        module = runtime_mgr.dsa_module
+        cfg = runtime_mgr.config
+        parameters = tuple(module.parameters())
+        if len(parameters) != ctx.parameter_count:
+            raise RuntimeError("DSA parameter set changed between forward and backward")
+        parameter_grads: list[torch.Tensor | None] = [None] * len(parameters)
+        dq = torch.zeros_like(q)
+        dkv = torch.zeros_like(latent_kv)
+        dx = torch.zeros_like(x) if module.compressor is not None else None
+        d_sink = torch.zeros_like(sink)
+        if d_output is None:
+            d_output = torch.zeros_like(output)
+        kl_upstream = (
+            torch.zeros((), dtype=torch.float32, device=x.device)
+            if d_kl is None
+            else d_kl.float()
+        )
+
+        row_begin = 0
+        lse_begin = 0
+        for sample_id, (start, end) in enumerate(zip(ctx.bounds[:-1], ctx.bounds[1:])):
+            sq = end - start
+            if sq == 0:
+                continue
+            width = ctx.widths[sample_id]
+            sample_indices = topk_indices[
+                row_begin : row_begin + sq, :width
+            ].contiguous()
+            sample_lse = lse[lse_begin : lse_begin + sq] if lse.numel() else lse
+            x_sample_data = x[start:end].unsqueeze(1)
+            with torch.enable_grad():
+                x_sample = x_sample_data.detach().requires_grad_(True)
+                compressed = (
+                    None if module.compressor is None else module.compressor(x_sample)
+                )
+            if compressed is None or compressed.size(0) == 0:
+                compressed_flat = latent_kv.new_empty((0, cfg.kv_dim))
+                kv_full = latent_kv[start:end]
+            else:
+                compressed_flat = compressed.squeeze(1)
+                kv_full = torch.cat(
+                    [latent_kv[start:end], compressed_flat.detach()], dim=0
+                )
+
+            dq_sample, dkv_full, d_sink_sample = _attention_backward(
+                q[start:end],
+                kv_full,
+                sink,
+                output[row_begin : row_begin + sq],
+                sample_lse,
+                sample_indices,
+                d_output[row_begin : row_begin + sq],
+                runtime_mgr,
+            )
+            dq[start:end] = dq_sample
+            dkv[start:end] = dkv_full[:sq].to(dkv.dtype)
+            d_sink = d_sink + d_sink_sample.float()
+
+            if compressed is not None and compressed.numel():
+                main_grads = torch.autograd.grad(
+                    compressed,
+                    (x_sample, *parameters),
+                    dkv_full[sq:].reshape_as(compressed).to(compressed.dtype),
+                    allow_unused=True,
+                )
+                if dx is not None and main_grads[0] is not None:
+                    dx[start:end] = main_grads[0].squeeze(1).to(dx.dtype)
+                _add_parameter_gradients(parameter_grads, main_grads[1:])
+
+            if ctx.compute_kl and module.indexer is not None and compressed is not None:
+                with torch.enable_grad():
+                    q_idx, w_idx = module.indexer.project_queries(
+                        x_sample_data.detach(),
+                        qr[start:end].detach().unsqueeze(1),
+                    )
+                    compressed_ki = module.indexer.compressor(x_sample_data.detach())
+                    local_ids = sample_indices[:, cfg.window_size :] - sq
+                    local_ids = torch.where(
+                        sample_indices[:, cfg.window_size :] >= 0,
+                        local_ids,
+                        torch.full_like(local_ids, -1),
+                    ).unsqueeze(0)
+                    if cfg.backend == "kernel":
+                        from magi_attention.experimental.dsa_v4.kernels import (
+                            indexer_kl_loss_kernel,
+                        )
+
+                        kl_sample = indexer_kl_loss_kernel(
+                            local_ids,
+                            q_idx,
+                            w_idx,
+                            compressed_ki,
+                            q[start:end].detach().unsqueeze(1),
+                            compressed.detach(),
+                            cfg.softmax_scale,
+                            module.indexer.softmax_scale,
+                            cfg.indexer_loss_coeff,
+                            total_global=max(x.size(0), 1),
+                        )
+                    else:
+                        from magi_attention.experimental.dsa_v4.indexer import (
+                            build_block_causal_mask,
+                            compute_index_scores,
+                        )
+                        from magi_attention.experimental.dsa_v4.reference import (
+                            indexer_kl_loss,
+                        )
+
+                        causal_mask = build_block_causal_mask(
+                            sq,
+                            compressed_ki.size(0),
+                            cfg.compress_ratio,
+                            1,
+                            x.device,
+                        )
+                        scores = compute_index_scores(
+                            q_idx,
+                            w_idx * module.indexer.softmax_scale,
+                            compressed_ki,
+                        )
+                        scores = scores + causal_mask
+                        kl_sample = indexer_kl_loss(
+                            scores,
+                            local_ids.clamp(min=0),
+                            q[start:end].detach().unsqueeze(1),
+                            compressed.detach(),
+                            cfg.softmax_scale,
+                            cfg.indexer_loss_coeff,
+                            causal_mask,
+                            cfg.use_sparse_loss,
+                            calculate_per_token_loss=True,
+                        ) / max(x.size(0), 1)
+                    kl_parameter_grads = torch.autograd.grad(
+                        kl_sample,
+                        parameters,
+                        kl_upstream,
+                        allow_unused=True,
+                    )
+                _add_parameter_gradients(parameter_grads, kl_parameter_grads)
+            row_begin += sq
+            lse_begin += sq
+
+        return (
+            None,
+            None,
+            dx,
+            None,
+            dq,
+            dkv,
+            d_sink.to(sink.dtype),
+            *[
+                None if gradient is None else gradient.to(parameter.dtype)
+                for parameter, gradient in zip(parameters, parameter_grads)
+            ],
+        )
+
+
+def _single_dsa_forward(
+    dsa_input: "MagiDSAInput",
+    runtime_mgr: "MagiDSARuntimeMgr",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    bounds = tuple(
+        int(value) for value in dsa_input.packed_meta.cu_seqlens.detach().cpu()
+    )
+    return _SingleDsa.apply(
+        runtime_mgr,
+        bounds,
+        dsa_input.x,
+        dsa_input.qr,
+        dsa_input.q,
+        dsa_input.latent_kv,
+        dsa_input.sink,
+        *tuple(runtime_mgr.dsa_module.parameters()),
+    )
 
 
 def dist_dsa_func(
@@ -575,28 +1569,17 @@ def dist_dsa_func(
     if runtime_mgr.plan.cp_size == 2:
         return _dist_dsa_forward(dsa_input, runtime_mgr, dispatch_plan)
 
-    output_flat, kl_loss = runtime_mgr.dsa_module.forward_packed(
-        dsa_input.x,
-        dsa_input.qr,
-        dsa_input.q,
-        dsa_input.latent_kv,
-        dsa_input.sink,
-        dsa_input.packed_meta.cu_seqlens,
-    )
-    expected_flat = (
-        dsa_input.q.size(0),
-        runtime_mgr.config.num_heads * runtime_mgr.config.kv_dim,
-    )
-    if tuple(output_flat.shape) != expected_flat:
-        raise RuntimeError(
-            f"legacy DSA path returned shape {tuple(output_flat.shape)}, "
-            f"expected {expected_flat}"
-        )
-    output = output_flat.reshape(
+    output, kl_loss = _single_dsa_forward(dsa_input, runtime_mgr)
+    expected_shape = (
         dsa_input.q.size(0),
         runtime_mgr.config.num_heads,
         runtime_mgr.config.kv_dim,
     )
+    if tuple(output.shape) != expected_shape:
+        raise RuntimeError(
+            f"single-rank DSA path returned shape {tuple(output.shape)}, "
+            f"expected {expected_shape}"
+        )
     if kl_loss.shape != torch.Size([]) or kl_loss.dtype != torch.float32:
         raise RuntimeError(
             "legacy DSA path must return a scalar FP32 KL loss, "

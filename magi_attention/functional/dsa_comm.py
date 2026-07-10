@@ -790,6 +790,63 @@ def start_dsa_group_reduce(
     )
 
 
+def reduce_replicated_dsa_gradient(
+    gradient: torch.Tensor,
+    group: dist.ProcessGroup,
+    *,
+    buffer_name: str = "dsa_replicated_gradient",
+    output_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Sum one replicated DSA gradient on every rank with GroupReduce.
+
+    Runtime-owned parameters and the attention sink are replicated rather
+    than row-sharded.  Their gradients therefore use a one-row all-to-all
+    GroupReduce: every rank sends its local FP32 contribution to every peer
+    and accumulates all peer rows into its local contribution.  Keeping this
+    helper in the DSA communication layer makes the no-``all_reduce`` contract
+    explicit and gives native grpcoll the same padding treatment as the four
+    row-routed payloads.
+    """
+
+    if not isinstance(gradient, torch.Tensor):
+        raise TypeError("gradient must be a torch.Tensor")
+    if not gradient.is_cuda:
+        raise ValueError("replicated DSA gradient reduction requires CUDA")
+    world_size = dist.get_world_size(group)
+    if world_size == 1:
+        result = gradient.float()
+        return result.to(gradient.dtype if output_dtype is None else output_dtype)
+
+    rank = dist.get_rank(group)
+    peers = [peer for peer in range(world_size) if peer != rank]
+    logical_numel = gradient.numel()
+    local = gradient.float().reshape(1, logical_numel).contiguous()
+    transport = _pad_native_hidden_size(local)
+    send = transport.expand(len(peers), -1).contiguous()
+    output = transport.clone()
+    work = group_reduce(
+        input=send,
+        output=output,
+        input_split_sizes=[1] * len(peers),
+        output_split_sizes=[1],
+        dst_index=peers,
+        src_indices=[peers],
+        group=group,
+        async_op=False,
+        reduce_op="sum",
+        acc_reduce=True,
+        comm_dtype=torch.float32,
+        deterministic=True,
+        split_alignment=1,
+        buffer_name=buffer_name,
+    )
+    reduced = work.wait_post_process(output)
+    if not isinstance(reduced, torch.Tensor):
+        raise TypeError("replicated DSA GroupReduce must return one tensor")
+    result = reduced.reshape(1, -1)[:, :logical_numel].reshape_as(gradient)
+    return result.to(gradient.dtype if output_dtype is None else output_dtype)
+
+
 __all__ = [
     "DsaCommBufferSlot",
     "DsaCommMeta",
@@ -805,6 +862,7 @@ __all__ = [
     "materialize_dsa_comm_plan",
     "reference_pack_dsa_payload",
     "reference_restore_dsa_gradient",
+    "reduce_replicated_dsa_gradient",
     "start_dsa_group_cast",
     "start_dsa_group_reduce",
 ]
