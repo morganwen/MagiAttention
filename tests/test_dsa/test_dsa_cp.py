@@ -36,6 +36,7 @@ from magi_attention.functional.dsa_comm import (
     DsaPayloadKind,
     DsaTypedPayload,
     build_dsa_comm_plan,
+    materialize_dsa_comm_plan,
     start_dsa_group_cast,
     start_dsa_group_reduce,
 )
@@ -192,8 +193,9 @@ class TestDsaCommMetadata:
         }
         cast_works = []
         logical_receive_widths = []
+        device_plan = materialize_dsa_comm_plan(comm_plan, torch.device("cuda"))
         with switch_envvar_context("MAGI_ATTENTION_NATIVE_GRPCOLL", enable=True):
-            for meta in comm_plan:
+            for meta, device_map in zip(comm_plan, device_plan):
                 local = DsaTypedPayload(
                     meta.kind,
                     torch.zeros(
@@ -202,7 +204,12 @@ class TestDsaCommMetadata:
                         device="cuda",
                     ),
                 )
-                cast_work = start_dsa_group_cast(local, meta, async_op=True)
+                cast_work = start_dsa_group_cast(
+                    local,
+                    meta,
+                    device_map=device_map,
+                    async_op=True,
+                )
                 remote = cast_work.wait()
                 logical_receive_widths.append(remote.tensor.size(1))
                 reduce_work = start_dsa_group_reduce(
@@ -227,6 +234,10 @@ class TestDsaCommMetadata:
         assert [call["input"].size(1) for call in cast_calls] == [512, 256, 512, 256]
         assert logical_receive_widths == [512, 256, 512, 128]
         assert len({id(work.native_handle_dict) for work in cast_works}) == 4
+        assert all(
+            work.device_map is device_map
+            for work, device_map in zip(cast_works, device_plan)
+        )
         for meta, cast_call, reduce_call, cast_work in zip(
             comm_plan, cast_calls, reduce_calls, cast_works
         ):
@@ -289,14 +300,24 @@ class TestDsaCommTransport(DistTestBase):
         else:
             dispatch_plan = _noncontiguous_cp2_plan()
         comm_plan = build_dsa_comm_plan(dispatch_plan, self.rank, self.process_group)
+        device_plan = materialize_dsa_comm_plan(comm_plan, torch.cuda.current_device())
 
         cast_works = []
-        for meta in comm_plan:
+        for meta, device_map in zip(comm_plan, device_plan):
             cast_works.append(
-                start_dsa_group_cast(self._local_payload(meta), meta, async_op=True)
+                start_dsa_group_cast(
+                    self._local_payload(meta),
+                    meta,
+                    device_map=device_map,
+                    async_op=True,
+                )
             )
         assert len({id(work.buffers) for work in cast_works}) == 4
         assert len({id(work.native_handle_dict) for work in cast_works}) == 4
+        assert all(
+            work.device_map is device_map
+            for work, device_map in zip(cast_works, device_plan)
+        )
 
         received = [work.wait() for work in cast_works]
         for meta, payload in zip(comm_plan, received):

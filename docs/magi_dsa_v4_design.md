@@ -54,7 +54,7 @@ V1 固定配置为：Hq=64、Hkv=1、D=512、rope dim=64、window=128、Hidx=64�
 - sparse backward/d_sink、Indexer forward/top-k、score recompute 和 Indexer backward 复用 cudnn-frontend `cudnn.deepseek_sparse_attention`。
 - 统一 wrapper 位于 `experimental/dsa_v4/kernels.py`；步骤 1 只接线，不重写、不 fork 外部 kernel。
 - reference backend 只用于数值对拍；正式 kernel backend 的输入为 CUDA BF16，top-k 保持 device resident。
-- 后续唯一计划内新增的计算辅助 kernel 是 `kernel/cutedsl/dsa_pack.py`，用于 SM90 packing、remap 与 FP32 CSR reduction。
+- 唯一计划内新增的计算辅助 kernel 是 `kernel/cutedsl/dsa_pack.py`，用于 packing、remap 与 FP32 CSR reduction。步骤 4 只在 SM90/H100 验收，但 public frontend、device mapping schema 和带 arch 的编译 cache key 不绑定 SM90；kernel 只使用 SM90/SM100 共有的通用 global copy、寄存器 FP32 累加和 128-bit vector copy。
 
 ## CP plan 与通信
 
@@ -80,12 +80,20 @@ compressed KV/Ki 则把 owner-local compressed block 静态发送给所有 peer�
 每条 source/destination 空路线也保留显式零长度 split，因此所有 rank 能按
 固定顺序进入 collective。
 
-forward 先用 torch `index_select` reference map 打包 owner-local unique rows，
-再调用 `group_cast` 得到带稳定 logical row id 的 typed receive buffer；backward
-复用同一元数据和 payload-private native handle 调用对称 `group_reduce`。本地与
-远端梯度先转成 FP32，GroupReduce 输出写回 owner-local FP32 accumulator，最后
-只做一次目标 dtype 转换。reference map 是步骤 4 SM90 CuTe DSL kernel 的明确
-替换缝，不改变 collective metadata/API。
+步骤 4 保留 torch `index_select`/`index_copy_` reference map 仅用于测试对拍；
+production forward 使用静态 device-resident int32 destination→source map 和 CuTe
+DSL row-copy kernel 打包 owner-local unique rows，再调用 `group_cast` 得到带稳定
+logical row id 的 typed receive buffer。backward 复用同一元数据和 payload-private
+native handle 调用对称 `group_reduce`，GroupReduce 初始 owner rows 也由 row-copy
+kernel 提取；返回结果按 inverse CSR map 以固定顺序、无 atomic 写回 owner-local
+FP32 accumulator，最后只做一次目标 dtype 转换。device map 可作为静态 plan state
+共享，send/receive buffer、work 和 native handle 仍按调用独占。
+
+`dsa_pack.py` 同时提供 logical block/token id→packed-local row 的 int32 remap LUT；
+`-1` sentinel 和 unavailable logical id 保持 `-1`，动态 Indexer top-k 全程留在
+device。CSR kernel 支持重复 source、空 destination row、极端 fan-in，以及覆盖
+非空 row或累加到已有 FP32 accumulator两种模式，为步骤 5/6 的 KV bank
+packing 和多路径梯度合并提供固定接口。
 
 native grpcoll 的 BF16 transport row 要求 256-element 对齐；compressed Ki 的
 逻辑宽度固定为 128，因此仅在 native send/receive buffer 内部右侧补零到 256，

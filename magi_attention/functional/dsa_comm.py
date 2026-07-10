@@ -14,9 +14,10 @@
 
 """Typed Magi_DSA transport over MagiAttention group collectives.
 
-Step 3 deliberately uses a torch reference gather/scatter map.  Step 4 replaces
-those two local mapping operations with SM90 CuTe DSL kernels without changing
-the communication metadata or the GroupCast/GroupReduce calls in this module.
+Step 3 introduced torch reference gather/scatter maps.  Step 4 keeps those
+references for tests and routes production packing/restore through immutable
+device maps plus CuTe DSL kernels, without changing the communication metadata
+or the GroupCast/GroupReduce primitives in this module.
 
 The four payload kinds never share metadata, buffer slots, native grpcoll
 handles or work objects.  The objects holding tensors and work are per-call;
@@ -28,7 +29,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Iterator, Sequence
+from typing import TYPE_CHECKING, Any, Iterator, Sequence
 
 import torch
 import torch.distributed as dist
@@ -44,6 +45,12 @@ from magi_attention.meta.collection.dsa_meta import (
     DsaTransferSpec,
     sample_offsets,
 )
+
+if TYPE_CHECKING:
+    from magi_attention.kernel.cutedsl.dsa_pack import (
+        DsaDeviceCopyMap,
+        DsaDeviceReduceMap,
+    )
 
 
 class DsaPayloadKind(str, Enum):
@@ -160,6 +167,57 @@ class DsaCommPlan:
         raise KeyError(kind)
 
 
+@dataclass(frozen=True)
+class DsaDeviceCommMap:
+    """Read-only device maps for one typed route of one static plan."""
+
+    meta: DsaCommMeta
+    send_copy: "DsaDeviceCopyMap"
+    owner_restore: "DsaDeviceReduceMap"
+
+    def __post_init__(self) -> None:
+        if self.send_copy.source_row_count != self.meta.local_row_count:
+            raise ValueError("DSA send map source row count does not match metadata")
+        if self.send_copy.destination_row_count != self.meta.send_row_count:
+            raise ValueError(
+                "DSA send map destination row count does not match metadata"
+            )
+        if self.owner_restore.source_row_count != self.meta.send_row_count:
+            raise ValueError("DSA restore map source row count does not match metadata")
+        if self.owner_restore.destination_row_count != self.meta.local_row_count:
+            raise ValueError(
+                "DSA restore map destination row count does not match metadata"
+            )
+
+
+@dataclass(frozen=True)
+class DsaDeviceCommPlan:
+    """All four immutable device mapping sets for one rank plan."""
+
+    window_kv: DsaDeviceCommMap
+    overlap_x: DsaDeviceCommMap
+    compressed_kv: DsaDeviceCommMap
+    compressed_ki: DsaDeviceCommMap
+
+    def __post_init__(self) -> None:
+        expected = tuple(DsaPayloadKind)
+        actual = tuple(device_map.meta.kind for device_map in self)
+        if actual != expected:
+            raise ValueError(f"DSA device map payload order must be {expected}")
+
+    def __iter__(self) -> Iterator[DsaDeviceCommMap]:
+        yield self.window_kv
+        yield self.overlap_x
+        yield self.compressed_kv
+        yield self.compressed_ki
+
+    def for_kind(self, kind: DsaPayloadKind) -> DsaDeviceCommMap:
+        for device_map in self:
+            if device_map.meta.kind is kind:
+                return device_map
+        raise KeyError(kind)
+
+
 @dataclass
 class DsaCommBufferSlot:
     """Per-call buffers for exactly one typed payload."""
@@ -176,6 +234,7 @@ class DsaGroupCastWork:
     """Disposable GroupCast work and its payload-private grpcoll handle."""
 
     meta: DsaCommMeta
+    device_map: DsaDeviceCommMap
     buffers: DsaCommBufferSlot
     work: WorkWithPostProcessFn
     native_handle_dict: dict[str, Any]
@@ -206,6 +265,7 @@ class DsaGroupReduceWork:
     """Disposable symmetric GroupReduce work with FP32 owner accumulation."""
 
     meta: DsaCommMeta
+    device_map: DsaDeviceCommMap
     buffers: DsaCommBufferSlot
     work: WorkWithPostProcessFn
     local_accumulator: torch.Tensor
@@ -227,12 +287,14 @@ class DsaGroupReduceWork:
                 f"{tuple(self.buffers.reduce_output_buffer.shape)}"
             )
 
-        result = reference_restore_dsa_gradient(
+        from magi_attention.kernel.cutedsl.dsa_pack import reduce_dsa_rows_csr
+
+        result = reduce_dsa_rows_csr(
             reduced,
+            self.device_map.owner_restore,
             self.local_accumulator,
-            self.meta,
-            output_dtype=self.output_dtype,
-        )
+            accumulate=False,
+        ).to(self.output_dtype)
         self._result = DsaTypedPayload(self.meta.kind, result)
         return self._result
 
@@ -464,6 +526,47 @@ def build_dsa_comm_plan(
     )
 
 
+def materialize_dsa_comm_map(
+    meta: DsaCommMeta,
+    device: torch.device | str | int,
+) -> DsaDeviceCommMap:
+    """Upload the validated static copy and inverse-CSR maps for one route."""
+
+    if not isinstance(meta, DsaCommMeta):
+        raise TypeError("meta must be a DsaCommMeta")
+    from magi_attention.kernel.cutedsl.dsa_pack import (
+        make_dsa_device_copy_map,
+        make_dsa_device_reduce_map,
+    )
+
+    send_copy = make_dsa_device_copy_map(
+        meta.send_row_indices,
+        meta.local_row_count,
+        device,
+    )
+    restore_rows: list[list[int]] = [[] for _ in range(meta.local_row_count)]
+    for packed_row, local_row in enumerate(meta.send_row_indices):
+        restore_rows[local_row].append(packed_row)
+    owner_restore = make_dsa_device_reduce_map(
+        restore_rows,
+        meta.send_row_count,
+        device,
+    )
+    return DsaDeviceCommMap(meta, send_copy, owner_restore)
+
+
+def materialize_dsa_comm_plan(
+    comm_plan: DsaCommPlan,
+    device: torch.device | str | int,
+) -> DsaDeviceCommPlan:
+    """Materialize all four read-only maps once for one rank/device plan."""
+
+    if not isinstance(comm_plan, DsaCommPlan):
+        raise TypeError("comm_plan must be a DsaCommPlan")
+    device_maps = tuple(materialize_dsa_comm_map(meta, device) for meta in comm_plan)
+    return DsaDeviceCommPlan(*device_maps)
+
+
 def _validate_payload(
     payload: DsaTypedPayload,
     meta: DsaCommMeta,
@@ -568,11 +671,22 @@ def start_dsa_group_cast(
     payload: DsaTypedPayload,
     meta: DsaCommMeta,
     *,
+    device_map: DsaDeviceCommMap | None = None,
     async_op: bool = False,
 ) -> DsaGroupCastWork:
-    """Reference-pack and launch one typed forward GroupCast."""
+    """Kernel-pack and launch one typed forward GroupCast."""
 
-    logical_send_buffer = reference_pack_dsa_payload(payload, meta)
+    _validate_payload(payload, meta, meta.local_row_count, "local payload")
+    if device_map is None:
+        device_map = materialize_dsa_comm_map(meta, payload.tensor.device)
+    elif not isinstance(device_map, DsaDeviceCommMap):
+        raise TypeError("device_map must be a DsaDeviceCommMap")
+    elif device_map.meta is not meta and device_map.meta != meta:
+        raise ValueError("device_map was materialized for different DSA metadata")
+
+    from magi_attention.kernel.cutedsl.dsa_pack import copy_dsa_rows
+
+    logical_send_buffer = copy_dsa_rows(payload.tensor, device_map.send_copy)
     send_buffer = _pad_native_hidden_size(logical_send_buffer)
     receive_buffer = send_buffer.new_empty(
         (meta.receive_row_count, *send_buffer.shape[1:])
@@ -594,7 +708,13 @@ def start_dsa_group_cast(
         native_grpcoll_handle_dict=native_handle_dict,
         **meta.collective_arg.to_group_cast_args(),
     )
-    return DsaGroupCastWork(meta, buffers, work, native_handle_dict)
+    return DsaGroupCastWork(
+        meta=meta,
+        device_map=device_map,
+        buffers=buffers,
+        work=work,
+        native_handle_dict=native_handle_dict,
+    )
 
 
 def start_dsa_group_reduce(
@@ -630,8 +750,12 @@ def start_dsa_group_reduce(
     local_accumulator = local_gradient.tensor.float().clone(
         memory_format=torch.contiguous_format
     )
-    send_indices = _index_tensor(meta.send_row_indices, local_gradient.tensor.device)
-    reduce_output = local_accumulator.index_select(0, send_indices).contiguous()
+    from magi_attention.kernel.cutedsl.dsa_pack import copy_dsa_rows
+
+    reduce_output = copy_dsa_rows(
+        local_accumulator,
+        forward_work.device_map.send_copy,
+    )
     reduce_input = remote_gradient.tensor.float().contiguous()
     forward_work.buffers.reduce_output_buffer = reduce_output
     work = group_reduce(
@@ -650,6 +774,7 @@ def start_dsa_group_reduce(
     )
     return DsaGroupReduceWork(
         meta=meta,
+        device_map=forward_work.device_map,
         buffers=forward_work.buffers,
         work=work,
         local_accumulator=local_accumulator,
@@ -663,11 +788,15 @@ __all__ = [
     "DsaCommBufferSlot",
     "DsaCommMeta",
     "DsaCommPlan",
+    "DsaDeviceCommMap",
+    "DsaDeviceCommPlan",
     "DsaGroupCastWork",
     "DsaGroupReduceWork",
     "DsaPayloadKind",
     "DsaTypedPayload",
     "build_dsa_comm_plan",
+    "materialize_dsa_comm_map",
+    "materialize_dsa_comm_plan",
     "reference_pack_dsa_payload",
     "reference_restore_dsa_gradient",
     "start_dsa_group_cast",

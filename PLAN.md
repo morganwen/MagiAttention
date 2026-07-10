@@ -33,7 +33,7 @@
 
 - sparse forward 使用 FlashMLA nv_dev；sparse backward、Indexer、top-k、score recompute 和 Indexer backward 使用 cudnn-frontend deepseek_sparse_attention。
 - 外部 kernel 依赖不 fork、不改源码；确需 patch 必须先经用户确认。
-- 新 packing/remap/CSR kernel 用 `magi_attention/kernel/cutedsl` 风格的 SM90 CuTe DSL；不复制 Magi-MSA 的 SM100 kernel。
+- 新 packing/remap/CSR kernel 用 `magi_attention/kernel/cutedsl` 风格的 CuTe DSL；本阶段只在 SM90/H100 验收，但 public frontend、device mapping schema 和编译缓存不得绑定 SM90。kernel 只使用 SM90/SM100 共有的通用 global copy、寄存器 FP32 累加和 128-bit vector copy，编译 key 必须包含 GPU arch；不复制 Magi-MSA 的 SM100 kernel。
 - 正式 CP 数据交换只调用 `group_cast` / `group_reduce`。DSA 源码不得直接用 torch P2P、all-gather、all-reduce 或 `all2all_v` 替代。
 - compressed KV、compressed Ki、window KV 和 compressor overlap x 使用独立 typed payload、metadata、buffer slot 和 work handle。
 - compressed KV/Ki 静态 GroupCast 到所有 CP peers；不根据 top-k 动态选择通信对象。
@@ -216,8 +216,13 @@ tests/test_dsa/
 
 - 新增：`kernel/cutedsl/dsa_pack.py` 和正式 kernel 单测。
 - 新增测试：`tests/test_dsa/test_dsa_pack_kernel.py`。
-- 动作：实现 int32 destination→source copy、block/token remap、FP32 CSR reduce；支持 D=128、D=512 和 hidden width，128-bit 对齐快路。
-- 测试：与步骤 3 reference 对拍；覆盖重复 source、极端 fan-in、零 row、非连续 map、tail 和越界拒绝；应用 10/30 秒 watchdog。
+- 动作：
+  1. 实现 device-resident int32 destination→source row copy map、logical block/token id→local packed row remap LUT，以及 FP32 CSR reduce map；静态 host plan 负责上传前的完整覆盖、CSR 单调性和越界校验，动态 top-k/remap 全程留在 device。
+  2. row copy 支持 BF16、FP32 和 int32，flatten trailing dimensions，覆盖 D=128、D=512 和任意 hidden width；满足对齐时走 128-bit vector copy，否则走有界 tail 路径。
+  3. CSR reduce 以 FP32 source/destination accumulator 工作，固定 CSR 顺序、无 atomic；支持覆盖非空 destination row或累加到已有 accumulator，空 destination row 保持不变，最终 dtype conversion 留给调用方。
+  4. device mapping 是可共享只读的静态 plan state；packed/remote tensor、output buffer、work 和 event 仍为 per-call state。CuTe 编译 cache key 包含 arch、dtype、feature width 和 operation，使同一 frontend 可在后续独立增加 SM100 验证和调优。
+  5. `functional/dsa_comm.py` 的 production GroupCast pack、GroupReduce initial row copy 和 owner restore 改用新 kernel；步骤 3 torch reference seam 保留仅用于对拍。
+- 测试：与步骤 3 reference 对拍；覆盖重复 source、极端 fan-in、零 row、非连续 map、`-1` sentinel、missing logical id、tail 和静态 plan 越界拒绝；编译后单批 kernel 使用 10 秒 watchdog，完整 kernel 单测使用 30 秒 watchdog。
 - 出口：CP transport 使用 SM90 kernel，无 D2H top-k/remap，同输入重复运行稳定。
 
 ### 步骤 5：接通完整 forward
@@ -274,3 +279,4 @@ tests/test_dsa/
 - 2026-07-09：正式 CP 通信使用 GroupCast/GroupReduce；compressed KV/Ki 保持静态全组可见。
 - 2026-07-09：步骤 5/6 复用现有 FlashMLA/cuDNN wrapper，不重写外部 kernel；新增 kernel 仅限步骤 4 的 SM90 packing/remap/CSR。
 - 2026-07-09：正式 DSA 测试按 Magi-MSA 的五类结构建立在 `tests/test_dsa`；现有测试和 `agents/tests` 稳定用例迁入后才计入验收。
+- 2026-07-10：步骤 4 仍只以 SM90/H100 为出口硬件，但 packing/remap/CSR 使用架构中性的 public frontend、静态 device mapping 和 arch-aware 编译缓存；后续 SM100 只新增构建、验证与调优，不改变 mapping/communication API。CP>2/多机继续不作为 V1 验收条件，其正确性扩展复用同一 mapping 与 GroupCast/GroupReduce 接口，性能扩展另行校准 topology-aware solver 和 internode transport。
