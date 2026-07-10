@@ -75,6 +75,8 @@ fragment overhead 和显存预测选择完整 E2E 最小的候选。rank 0 确�
 
 步骤 2 不移动 CP 数据；步骤 3 才接入 GroupCast/GroupReduce reference packing。
 
+![步骤 2 负载均衡改前与改后](assets/dsa_step2_load_balance.svg)
+
 ## Saved-state 与并发
 
 - forward 只保存 O、FP32 LSE、`topk_idx`、`topk_length` 和 compressor gate 反向必需中间量。

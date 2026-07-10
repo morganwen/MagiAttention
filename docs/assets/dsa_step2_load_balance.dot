@@ -1,0 +1,98 @@
+digraph DsaStep2LoadBalance {
+  graph [
+    rankdir=LR,
+    bgcolor="#F8FAFC",
+    pad="0.28",
+    nodesep="0.35",
+    ranksep="0.55",
+    fontname="DejaVu Sans",
+    fontsize=18,
+    label="Magi_DSA Step 2 — Load Balance: Before vs After",
+    labelloc=t,
+    labeljust=c
+  ];
+  node [
+    shape=box,
+    style="rounded,filled",
+    color="#475569",
+    fillcolor="#FFFFFF",
+    fontname="DejaVu Sans",
+    fontsize=11,
+    margin="0.14,0.09"
+  ];
+  edge [
+    color="#64748B",
+    penwidth=1.4,
+    arrowsize=0.7,
+    fontname="DejaVu Sans",
+    fontsize=9
+  ];
+
+  subgraph cluster_before {
+    label="BEFORE — contiguous equal-token split";
+    color="#FCA5A5";
+    fillcolor="#FEF2F2";
+    style="rounded,filled";
+    penwidth=1.8;
+
+    before_input [label="Packed sequence\n[0, 1024)", fillcolor="#FFFFFF"];
+    before_split [label="Split by token count\n512 / 512", fillcolor="#FEE2E2"];
+    before_r0 [label="Rank 0\n[0, 512)\nIndexer cost: 32,640", fillcolor="#FFFFFF"];
+    before_r1 [label="Rank 1\n[512, 1024)\nIndexer cost: 98,176", fillcolor="#FFFFFF"];
+    before_result [
+      label="max / mean - 1\n50.098%",
+      color="#DC2626",
+      fillcolor="#FECACA",
+      fontcolor="#991B1B",
+      penwidth=2.0
+    ];
+
+    before_input -> before_split;
+    before_split -> before_r0;
+    before_split -> before_r1;
+    before_r0 -> before_result;
+    before_r1 -> before_result;
+  }
+
+  subgraph cluster_after {
+    label="AFTER — Indexer-aware fragment plan";
+    color="#86EFAC";
+    fillcolor="#F0FDF4";
+    style="rounded,filled";
+    penwidth=1.8;
+
+    after_atoms [label="128-token\naligned fragments", fillcolor="#DCFCE7"];
+    after_cost [label="Sample-relative cost\nfloor((p + 1) / 4)", fillcolor="#DCFCE7"];
+    after_solver [
+      label="Descending assignment\nmove / swap / split / merge\n+ token, memory, fragment limits",
+      fillcolor="#BBF7D0"
+    ];
+    after_r0 [label="Rank 0\n[256, 768)\nIndexer cost: 65,408", fillcolor="#FFFFFF"];
+    after_r1 [label="Rank 1\n[0, 256) + [768, 1024)\nIndexer cost: 65,408", fillcolor="#FFFFFF"];
+    after_plan [
+      label="Immutable plan\nblock owner + restore map\nwindow / overlap transfer + hash",
+      fillcolor="#DCFCE7"
+    ];
+    after_result [
+      label="max / mean - 1\n0.000%",
+      color="#16A34A",
+      fillcolor="#BBF7D0",
+      fontcolor="#166534",
+      penwidth=2.0
+    ];
+
+    after_atoms -> after_cost -> after_solver;
+    after_solver -> after_r0;
+    after_solver -> after_r1;
+    after_solver -> after_plan;
+    after_r0 -> after_result;
+    after_r1 -> after_result;
+  }
+
+  before_result -> after_atoms [
+    label="Step 2",
+    color="#2563EB",
+    fontcolor="#1D4ED8",
+    penwidth=2.2
+  ];
+}
