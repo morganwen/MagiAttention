@@ -165,7 +165,7 @@ tests/test_dsa/
 完成记录（2026-07-09）：
 
 - worktree：`agents/worktrees/magi-dsa-v4-plan-grpcoll`；步骤 0 commit `3c49075f`。
-- commit：`Add public Magi DSA runtime API`（本步骤原子提交；精确 hash 由后续步骤记录）。
+- commit：`5bc0ab3d`（`Add public Magi DSA runtime API`）。
 - 测试：冻结镜像 `sha256:9c51e29d1fda8fc1a6e2a8e16c7b0773309e91dcbd44cf6d0182e5e3327c1029` 上运行 `python -m pytest -q tests/test_dsa/test_dsa_api.py`，结果 `21 passed`（reference/kernel、ratio 0/4/128、packed、O/KL、全部输入/参数梯度）；运行 `PYTHONPATH=. python tests/test_attn/test_dsa_v4.py`，结果 `17 tests OK`。
 - 静态检查：Black 与 isort 对新增 Python 文件检查通过；`python -m compileall` 通过。
 - 报告：`tests/test_dsa/README.md`、`tests/test_dsa/README_zh.md`；CP=2 只构造 `DsaStaticPlan(communication_ready=False)`，未引入 collective。
