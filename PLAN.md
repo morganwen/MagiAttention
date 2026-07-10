@@ -136,9 +136,10 @@ tests/test_dsa/
 - 证据：`agents/tests/magi-dsa-v4`、`agents/profiles/magi-dsa-v4`、`agents/perf/magi-dsa-v4`。
 - 未完成：SM90 packing、完整 CP forward/backward、saved-state 收紧、最终并发/死锁/性能验收。
 - 当前 `magi_comm.py` 是未提交技术探针，不直接作为生产实现；重构前先提交或备份，禁止覆盖/reset。
-- 已完成：步骤 0、步骤 1、步骤 2、步骤 3；grpcoll dirty probe 已保存为 `agents/backups/magi-dsa-v4-grpcoll-probe-20260709.patch`（SHA256 `b6a6b8fadb48a38dc2c9b38bb1abd1fab8d5d86f27fedb67d298bded836416ee`）。
+- 已完成：步骤 0、步骤 1、步骤 2、步骤 3、步骤 4；grpcoll dirty probe 已保存为 `agents/backups/magi-dsa-v4-grpcoll-probe-20260709.patch`（SHA256 `b6a6b8fadb48a38dc2c9b38bb1abd1fab8d5d86f27fedb67d298bded836416ee`）。
 - 步骤 3 实现 commits：`29a9ffa3`、`f81d121e`；A2AV fallback 与真实 native grpcoll 的 CP=2 transport-only 全部通过。
-- 下一步：步骤 4。
+- 步骤 4 实现 commit：`c9856309`；SM90 copy/remap/FP32 CSR、A2AV fallback 与真实 native grpcoll 的 CP=2 transport-only 全部通过。
+- 下一步：步骤 5。
 
 ## 具体实施步骤
 
@@ -224,6 +225,16 @@ tests/test_dsa/
   5. `functional/dsa_comm.py` 的 production GroupCast pack、GroupReduce initial row copy 和 owner restore 改用新 kernel；步骤 3 torch reference seam 保留仅用于对拍。
 - 测试：与步骤 3 reference 对拍；覆盖重复 source、极端 fan-in、零 row、非连续 map、`-1` sentinel、missing logical id、tail 和静态 plan 越界拒绝；编译后单批 kernel 使用 10 秒 watchdog，完整 kernel 单测使用 30 秒 watchdog。
 - 出口：CP transport 使用 SM90 kernel，无 D2H top-k/remap，同输入重复运行稳定。
+
+完成记录（2026-07-10）：
+
+- worktree：`agents/worktrees/magi-dsa-v4-plan-grpcoll`；步骤 3 关闭记录 commit `f2248fef`。
+- 实现 commit：`c9856309`（`Add device-resident DSA packing kernels`）。
+- 实现：新增架构中性 `kernel/cutedsl/dsa_pack.py` public frontend 与 arch-aware CuTe compile cache；实现 BF16/FP32/int32 destination→source row copy、device-resident int32 logical-id remap、固定 CSR 顺序且无 atomic 的 FP32 reduce，并提供上传前校验的 immutable device map。`dsa_comm.py` 的 production GroupCast pack、GroupReduce initial row copy 和 owner restore 全部改用新 kernel，torch reference 仅保留测试对拍；mapping 为静态共享 state，buffer/work/native handle 保持 per-call。
+- Kernel/CP 测试：双 H100 验证镜像 `magi-dsa-step4:final`（image id `sha256:60ca4acf7080f036641382ae30d4a41d44262c79eadcbb790fe51ca733aa79cb`）运行 `timeout 300 pytest -q tests/test_dsa/test_dsa_pack_kernel.py tests/test_dsa/test_dsa_cp.py` 为 `24 passed`；其中 kernel 正式用例 `17 passed`，CP transport `7 passed`，真实覆盖 A2AV/native grpcoll、四类 payload forward/reverse、compressed Ki padding、FP32 owner restore、零长度路线和空 rank，无 skip。
+- 回归：同一镜像运行 `pytest -q tests/test_dsa/test_dsa_api.py tests/test_dsa/test_dsa_dispatch.py tests/test_dsa/test_dsa_solver.py` 为 `48 passed`；运行 `python tests/test_attn/test_dsa_v4.py` 为 `17 tests OK`。
+- 静态检查：Black、isort、compileall 通过；镜像未安装 flake8，未执行该项。production GroupCast/GroupReduce 入口不再调用 torch `index_select/index_copy_`，这两个操作只存在于保留的 reference 函数；动态 remap 不包含 `.item()`/`.cpu()`/D2H。
+- 出口：D=128、D=512、7168 hidden width、非 128-bit 整数倍 tail、重复 source、4096-way fan-in、零 row、`-1`/missing id、静态越界拒绝和重复运行稳定性均有正式测试；步骤 4 完成，步骤 5 可直接复用 device remap/packing API 接完整 forward。
 
 ### 步骤 5：接通完整 forward
 

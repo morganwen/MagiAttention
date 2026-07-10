@@ -52,6 +52,25 @@ D=256 的内部 padding。此文件当前不运行 attention kernel。
 由冻结镜像、pinned 仓库扩展和 `nvidia-nvshmem-cu13==3.6.5` 构建；本文件
 结果为 `7 passed`。
 
+步骤 4 在该镜像上加入仓库 requirements 已固定的 `quack-kernels==0.4.1`、
+commit `c9856309` 和 device-resident CuTe DSL packing kernel。完成镜像为
+`magi-dsa-step4:final`
+（`sha256:60ca4acf7080f036641382ae30d4a41d44262c79eadcbb790fe51ca733aa79cb`）。
+SM90 kernel 与两种 CP transport 后端的联合命令：
+
+```bash
+docker run --rm --gpus all --ipc=host \
+  --ulimit memlock=-1 --ulimit stack=67108864 \
+  magi-dsa-step4:final timeout 300 \
+  pytest -q tests/test_dsa/test_dsa_pack_kernel.py \
+            tests/test_dsa/test_dsa_cp.py
+```
+
+预期结果为 `24 passed`：17 项 row-copy/remap/FP32-CSR 正式测试和 7 项
+transport 测试，包含真实 native grpcoll。watchdog 计时前先完成编译；单个
+compiled operation 限时 10 秒，post-compile batch 限时 30 秒。public frontend
+与编译 cache 已包含 arch，但 SM100 仍不属于 V1 验收范围。
+
 fragment 与 solver 是 CPU-only 测试，在同一冻结镜像中运行：
 
 ```bash
@@ -64,4 +83,5 @@ docker run --rm \
 
 最终目录职责：`test_dsa_api.py` 覆盖 CP=1 公共 API；`test_dsa_cp.py`
 覆盖 CP=2；`test_dsa_dispatch.py` 与 `test_dsa_solver.py` 覆盖静态计划；
-`test_dsa_pack_kernel.py` 覆盖 SM90 packing/remap/CSR kernel。
+`test_dsa_pack_kernel.py` 覆盖 SM90 packing/remap/CSR、静态 map 校验、重复运行
+稳定性和 watchdog。

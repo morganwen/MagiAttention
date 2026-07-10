@@ -56,6 +56,26 @@ The completed native verification image is `magi-dsa-native-step3:final`
 built from the frozen image plus the pinned repository extension and
 `nvidia-nvshmem-cu13==3.6.5`. It reports `7 passed` for this file.
 
+Step 4 adds `quack-kernels==0.4.1` (already pinned by the repository
+requirements), commit `c9856309`, and the device-resident CuTe DSL packing
+kernels to that image. The completed image is `magi-dsa-step4:final`
+(`sha256:60ca4acf7080f036641382ae30d4a41d44262c79eadcbb790fe51ca733aa79cb`).
+Run the SM90 kernel suite together with both CP transport backends using:
+
+```bash
+docker run --rm --gpus all --ipc=host \
+  --ulimit memlock=-1 --ulimit stack=67108864 \
+  magi-dsa-step4:final timeout 300 \
+  pytest -q tests/test_dsa/test_dsa_pack_kernel.py \
+            tests/test_dsa/test_dsa_cp.py
+```
+
+The expected result is `24 passed`: 17 row-copy/remap/FP32-CSR tests and all
+7 transport tests, including real native grpcoll. Kernel compilation is warmed
+before the execution watchdogs: one compiled operation has a 10-second limit
+and the post-compile batch has a 30-second limit. The public frontend and
+compile cache are architecture-aware, but SM100 remains outside V1 acceptance.
+
 The CPU-only fragment and solver tests run in the same frozen environment:
 
 ```bash
@@ -73,4 +93,5 @@ The final directory responsibilities are:
 - `test_dsa_cp.py`: CP=2 communication and full-path parity (steps 3-7).
 - `test_dsa_dispatch.py`: fragment and transfer plans (step 2).
 - `test_dsa_solver.py`: deterministic Indexer-balanced solver (step 2).
-- `test_dsa_pack_kernel.py`: SM90 packing/remap/CSR kernels (step 4).
+- `test_dsa_pack_kernel.py`: SM90 packing/remap/CSR kernels, static mapping
+  validation, deterministic repeatability and watchdogs (step 4).
