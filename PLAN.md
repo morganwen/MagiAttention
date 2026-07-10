@@ -136,8 +136,8 @@ tests/test_dsa/
 - 证据：`agents/tests/magi-dsa-v4`、`agents/profiles/magi-dsa-v4`、`agents/perf/magi-dsa-v4`。
 - 未完成：独立 runtime、非连续 fragment plan、真实 Indexer-balanced solver、正式 GroupCast/GroupReduce、SM90 packing、saved-state 收紧、最终并发/死锁/性能验收。
 - 当前 `magi_comm.py` 是未提交技术探针，不直接作为生产实现；重构前先提交或备份，禁止覆盖/reset。
-- 已完成：步骤 0、步骤 1；grpcoll dirty probe 已保存为 `agents/backups/magi-dsa-v4-grpcoll-probe-20260709.patch`（SHA256 `b6a6b8fadb48a38dc2c9b38bb1abd1fab8d5d86f27fedb67d298bded836416ee`）。
-- 下一步：步骤 2。
+- 已完成：步骤 0、步骤 1、步骤 2；grpcoll dirty probe 已保存为 `agents/backups/magi-dsa-v4-grpcoll-probe-20260709.patch`（SHA256 `b6a6b8fadb48a38dc2c9b38bb1abd1fab8d5d86f27fedb67d298bded836416ee`）。
+- 下一步：步骤 3。
 
 ## 具体实施步骤
 
@@ -182,6 +182,15 @@ tests/test_dsa/
   5. 在最优 Indexer slack 内选择完整预测 E2E 最小的 plan；rank 0 确定性求解并广播。
 - 测试：1000 组随机 packed plans；覆盖无重叠/空洞、128 对齐、多 sample、非连续 fragments、空 rank、block owner、稳定 plan hash。
 - 出口：示例 `[0:256)+[768:1024)` / `[256:768)` 能均衡 scan cost；sequential/balanced report 可读且重复运行一致。
+
+完成记录（2026-07-09）：
+
+- worktree：`agents/worktrees/magi-dsa-v4-plan-grpcoll`；步骤 1 记录 commit `5bc8f3a9`。
+- commit：`68bc8491`（`Add deterministic DSA fragment load balancer`）。
+- 实现：sample-relative immutable fragment/rank plan、compressed block owner、分段 restore map、window/overlap unique-row transfer table、128 对齐 sequential baseline、ratio=4 Indexer cost 降序分配与 move/swap/split/merge refinement、token/显存/fragment 约束、Indexer slack 内完整 E2E 选择、stable SHA256 plan hash、runtime cache 和 rank-0 plan 广播。
+- 测试：冻结镜像上 `pytest -q tests/test_dsa/test_dsa_dispatch.py tests/test_dsa/test_dsa_solver.py` 为 `26 passed`（含 1000 组随机 balanced packed plans）；`pytest -q tests/test_dsa/test_dsa_api.py` 为 `22 passed`；`pytest -q tests/test_attn/test_dsa_v4.py` 为 `17 passed`；Black、isort、compileall 通过。
+- 出口证据：1024-token 示例 sequential Indexer cost 为 `[32640, 98176]`（`max/mean-1=50.098%`），balanced 为 `[65408, 65408]`（`0.000%`），输出 fragments 等价于 `[0:256)+[768:1024)` / `[256:768)`；固定 49152-token 单 sample 静态预测从 `[75491328, 226486272]`（`50.002%`）变为 `[150988800, 150988800]`（`0.000%`）。
+- 报告：`docs/magi_dsa_v4_design.md`、`tests/test_dsa/README.md`、`tests/test_dsa/README_zh.md`；步骤 2 只生成 host metadata，CP tensor 数据移动仍由步骤 3 接入。
 
 ### 步骤 3：实现 GroupCast/GroupReduce 和 reference packing
 
