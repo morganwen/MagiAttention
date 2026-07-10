@@ -134,13 +134,14 @@ tests/test_dsa/
 
 - 已完成：三形态 PyTorch reference、compressor、Indexer、FlashMLA/cuDNN kernel、packed 原型、连续 CP=2 对拍和初版 profile。
 - 证据：`agents/tests/magi-dsa-v4`、`agents/profiles/magi-dsa-v4`、`agents/perf/magi-dsa-v4`。
-- 未完成：完整 CP backward、saved-state 收紧、最终并发/死锁/性能验收。
+- 未完成：最终 overlap、并发/故障收敛和性能验收。
 - 当前 `magi_comm.py` 是未提交技术探针，不直接作为生产实现；重构前先提交或备份，禁止覆盖/reset。
-- 已完成：步骤 0、步骤 1、步骤 2、步骤 3、步骤 4、步骤 5；grpcoll dirty probe 已保存为 `agents/backups/magi-dsa-v4-grpcoll-probe-20260709.patch`（SHA256 `b6a6b8fadb48a38dc2c9b38bb1abd1fab8d5d86f27fedb67d298bded836416ee`）。
+- 已完成：步骤 0、步骤 1、步骤 2、步骤 3、步骤 4、步骤 5、步骤 6；grpcoll dirty probe 已保存为 `agents/backups/magi-dsa-v4-grpcoll-probe-20260709.patch`（SHA256 `b6a6b8fadb48a38dc2c9b38bb1abd1fab8d5d86f27fedb67d298bded836416ee`）。
 - 步骤 3 实现 commits：`29a9ffa3`、`f81d121e`；A2AV fallback 与真实 native grpcoll 的 CP=2 transport-only 全部通过。
 - 步骤 4 实现 commit：`c9856309`；SM90 copy/remap/FP32 CSR、A2AV fallback 与真实 native grpcoll 的 CP=2 transport-only 全部通过。
 - 步骤 5 实现 commit：`9bf41223`；B300/SM103 上 CP=2 reference/kernel 完整 forward、sequential/balanced、ratio=0/4/128 与 CP=1 对拍全部通过。
-- 下一步：步骤 6。
+- 步骤 6 实现 commit：`5c374507`；CP=1/CP=2 reference/kernel 完整 backward、四路反向 GroupReduce、replicated gradient GroupReduce 和最小 saved-state 在双 B300 上通过。
+- 下一步：步骤 7。
 
 ## 具体实施步骤
 
@@ -270,6 +271,16 @@ tests/test_dsa/
 - 测试：dx、dqr、dQ、dKV、compressor/Indexer 参数梯度、d_sink 与 CP=1 reference 对齐；saved-tensor hooks 确认未保存 compressed/remote/packed tensor；释放 forward 临时 buffer 后 backward 仍通过。
 - 落位：CP=1 backward/saved-state 写入 `test_dsa_api.py`；CP=2 全梯度和 owner reduce 写入 `test_dsa_cp.py`。
 - 出口：全部梯度正确，参数梯度明确为 CP-reduced，saved-state 满足冻结合同。
+
+完成记录（2026-07-10）：
+
+- worktree：`agents/worktrees/magi-dsa-v4-plan-grpcoll`；步骤 5 关闭记录 commit `071f7ad2`。
+- 实现 commit：`5c374507`（`Connect complete Magi DSA backward`）。
+- 实现：CP=1 和 CP=2 都由高层 custom autograd boundary 管理最小 saved-state；forward 保存 owner-local 原始输入、O、FP32 LSE、topk 和 topk_length，不保存 compressed/remote/packed payload、collective work 或 event。CP=2 backward 重新发起 window KV、overlap X、compressed KV、compressed Ki 四路 GroupCast 并重算两个 compressor；KL 使用已保存 top-k 做 Indexer score recompute/backward，dKi 经 FP32 inverse CSR 和 GroupReduce 回 owner；sparse backward 复用 cuDNN DSA ABI 产生 dQ/dKV/d_sink，window/compressed dKV 经 FP32 CSR 合并和对称 GroupReduce 回 owner。compressor backward 保持 PyTorch autograd；d_sink 和全部 runtime 参数梯度使用独立的 FP32 GroupReduce 做 replicated sum，并标记 `_magi_dsa_cp_reduced`。
+- saved-state：CP=1 packed 变长路径也改为不保存 compressed KV/Ki；reference 测试 seam 仅在 backward 重算 reference sparse attention，正式 kernel 路径只消费已保存 O/LSE/top-k，不重算 sparse forward 或 Indexer top-k。saved-tensor hooks 对 CP=1/CP=2 均只观察到 5 个原始输入加 O/LSE/topk/topk_length；forward 临时通信 buffer 释放后 backward 通过。
+- B300 验证：在 8× NVIDIA B300 SXM6 AC 节点上按冻结 CP=2 范围使用其中 2 卡；镜像继续使用 `magi-dsa-b300-step5:dev`（image id `sha256:5ecfa64c2164301e301e8e7348aeaf12e99dde0b4d2bdf0ada7f5dfdd314425a`）。SM100 cuDNN sparse backward 首次调用包含 CUTLASS DSL 冷编译，因此该测试单独给 600 秒冷编译预算，其余 CP 测试保持 60 秒；编译后 reference/kernel ratio=0/4/128 均通过。
+- 正式测试：`test_dsa_api.py` 为 `24 passed`；dispatch/solver/pack 三文件为 `43 passed`；`test_dsa_cp.py` 的 A2AV 路径为 `11 passed`，当前镜像未安装 `magi_attn_comm`，故既有 native transport-only 用例为 `1 skipped`。CP backward 使用全局 token-mean 随机上游梯度，在相同容差下对齐 CP=1，不为 CP 单独放宽 mismatch threshold；覆盖 dx、dqr、dQ、owner dKV、全部 compressor/Indexer 参数和 d_sink。步骤 5 forward 两项在修正不稳定的 fragment-count 测试假设后单独复跑为 `2 passed`。
+- 回归：`tests/test_attn/test_dsa_v4.py tests/test_attn/test_dsa_v4_cp.py` 为 `19 passed`。Black、isort、compileall 和 `git diff --check` 通过；镜像未安装 flake8。生产 `dist_dsa.py`/`dsa_comm.py` 仍不直接调用 torch P2P/all-gather/all-reduce/all-to-all；torch `index_select/index_copy_` 只存在于步骤 3 保留的 reference seam。
 
 ### 步骤 7：实现 overlap、并发和故障收敛
 
