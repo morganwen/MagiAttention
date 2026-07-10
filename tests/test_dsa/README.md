@@ -30,8 +30,24 @@ docker run --rm --gpus all --ipc=host \
 Useful filters include `-k contract`, `-k compressor`, `-k reference`, and
 `-k kernel`.  A compiled kernel execution over 10 seconds is treated as a
 deadlock; later kernel unit tests use a 30-second watchdog and CP tests use a
-60-second watchdog. CP=2 data movement is intentionally deferred to step 3;
-step 2 only builds and validates immutable host-side plans.
+60-second watchdog. Step 3 now provides CP=2 transport-only coverage; full
+CP=2 attention remains in steps 5/6.
+
+Run the step-3 GroupCast/GroupReduce transport suite on two H100s with:
+
+```bash
+docker run --rm --gpus all --ipc=host \
+  --ulimit memlock=-1 --ulimit stack=67108864 \
+  -v /home/scratch.wewen_gpu:/ws \
+  -w /ws/MagiAttention/agents/worktrees/magi-dsa-v4-plan-grpcoll \
+  magi-dsa-dev:v2 timeout 60 \
+  pytest -q tests/test_dsa/test_dsa_cp.py
+```
+
+The A2AV fallback, non-contiguous routes, FP32 reverse reduction, and empty
+routes run without the optional compiled `magi_attn_comm` extension. The native
+grpcoll parity case executes when that extension is installed; otherwise that
+single case is reported as skipped. No attention kernel runs in this file yet.
 
 The CPU-only fragment and solver tests run in the same frozen environment:
 

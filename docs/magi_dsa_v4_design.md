@@ -43,7 +43,7 @@ magi_attention/functional/dist_dsa.py
 - `MagiDSAInput` 具名保存 `x`、`qr`、`q`、`latent_kv`、FP32 `sink` 和 `packed_meta`。
 - 行张量均为 packed THD：`x [T,hidden_size]`、`qr [T,q_lora_rank]`、`q [T,64,512]`、`latent_kv [T,512]`、`sink [64]`。
 - `calc_dsa(input, runtime_mgr)` 返回 `O [T,64,512]` 与可微 FP32 标量 `kl_loss`。
-- 一个 `MagiDSARuntimeMgr` 只服务其 config 固定的一种 ratio，并持有 compressor/Indexer 参数。CP=1 计算路径继续复用 `MagiDSAV4.forward_packed`；步骤 2 按 packed layout/policy 缓存真实 fragment plan。CP=2 在 plan 求解与元数据广播后明确停在 tensor 数据移动之前。
+- 一个 `MagiDSARuntimeMgr` 只服务其 config 固定的一种 ratio，并持有 compressor/Indexer 参数。CP=1 计算路径继续复用 `MagiDSAV4.forward_packed`；步骤 2 按 packed layout/policy 缓存真实 fragment plan。步骤 3 已提供独立的 CP=2 transport 层；`calc_dsa` 的完整 CP=2 attention 编排仍在步骤 5/6 接入。
 - ratio=0 不构建 compressor/Indexer；ratio=128 只构建 compressor；ratio=4 同时构建 compressor 和 Indexer。
 
 V1 固定配置为：Hq=64、Hkv=1、D=512、rope dim=64、window=128、Hidx=64、Didx=128、topk=512，主路径 BF16，sink FP32。`hidden_size`、`q_lora_rank` 和 `softmax_scale` 由模型配置提供。
@@ -73,9 +73,34 @@ ratio=4 最慢 rank 的 Indexer scan cost，再在允许 slack 内按 token、�
 fragment overhead 和显存预测选择完整 E2E 最小的候选。rank 0 确定性求解后
 广播 plan，runtime 按 packed layout 与 policy 缓存。
 
-步骤 2 不移动 CP 数据；步骤 3 才接入 GroupCast/GroupReduce reference packing。
+步骤 3 在 `functional/dsa_comm.py` 中实现了通信层。`DsaCommPlan` 为四类
+payload 各自生成一个 `GroupCollectiveArg`：window KV 与 overlap x 根据
+transfer table 将相同 owner row 的 destination 合并后只 pack 一次；
+compressed KV/Ki 则把 owner-local compressed block 静态发送给所有 peer。
+每条 source/destination 空路线也保留显式零长度 split，因此所有 rank 能按
+固定顺序进入 collective。
+
+forward 先用 torch `index_select` reference map 打包 owner-local unique rows，
+再调用 `group_cast` 得到带稳定 logical row id 的 typed receive buffer；backward
+复用同一元数据和 payload-private native handle 调用对称 `group_reduce`。本地与
+远端梯度先转成 FP32，GroupReduce 输出写回 owner-local FP32 accumulator，最后
+只做一次目标 dtype 转换。reference map 是步骤 4 SM90 CuTe DSL kernel 的明确
+替换缝，不改变 collective metadata/API。
+
+`DsaCommBufferSlot`、`DsaGroupCastWork`、`DsaGroupReduceWork` 和 native handle
+dictionary 都按单次调用、单 payload 创建，不进入 runtime 共享静态对象。生产
+DSA 通信源码只调用 `group_cast` / `group_reduce`；A2AV 是该 primitive 的内建
+fallback，不在 DSA 层直接调用。
 
 ![步骤 2 负载均衡改前与改后](assets/dsa_step2_load_balance.svg)
+
+步骤 3 修改前：
+
+![步骤 3 通信修改前](assets/dsa_step3_comm_before.svg)
+
+步骤 3 修改后：
+
+![步骤 3 通信修改后](assets/dsa_step3_comm_after.svg)
 
 ## Saved-state 与并发
 
@@ -101,6 +126,12 @@ docker run --rm \
   -v /home/scratch.wewen_gpu:/ws -w /ws/MagiAttention/agents/worktrees/magi-dsa-v4-plan-grpcoll \
   magi-dsa-dev:v2 timeout 300 pytest -q \
   tests/test_dsa/test_dsa_dispatch.py tests/test_dsa/test_dsa_solver.py
+
+# 步骤 3 CP=2 transport-only（双 H100，60 秒 watchdog）
+docker run --rm --gpus all --ipc=host \
+  --ulimit memlock=-1 --ulimit stack=67108864 \
+  -v /home/scratch.wewen_gpu:/ws -w /ws/MagiAttention/agents/worktrees/magi-dsa-v4-plan-grpcoll \
+  magi-dsa-dev:v2 timeout 60 pytest -q tests/test_dsa/test_dsa_cp.py
 
 # 已有 DSA 原型回归
 docker run --rm --gpus all --ipc=host \

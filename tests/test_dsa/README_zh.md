@@ -28,8 +28,23 @@ docker run --rm --gpus all --ipc=host \
 
 可用 `-k contract`、`-k compressor`、`-k reference`、`-k kernel` 过滤。
 编译后单个 kernel 执行超过 10 秒视为死锁；后续 kernel 单测使用 30 秒
-watchdog，CP 测试使用 60 秒 watchdog。CP=2 数据移动推迟到步骤 3；步骤 2
-只构建并验证不可变的 host plan。
+watchdog，CP 测试使用 60 秒 watchdog。步骤 3 已提供 CP=2 transport-only
+覆盖；完整 CP=2 attention 留在步骤 5/6 接入。
+
+双 H100 上运行步骤 3 GroupCast/GroupReduce 通信测试：
+
+```bash
+docker run --rm --gpus all --ipc=host \
+  --ulimit memlock=-1 --ulimit stack=67108864 \
+  -v /home/scratch.wewen_gpu:/ws \
+  -w /ws/MagiAttention/agents/worktrees/magi-dsa-v4-plan-grpcoll \
+  magi-dsa-dev:v2 timeout 60 \
+  pytest -q tests/test_dsa/test_dsa_cp.py
+```
+
+A2AV fallback、非连续路线、FP32 反向归约和空路线不依赖可选的
+`magi_attn_comm` 编译扩展。扩展已安装时会执行 native grpcoll 对拍；否则只
+skip 该单项。此文件当前不运行 attention kernel。
 
 fragment 与 solver 是 CPU-only 测试，在同一冻结镜像中运行：
 

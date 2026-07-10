@@ -1,0 +1,97 @@
+digraph DsaStep3CommBefore {
+  graph [
+    rankdir=LR,
+    bgcolor="#F8FAFC",
+    pad="0.32",
+    nodesep="0.38",
+    ranksep="0.62",
+    fontname="DejaVu Sans",
+    fontsize=20,
+    label="Magi_DSA Communication — BEFORE Step 3",
+    labelloc=t
+  ];
+  node [
+    shape=box,
+    style="rounded,filled",
+    color="#64748B",
+    fillcolor="#FFFFFF",
+    fontname="DejaVu Sans",
+    fontsize=11,
+    margin="0.16,0.10"
+  ];
+  edge [
+    color="#64748B",
+    penwidth=1.5,
+    arrowsize=0.75,
+    fontname="DejaVu Sans",
+    fontsize=9
+  ];
+
+  packed [
+    label="Packed metadata\ncu_seqlens + ratio",
+    fillcolor="#DBEAFE",
+    color="#2563EB"
+  ];
+  solver [
+    label="Step 2 solver\n128-aligned balanced fragments",
+    fillcolor="#E0E7FF",
+    color="#4F46E5"
+  ];
+  plan [
+    label="Immutable host plan\nfragments + block owners\nrestore map + transfer tables",
+    fillcolor="#EDE9FE",
+    color="#7C3AED"
+  ];
+
+  subgraph cluster_rank0 {
+    label="Rank 0 local state";
+    color="#CBD5E1";
+    style="rounded,filled";
+    fillcolor="#F1F5F9";
+    r0 [label="Local token fragments\nLocal compressed blocks"];
+    r0_payloads [
+      label="window KV\noverlap x\ncompressed KV\ncompressed Ki",
+      fillcolor="#E2E8F0",
+      fontcolor="#64748B"
+    ];
+    r0 -> r0_payloads [style=dashed, color="#94A3B8"];
+  }
+
+  subgraph cluster_rank1 {
+    label="Rank 1 local state";
+    color="#CBD5E1";
+    style="rounded,filled";
+    fillcolor="#F1F5F9";
+    r1 [label="Local token fragments\nLocal compressed blocks"];
+    r1_payloads [
+      label="window KV\noverlap x\ncompressed KV\ncompressed Ki",
+      fillcolor="#E2E8F0",
+      fontcolor="#64748B"
+    ];
+    r1 -> r1_payloads [style=dashed, color="#94A3B8"];
+  }
+
+  missing [
+    label="No production transport executor\nNo reference pack/remap\nNo GroupCast / GroupReduce",
+    fillcolor="#FEE2E2",
+    color="#DC2626",
+    fontcolor="#991B1B",
+    penwidth=2.0
+  ];
+  stop [
+    label="CP=2 calc_dsa stops\nNotImplementedError",
+    shape=octagon,
+    fillcolor="#FECACA",
+    color="#B91C1C",
+    fontcolor="#7F1D1D",
+    penwidth=2.2
+  ];
+
+  packed -> solver -> plan;
+  plan -> r0;
+  plan -> r1;
+  r0_payloads -> missing [style=dashed, color="#DC2626"];
+  r1_payloads -> missing [style=dashed, color="#DC2626"];
+  missing -> stop [color="#B91C1C", penwidth=2.2];
+
+}

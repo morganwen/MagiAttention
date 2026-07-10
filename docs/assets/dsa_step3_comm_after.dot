@@ -1,0 +1,141 @@
+digraph DsaStep3CommAfter {
+  graph [
+    rankdir=LR,
+    bgcolor="#F8FAFC",
+    pad="0.32",
+    nodesep="0.34",
+    ranksep="0.58",
+    fontname="DejaVu Sans",
+    fontsize=20,
+    label="Magi_DSA Communication — AFTER Step 3",
+    labelloc=t
+  ];
+  node [
+    shape=box,
+    style="rounded,filled",
+    color="#475569",
+    fillcolor="#FFFFFF",
+    fontname="DejaVu Sans",
+    fontsize=10,
+    margin="0.14,0.09"
+  ];
+  edge [
+    color="#64748B",
+    penwidth=1.4,
+    arrowsize=0.72,
+    fontname="DejaVu Sans",
+    fontsize=8
+  ];
+
+  plan [
+    label="DsaDispatchPlan\nfragments + owners + transfer tables",
+    fillcolor="#EDE9FE",
+    color="#7C3AED"
+  ];
+  comm_plan [
+    label="DsaCommPlan\n4 independent GroupCollectiveArg objects",
+    fillcolor="#DBEAFE",
+    color="#2563EB",
+    penwidth=2.0
+  ];
+
+  subgraph cluster_payloads {
+    label="Typed static routes";
+    color="#93C5FD";
+    fillcolor="#EFF6FF";
+    style="rounded,filled";
+
+    window [
+      label="WINDOW_KV\ntransfer table → unique token rows",
+      fillcolor="#DBEAFE",
+      color="#2563EB"
+    ];
+    overlap [
+      label="OVERLAP_X\ntransfer table → unique token rows",
+      fillcolor="#D1FAE5",
+      color="#059669"
+    ];
+    ckv [
+      label="COMPRESSED_KV\nowner rows → every CP peer",
+      fillcolor="#FEF3C7",
+      color="#D97706"
+    ];
+    cki [
+      label="COMPRESSED_KI\nowner rows → every CP peer",
+      fillcolor="#FCE7F3",
+      color="#DB2777"
+    ];
+  }
+
+  pack [
+    label="Torch reference pack\nunique owner-local row indices\n(Step 4 kernel seam)",
+    fillcolor="#E0F2FE",
+    color="#0284C7"
+  ];
+  cast [
+    label="Forward GroupCast\nA2AV fallback or native grpcoll",
+    fillcolor="#BFDBFE",
+    color="#1D4ED8",
+    penwidth=2.0
+  ];
+  recv [
+    label="Typed unique receive buffer\nstable logical row ids",
+    fillcolor="#DCFCE7",
+    color="#16A34A"
+  ];
+
+  remote_grad [
+    label="Remote gradient contributions\nin receive-row order",
+    fillcolor="#FFEDD5",
+    color="#EA580C"
+  ];
+  local_grad [
+    label="Owner-local contribution",
+    fillcolor="#FFEDD5",
+    color="#EA580C"
+  ];
+  reduce [
+    label="Symmetric GroupReduce\nsame route + same payload handle\nsum, FP32 communication",
+    fillcolor="#FED7AA",
+    color="#C2410C",
+    penwidth=2.0
+  ];
+  restore [
+    label="FP32 owner accumulator\nrestore local row order\none final dtype cast",
+    fillcolor="#BBF7D0",
+    color="#15803D",
+    penwidth=2.0
+  ];
+
+  isolation [
+    label="Per-call isolation\n4 buffer slots + 4 work objects\n4 native handle dictionaries\n(no runtime-shared event/work/buffer)",
+    fillcolor="#F0FDFA",
+    color="#0F766E"
+  ];
+  contract [
+    label="Production DSA transport calls only\ngroup_cast / group_reduce",
+    shape=note,
+    fillcolor="#ECFCCB",
+    color="#4D7C0F",
+    fontcolor="#365314"
+  ];
+
+  plan -> comm_plan;
+  comm_plan -> window;
+  comm_plan -> overlap;
+  comm_plan -> ckv;
+  comm_plan -> cki;
+  window -> pack;
+  overlap -> pack;
+  ckv -> pack;
+  cki -> pack;
+  pack -> cast -> recv;
+  recv -> remote_grad [label="backward"];
+  remote_grad -> reduce;
+  local_grad -> reduce;
+  reduce -> restore;
+  cast -> isolation [style=dashed, color="#0F766E"];
+  reduce -> isolation [style=dashed, color="#0F766E"];
+  cast -> contract [style=dotted, color="#4D7C0F"];
+  reduce -> contract [style=dotted, color="#4D7C0F"];
+}
