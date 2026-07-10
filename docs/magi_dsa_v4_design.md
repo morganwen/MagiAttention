@@ -1,65 +1,99 @@
 # Magi_DSA V4 设计文档
 
-- 依据 AGENTS.md 的 V4 契约与 PLAN.md 设计文档阶段清单撰写。本文冻结实现口径，代码以此为准。
-- 数值权威参考：Megatron-LM dsv4 实现，本地 /home/scratch.wewen_gpu/megatron-lm 分支 dsv4-repro，commit c6449f0b2。下文引用的行号都指该 commit。
+本文与仓库根目录 `PLAN.md` 共同冻结 Magi_DSA V4 的实现口径；发生冲突时以 `PLAN.md` 的“冻结合同”为准。当前验收平台仅为 SM90/H100 80GB：CP=1 使用 1 卡，CP=2 使用同机 2 卡。
 
-## 已消除的开放问题
+## 可复现基线
 
-- compressor 输入口径：吃 hidden，不吃投影后的 KV。参考实现 Compressor 的内容投影和门控投影都是 hidden_size 到 coff 乘 head_dim（csa.py:852、:866），主压缩流与 indexer 压缩流都从 hidden 出发。Magi_DSA 照此办理，config 携带 hidden_size。
-- indexer 输入口径，对 AGENTS.md 的一处契约修正：indexer 的 Qi、Ki、Weights 都不是外部输入，而是 runtime 内部投影生成。参考实现 CSAIndexer 持有 wq_b（q_lora_rank 到 64 乘 128）、weights_proj（hidden 到 64）和自己的 rotate 压缩器（csa.py:1191 起），输入是 hidden x 和 q 的 latent qr。Magi_DSA 的 API 输入相应为 x 与 qr，indexer 参数归 runtime 所有，梯度经 autograd 落在自有参数上，对外返回 dx、dqr。此修正待用户确认后回写 AGENTS.md。
-- sink 梯度路径，已实测关闭：cudnn-fe 的 sparse_attention_backward_wrapper 原生返回 d_sink，在 V4-Flash 真实维度上与 autograd 对拍通过，无需 LSE 补算。理论备忘：sink 等价于一条 value 为零向量的额外注意力条目，d_sink 对每个头 h 为对所有 query 求和的 −p_sink(q,h) 乘 dO(q,h) 点乘 O(q,h)，补算公式留作交叉校验用。
-- KL 精确口径，逐项对齐参考实现 compute_dsa_indexer_loss（dsa.py:231）：
-  - predict 是 index_scores 的 softmax。index_scores 等于对 head 求和的 weights 乘 relu(Qi 点乘 Ki)，fp32（dsa.py:_compute_index_scores）。进 KL 前 weights 额外乘 indexer softmax_scale，即 index_head_dim 的负二分之一次方（csa.py:1591）。top-k 选择用不乘 scale 的分数，因缩放不改变排序。
-  - target 是主注意力分数的逐头 softmax：q 点乘压缩 KV 乘主 softmax_scale，压缩条按块级因果掩码，逐头 softmax 后对头求和再 L1 归一。
-  - sparse loss 开启时，target 和 predict 都先加 top-k 的 index_mask，分布限制在选中位置上。V4 recipe 开 sparse loss，V1 只实现 sparse 口径，dense 口径留接口不留实现。
-  - 全掩码行，即块级因果下可见块数为零的行，logits 置零过 softmax 再乘行掩码归零，不产生 NaN，不贡献损失。
-  - KL(target 对 predict) 沿 KV 轴求和成每行标量，token-mean 归一，乘 loss_coeff。per-token-loss 模式改为求和。CP 下分母是全局 query token 数。
-- 窗口折叠布局：kv_full 平铺为原始段在前压缩段在后，压缩索引加原始段长度作 offset，窗口索引与压缩 top-k 索引沿最后一维拼接，一次 sparse attention 统一算（csa.py:1629、:2415）。kernel 路径的 topk 对齐要求参照 Megatron dsa_kernels.py 的 _get_topk_alignment。
+- MagiAttention 基线：`529fb0a4e273b3557a56d8afd60b74da46688095`。
+- DSA 计算原型：`98e043cafebbdcbce6835e26849d96624136ef70`。
+- Megatron dsv4 数值参考：`c6449f0b23be397449f21c0967c5fc90785e55ea`。
+- DeepSeek 官方 HF 配置：`deepseek-ai/DeepSeek-V4-Flash@60d8d70770c6776ff598c94bb586a859a38244f1`；使用该 revision 的 `config.json` 和 `inference/config.json`。
+- FlashMLA nv_dev：`b7643bd54521f563b839b98289b5cd048c062ba2`。
+- NVIDIA cudnn-frontend：`f00538322e9d3d439fe8c5f3144644e58ee66823`（安装包 `nvidia-cudnn-frontend==1.27.0`）。
+- fast-hadamard-transform：`e7706faf8d1c3b9f241e36860640ad1dac644ede`。
+- CUTLASS 子仓：`81a43e6d92cdd8c20d22392f9579604ed5f710a1`；FA4 子仓：`ee1d15159cda6f3f97bfab9e487da146a8254970`；`nvidia-cutlass-dsl==4.5.2`。
+- 开发镜像：`magi-dsa-dev:v2`，本机 image id `sha256:9c51e29d1fda8fc1a6e2a8e16c7b0773309e91dcbd44cf6d0182e5e3327c1029`；其 v1 基础层为 `sha256:000b7bb606e306ca31050615e2896a5becc1eda2ede3e8c4ab4f76113969479d`。NGC PyTorch 26.05 固定为 registry digest `sha256:222d8b18e671be5c3ef91cb41727a2572a0b23f59ded6c39f373a96946f6f2ba`（build `313520559`，build ref `30a5fc6cbfce157e75fae3d0cf1fd8e273a3dc25`）。
+
+`agents/docker/magi-dsa-dev/Dockerfile` 和 `magi-dsa-flashmla/Dockerfile` 分别固定 cudnn-frontend、fast-hadamard-transform 和 FlashMLA commit。镜像 tag 只作为易读别名，测试报告同时记录 image id。
+
+## 数值与模块边界
+
+- compressor 输入 hidden `x`，不是投影后的 latent KV。内容投影和门控投影都从 `hidden_size` 出发。
+- Indexer 的 Qi、Ki、Weights 由 runtime 内部从 `qr` 和 `x` 投影生成；Indexer 分支 detach 输入，KL 不向 trunk `x/qr` 回传。
+- cuDNN sparse backward 原生返回 `d_sink`。sink 等价于 value 为零的附加 softmax 条目，但正式实现不通过补算代替原生梯度。
+- Q/KV 最后 64 维已经由模型侧做 partial RoPE。压缩条按 logical block id 使用压缩 RoPE；官方配置使用 `compress_rope_theta=160000`、YaRN factor 16、original max positions 65536。
+- 压缩器只处理完整块，sample 尾部不足 ratio 的 token 不生成压缩条。ratio=4 使用重叠 compressor，ratio=128 使用非重叠 compressor。
+- 位置 `p`（sample 内 0-based）只能看到 `floor((p+1)/ratio)` 个完整压缩块。
+- Indexer score 为 `sum_h weights[q,h] * relu(Qi[q,h] dot Ki[k])`。top-k 按 score 降序、同分按小 logical block id；合法项在前，其余填 `-1`。
+- KL target 来自主 Q 与 compressed KV 的逐头注意力分布；predict 来自 Indexer。CP 下可微返回值为 `local_kl_sum / global_query_tokens`。
 
 ## 公共 API 与 tensor schema
 
-- 包位置 magi_attention/experimental/dsa_v4，独立 runtime，不进 calc_attn。对外类名 MagiDSAV4，配置类 MagiDSAV4Config。
-- 配置字段与 V4-Flash 默认值：compress_ratio 必填取 0、4、128 之一；hidden_size 必填；q_lora_rank 必填；num_heads 64；kv_dim 512；rope_dim 64；window_size 128；topk 512；indexer_heads 64；indexer_dim 128；softmax_scale 必填；indexer_loss_coeff 0.01；use_sparse_loss True；compress_rotary_base 40000 与 YaRN 参数；校验拒绝契约外组合。
-- forward 输入，SBHD 参考布局 sq b 在前，packed THD 布局见 packed 一节：
-  - x：hidden，[sq, b, hidden_size]，喂两个压缩器和 weights_proj
-  - qr：q latent，[sq, b, q_lora_rank]，喂 indexer 的 wq_b
-  - q：主 query，RoPE 已完成，[sq, b, 64, 512]
-  - kv：每 token 一条 latent KV，RoPE 已完成，[sq, b, 512]
-  - sink：[64] fp32 可学习参数，由调用方持有传入
-- forward 输出：O [sq, b, 64 乘 512]，kl_loss 可微标量。compress_ratio 为 0 或 128 时 kl_loss 恒为零标量，保持签名一致。
-- backward 由 autograd 驱动：dO 与 d_kl 进来，产出 dx、dqr、dq、dkv、d_sink，runtime 自有参数的梯度落在参数上。
-- runtime 自有参数：主压缩器的 wkv、wgate、ape、norm；indexer 的 wq_b、weights_proj 和它的压缩器同名参数。compress_ratio 为 0 时不建任何压缩器参数，128 时不建 indexer 参数，与参考实现的条件构造一致（csa.py:1488、:1502）。
+正式入口位于：
 
-## 数学口径
+```text
+magi_attention/api/dsa_attn_interface.py
+magi_attention/dsa_runtime_mgr.py
+magi_attention/functional/dist_dsa.py
+```
 
-- 压缩器：cutoff 等于 seqlen 对 ratio 取整乘 ratio，尾巴不压。内容投影与门控投影 hidden 到 coff 乘 head_dim，门控加块内位置嵌入 APE，块内 softmax 用 fp32，加权求和后过 RMSNorm，再按块序号位置打 RoPE，nope 与 rope 维划分为 head_dim 减 rope_dim 与 rope_dim。ratio 4 时 coff 2 做重叠：每 token 投影劈两半，前半给下一块后半留本块，块首缺口分数填负无穷；ratio 128 时 coff 1 不重叠。indexer 压缩器多一步 Hadamard 旋转。全部对齐 csa.py:795 起的 Compressor。
-- 块级因果：位置 p 可见 (p+1) 整除 ratio 条压缩条，用于 top-k 掩码、KL 掩码和索引合法性校验。
-- 窗口：每 query 附带同 sample 内最近 window_size 个原始 token 的索引，越界填负一。
-- 统一 sparse attention：gather 平铺索引对应的 KV，fp32 打分乘 softmax_scale，无效位填负无穷，带 sink 的 softmax，加权求和。对齐 unfused_compressed_sparse_attn（csa.py:535）。
-- 三形态：ratio 0 只有窗口索引；ratio 4 窗口拼 indexer top-k；ratio 128 窗口拼块级因果前缀内全部压缩条（csa.py:1622 的 else 分支语义）。
+`experimental/dsa_v4` 保留为已验证的计算/kernel 原型，公共调用方不再直接调用 `forward_cp` 或 `forward_cp_packed`。
 
-## saved-state 契约
+- `DsaPackedMeta` 保存 packed sample 边界 `cu_seqlens`（1-D contiguous int32、首项 0、单调不减）。
+- `MagiDSAInput` 具名保存 `x`、`qr`、`q`、`latent_kv`、FP32 `sink` 和 `packed_meta`。
+- 行张量均为 packed THD：`x [T,hidden_size]`、`qr [T,q_lora_rank]`、`q [T,64,512]`、`latent_kv [T,512]`、`sink [64]`。
+- `calc_dsa(input, runtime_mgr)` 返回 `O [T,64,512]` 与可微 FP32 标量 `kl_loss`。
+- 一个 `MagiDSARuntimeMgr` 只服务其 config 固定的一种 ratio，并持有 compressor/Indexer 参数。步骤 1 的 CP=1 路径复用 `MagiDSAV4.forward_packed`；CP=2 只建立静态占位 plan 并明确拒绝计算，不发起通信。
+- ratio=0 不构建 compressor/Indexer；ratio=128 只构建 compressor；ratio=4 同时构建 compressor 和 Indexer。
 
-- forward 保存：O、fp32 LSE、topk_idx、topk_length、压缩器反向所需的门控中间量。V1 的 reference 路径先用 autograd 默认保存行为跑通数值，再按本契约收紧并配 saved-tensor hooks 专项；kernel 路径从一开始就按本契约实现。
-- 压缩条不保存，backward 重算或由门控中间量恢复，取舍在单卡核心阶段以显存实测定案，结论回写本文档。
-- remote 与 packed tensor 不保存，CP 阶段 backward 按静态 plan 重收。
+V1 固定配置为：Hq=64、Hkv=1、D=512、rope dim=64、window=128、Hidx=64、Didx=128、topk=512，主路径 BF16，sink FP32。`hidden_size`、`q_lora_rank` 和 `softmax_scale` 由模型配置提供。
 
-## kernel 接入计划
+## Kernel 接入边界
 
-- 阶段一，纯 PyTorch reference：全链路 torch 算子加 fast-hadamard-transform，与 Megatron unfused 路径对拍。本机 SM90 可完整执行。
-- 阶段二，cudnn-fe 接入：indexer_forward、indexer_top_k、indexer_backward、score_recompute、sparse_attention_backward，SM90 与 SM100 都官方支持，本机可验 backward 侧数值。sink 直传真实值，d_sink 视 kernel 能力走原生或 LSE 补算。
-- 阶段三，FlashMLA sparse forward：nv_dev 分支，V4 形状走 head64 对齐路径。本机为 SM90，Megatron 官方容器在 SM90 上禁编该 kernel，故此阶段的构建与数值验证留待 SM100 环境，接入代码与 wrapper 先行完成并以 reference 兜底。
-- kernel 与 reference 的切换走 config 的 backend 字段，默认 reference。
+- sparse forward 复用 FlashMLA `flash_mla_sparse_fwd`。
+- sparse backward/d_sink、Indexer forward/top-k、score recompute 和 Indexer backward 复用 cudnn-frontend `cudnn.deepseek_sparse_attention`。
+- 统一 wrapper 位于 `experimental/dsa_v4/kernels.py`；步骤 1 只接线，不重写、不 fork 外部 kernel。
+- reference backend 只用于数值对拍；正式 kernel backend 的输入为 CUDA BF16，top-k 保持 device resident。
+- 后续唯一计划内新增的计算辅助 kernel 是 `kernel/cutedsl/dsa_pack.py`，用于 SM90 packing、remap 与 FP32 CSR reduction。
 
-## CP 设计要点
+## CP plan 与通信
 
-- dispatch 块对齐 128，块归属最后一个 token 所在 rank，halo 行数取 window_size 与 ratio 的最大值即 128。
-- 通信内容：原始 KV 与 x 的左边界 halo 点对点；压缩条、indexer 压缩 Ki 全组 allgather；backward 反向归并对应各自路径，压缩条梯度经压缩器反传，不跨 rank 通信压缩条梯度本体而是归并到原始 token 的 dx。
-- metadata schema：块 id 与原始 token 区间双向映射、sample id、owner rank、packed 行号，全部显式 dataclass，细化在 CP 阶段动工前补充到本文档并评审。
+- dispatch/transfer plan 以 sample-relative logical positions 和可非连续 fragments 表示；128 对齐只约束可切分边界，不假设 fragment owner 相邻。
+- compressed KV、compressed Ki、window KV、compressor overlap x 是四种独立 typed payload，分别持有 metadata、buffer slot 和 work handle。
+- compressed KV/Ki 静态发送到全部 CP peers；window KV 和 overlap x 按 sample/fragment transfer table 只发送 unique rows。
+- 正式数据交换只通过 `group_cast` / `group_reduce`。DSA 生产代码不直接调用 torch P2P、all-gather、all-reduce 或 `all2all_v` 替代。
+- backward 使用 forward 的对称 GroupReduce；窗口与压缩条落到同一原 token 的梯度先用 FP32 accumulator 合并。
+- collective 进入顺序在全部 rank 一致；空路线仍传合法零长度 metadata。
 
-## 测试计划
+步骤 1 不实现 CP 数据移动。步骤 2 建立 fragment/solver plan，步骤 3 才接入 GroupCast/GroupReduce reference packing。
 
-- 单卡：reference 对 Megatron unfused 的逐张量对拍，覆盖三形态、compressor 重叠边界、块级因果、sink 双向、KL 标量与全部梯度；容差用 magi_attention.testing.precision 流程校准后冻结。
-- packed：多 sample、不连续 fragment 块对齐、行尾负一、saved-state 专项。
-- CP：本机 CP=2 与 CP=1 全量对拍；CP=4、8 与性能门槛留 SM100 环境。
-- 正式单测放 tests 目录，agent 自用的探索性脚本放 agents/tests。
+## Saved-state 与并发
+
+- forward 只保存 O、FP32 LSE、`topk_idx`、`topk_length` 和 compressor gate 反向必需中间量。
+- 不保存 compressed、remote/packed tensor、work 或 CUDA event；backward 按静态 plan 重收输入并重算压缩条，不重算 top-k 或 sparse forward。
+- work、event、remote buffer 和 saved-state 都属于单次 autograd 调用，不放入 runtime 共享静态状态。
+- d_sink 与 runtime replicated 参数梯度由 DSA 内部 GroupReduce，并标记为 CP-reduced，外层不得对同一 CP group 重复归约。
+
+## 正式测试与当前命令
+
+正式测试固定在 `tests/test_dsa`。步骤 1 提供公共 API 的配置/字段拒绝测试，以及 CP=1 三种 ratio、packed、sink、compressor、KL、输出和梯度与原型 API 的对拍。
+
+当前 H100 镜像命令：
+
+```bash
+# 公共 API（步骤 1）
+docker run --rm --gpus all --ipc=host \
+  -v /home/scratch.wewen_gpu:/ws -w /ws/MagiAttention/agents/worktrees/magi-dsa-v4-plan-grpcoll \
+  magi-dsa-dev:v2 timeout 300 pytest -q tests/test_dsa/test_dsa_api.py
+
+# 已有 DSA 原型回归
+docker run --rm --gpus all --ipc=host \
+  -v /home/scratch.wewen_gpu:/ws -w /ws/MagiAttention/agents/worktrees/magi-dsa-v4-plan-grpcoll \
+  magi-dsa-dev:v2 timeout 300 pytest -q tests/test_attn/test_dsa_v4.py
+```
+
+编译后的单 kernel 测试使用 30 秒 watchdog，CP 通信测试使用 60 秒 watchdog；kernel 单次执行超过 10 秒按死锁处理。探索脚本和原始日志保留在 `agents/tests/magi-dsa-v4`，不替代正式测试。
+
+## grpcoll 探针保存
+
+原型 worktree `agents/worktrees/magi-dsa-v4` 的未提交 grpcoll 探针没有被覆盖或 reset；完整可应用补丁保存在 `agents/backups/magi-dsa-v4-grpcoll-probe-20260709.patch`，SHA256 为 `b6a6b8fadb48a38dc2c9b38bb1abd1fab8d5d86f27fedb67d298bded836416ee`。

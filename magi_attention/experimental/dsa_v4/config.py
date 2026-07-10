@@ -32,8 +32,8 @@ class MagiDSAV4YarnConfig:
     when embedding compressed entries at block positions.
     """
 
-    rotary_base: float = 40000.0
-    scaling_factor: float = 4.0
+    rotary_base: float = 160000.0
+    scaling_factor: float = 16.0
     original_max_position_embeddings: int = 65536
     beta_fast: int = 32
     beta_slow: int = 1

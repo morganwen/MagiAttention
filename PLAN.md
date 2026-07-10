@@ -74,9 +74,10 @@ mean_pack(max_rank_indexer_time)_sequential
 - Magi-MSA 结构参考：`/home/scratch.wewen_gpu/Magi-MSA`，commit `9670ae222b4a93ce63994982c111604f9f0d6265`。
 - Megatron dsv4 数值参考：`/home/scratch.wewen_gpu/megatron-lm`，commit `c6449f0b2`。
 - FlashMLA：`b7643bd54521f563b839b98289b5cd048c062ba2`；`nvidia-cutlass-dsl==4.5.2`。
-- cudnn-frontend 当前安装包版本为 1.27.0，但 `agents/docker/magi-dsa-dev/Dockerfile` 仍从未固定 commit 的 Git URL 安装；精确 commit 待步骤 0 冻结并写入 Dockerfile。
+- cudnn-frontend：`f00538322e9d3d439fe8c5f3144644e58ee66823`（`nvidia-cudnn-frontend==1.27.0`）；fast-hadamard-transform：`e7706faf8d1c3b9f241e36860640ad1dac644ede`。
 - CUTLASS 子仓：`81a43e6d92cdd8c20d22392f9579604ed5f710a1`；FA4 子仓：`ee1d15159cda6f3f97bfab9e487da146a8254970`。
-- DeepSeek V4 官方 HF config revision：待冻结。
+- DeepSeek V4 官方 HF config：`deepseek-ai/DeepSeek-V4-Flash@60d8d70770c6776ff598c94bb586a859a38244f1`。
+- H100 开发镜像：`magi-dsa-dev:v2@sha256:9c51e29d1fda8fc1a6e2a8e16c7b0773309e91dcbd44cf6d0182e5e3327c1029`；NGC 26.05 基础镜像 digest：`sha256:222d8b18e671be5c3ef91cb41727a2572a0b23f59ded6c39f373a96946f6f2ba`。
 
 ## 目标代码位置
 
@@ -135,7 +136,8 @@ tests/test_dsa/
 - 证据：`agents/tests/magi-dsa-v4`、`agents/profiles/magi-dsa-v4`、`agents/perf/magi-dsa-v4`。
 - 未完成：独立 runtime、非连续 fragment plan、真实 Indexer-balanced solver、正式 GroupCast/GroupReduce、SM90 packing、saved-state 收紧、最终并发/死锁/性能验收。
 - 当前 `magi_comm.py` 是未提交技术探针，不直接作为生产实现；重构前先提交或备份，禁止覆盖/reset。
-- 当前进行：步骤 0。
+- 已完成：步骤 0；grpcoll dirty probe 已保存为 `agents/backups/magi-dsa-v4-grpcoll-probe-20260709.patch`（SHA256 `b6a6b8fadb48a38dc2c9b38bb1abd1fab8d5d86f27fedb67d298bded836416ee`）。
+- 当前进行：步骤 1。
 
 ## 具体实施步骤
 
@@ -144,6 +146,13 @@ tests/test_dsa/
 - 修改：本 `PLAN.md`、`docs/magi_dsa_v4_design.md`。
 - 动作：删除旧 P2P/allgather 正式方案描述；冻结 HF revision、子仓状态、H100 镜像和当前有效测试命令；查明 cudnn-frontend 精确 commit 并把 Dockerfile 改为 commit pin；保存现有 dirty grpcoll 探针。
 - 出口：所有 revision 可复现，设计文档与本计划一致，主 worktree 用户改动未丢失。
+
+完成记录（2026-07-09）：
+
+- worktree：`agents/worktrees/magi-dsa-v4-plan-grpcoll`；步骤基线 `b3a7aa2df6057f4ae7a512587e284a9ea487e97d`。
+- commit：`Freeze reproducible DSA design inputs`（本步骤原子提交；精确 hash 在步骤 1 完成记录回填）。
+- 验证：重建 `magi-dsa-dev:v1`/`v2`；`pip check` 返回 `No broken requirements found`；镜像内核对 cudnn-frontend/FHT/FlashMLA/CUTLASS DSL revision。
+- 报告：`docs/magi_dsa_v4_design.md`、`agents/docker/magi-dsa-*/Dockerfile`、`agents/backups/magi-dsa-v4-grpcoll-probe-20260709.patch`。
 
 ### 步骤 1：建立公共 API 和 runtime 空骨架
 
