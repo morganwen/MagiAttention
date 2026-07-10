@@ -134,10 +134,11 @@ tests/test_dsa/
 
 - 已完成：三形态 PyTorch reference、compressor、Indexer、FlashMLA/cuDNN kernel、packed 原型、连续 CP=2 对拍和初版 profile。
 - 证据：`agents/tests/magi-dsa-v4`、`agents/profiles/magi-dsa-v4`、`agents/perf/magi-dsa-v4`。
-- 未完成：独立 runtime、非连续 fragment plan、真实 Indexer-balanced solver、正式 GroupCast/GroupReduce、SM90 packing、saved-state 收紧、最终并发/死锁/性能验收。
+- 未完成：步骤 3 的真实 native grpcoll runtime 对拍、SM90 packing、完整 CP forward/backward、saved-state 收紧、最终并发/死锁/性能验收。
 - 当前 `magi_comm.py` 是未提交技术探针，不直接作为生产实现；重构前先提交或备份，禁止覆盖/reset。
 - 已完成：步骤 0、步骤 1、步骤 2；grpcoll dirty probe 已保存为 `agents/backups/magi-dsa-v4-grpcoll-probe-20260709.patch`（SHA256 `b6a6b8fadb48a38dc2c9b38bb1abd1fab8d5d86f27fedb67d298bded836416ee`）。
-- 下一步：步骤 3。
+- 步骤 3 实现已落在 commit `29a9ffa3`：A2AV fallback 的 CP=2 transport-only 和 native 调用契约已通过；冻结镜像未预装 `magi_attn_comm`，真实 native kernel 对拍仍为 skip，因此步骤 3 尚未按出口条件正式关闭。
+- 下一步：在预编译/已安装 pinned `magi_attn_comm` 的同一 H100 镜像中补跑 native grpcoll 对拍；通过后关闭步骤 3，再进入步骤 4。
 
 ## 具体实施步骤
 
@@ -199,6 +200,17 @@ tests/test_dsa/
 - 动作：为 window KV、overlap x、compressed KV、compressed Ki 分别生成 `GroupCollectiveArg`；forward GroupCast 得到 unique receive buffer，backward 用对称 GroupReduce 回 owner。
 - 测试：CP=2 transport-only；逐项验证 send/recv rows、重复 fragment FP32 求和、零长度路线、非相邻 owner、A2AV fallback 和 native grpcoll 语义一致。
 - 出口：DSA 生产通信代码不直接调用 torch collectives/all2allv；四类 payload 的 forward/reverse 都与 host reference 一致。
+
+实现记录（2026-07-10；native kernel 出口待补）：
+
+- worktree：`agents/worktrees/magi-dsa-v4-plan-grpcoll`；步骤 2 图示基线 commit `870e53e5`。
+- 实现 commit：`29a9ffa3`（`Add typed DSA group collective transport`）。
+- 实现：新增 `functional/dsa_comm.py`，为 window KV、overlap x、compressed KV、compressed Ki 建立四套独立 typed metadata、`GroupCollectiveArg`、per-call buffer slot/work/native handle；token 路线按 transfer table 合并 destination 并 reference-pack unique owner rows，compressed KV/Ki 静态发给全部 peer；空 source/destination 路线保留显式零长度 split；backward 复用 forward route 做对称 GroupReduce，并以 FP32 communication/owner accumulator 合并后一次性转回目标 dtype。
+- 生产边界检查：DSA 通信源码只调用 `group_cast` / `group_reduce`，未直接调用 torch P2P、all-gather、all-reduce、all-to-all 或 `all2all_v`；torch `index_select`/`index_copy_` reference seam 留给步骤 4 的 SM90 kernel 替换。
+- CP=2 测试：冻结镜像上 `timeout 60 pytest -q tests/test_dsa/test_dsa_cp.py` 为 `6 passed, 1 skipped`；真实双 H100 A2AV 覆盖非连续 send/recv rows、四类 payload forward/reverse、FP32 owner 求和、零长度路线和空 rank；native buffer name/对称 handle/FP32 参数契约由无扩展 mock 测试覆盖。
+- 回归：`pytest -q tests/test_dsa/test_dsa_api.py tests/test_dsa/test_dsa_dispatch.py tests/test_dsa/test_dsa_solver.py` 为 `48 passed`；Black、isort、compileall 通过。镜像未安装 flake8，未执行该项。
+- native 状态：冻结 `magi-dsa-dev:v2` 未预装 `magi_attn_comm`。一次性容器补齐同版本 `nvidia-nvshmem-cu13==3.6.5` 后可进入 38 个 grpcoll 全量模板单元的编译，但本轮未等待全量构建完成；未修改/fork grpcoll kernel。真实 native case 保持显式 skip，故本步骤不标记正式完成，也未进入步骤 4。
+- 图示：`docs/assets/dsa_step3_comm_before.{dot,svg,png}`、`docs/assets/dsa_step3_comm_after.{dot,svg,png}`；设计说明同步在 `docs/magi_dsa_v4_design.md`。
 
 ### 步骤 4：实现 SM90 packing/remap/CSR kernel
 
