@@ -22,9 +22,13 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from magi_attention.experimental.dsa_v4 import MagiDSAV4, MagiDSAV4Config
+from magi_attention.dsa import MagiDSAConfig, MagiDSAV4
 from magi_attention.meta.collection.dsa_meta import DsaDispatchPlan
-from magi_attention.meta.solver.dsa_dispatch import DsaCostModel
+from magi_attention.meta.solver.dsa_calibration import (
+    CALIBRATION_ID,
+    calibration_manifest,
+    get_dsa_cost_model,
+)
 from magi_attention.meta.solver.dsa_solver import DsaPlanSolver
 
 if TYPE_CHECKING:
@@ -87,7 +91,7 @@ class MagiDSARuntimeMgr(nn.Module):
 
     def __init__(
         self,
-        config: MagiDSAV4Config,
+        config: MagiDSAConfig,
         cp_group: dist.ProcessGroup | None = None,
         *,
         dispatch_policy: str = "balanced",
@@ -140,17 +144,16 @@ class MagiDSARuntimeMgr(nn.Module):
         if config.compress_ratio == 4:
             compressed_block_memory_bytes += 2 * config.indexer_dim
         remote_row_memory_bytes = 2 * max(config.hidden_size, config.kv_dim)
+        calibrated_cost_model = get_dsa_cost_model(
+            config.compress_ratio,
+            token_memory_bytes=token_memory_bytes,
+            compressed_block_memory_bytes=compressed_block_memory_bytes,
+            remote_row_memory_bytes=remote_row_memory_bytes,
+        )
         self._plan_solver = DsaPlanSolver(
             alignment=128,
             window_size=config.window_size,
-            cost_model=DsaCostModel(
-                token_memory_bytes=token_memory_bytes,
-                compressed_block_memory_bytes=compressed_block_memory_bytes,
-                compressed_owner_send_memory_bytes=compressed_block_memory_bytes,
-                compressed_remote_receive_memory_bytes=compressed_block_memory_bytes,
-                compressed_global_memory_bytes=compressed_block_memory_bytes,
-                remote_row_memory_bytes=remote_row_memory_bytes,
-            ),
+            cost_model=calibrated_cost_model,
         )
         self.dsa_module = MagiDSAV4(config, dtype=torch.bfloat16)
         self._forward_plan_cache: dict[tuple[str, int], "DsaForwardPlan"] = {}
@@ -178,6 +181,20 @@ class MagiDSARuntimeMgr(nn.Module):
     @property
     def forward_plan_cache_size(self) -> int:
         return len(self._forward_plan_cache)
+
+    @property
+    def solver_calibration_id(self) -> str:
+        return CALIBRATION_ID
+
+    @property
+    def solver_calibration(self) -> dict[str, object]:
+        return calibration_manifest()
+
+    @property
+    def solver_cost_model(self):
+        """Frozen predictor used for plans created by this runtime."""
+
+        return self._plan_solver.cost_model
 
     def get_dispatch_plan(
         self,
@@ -245,9 +262,9 @@ class MagiDSARuntimeMgr(nn.Module):
             return cached
 
     @classmethod
-    def _validate_config(cls, config: MagiDSAV4Config) -> None:
-        if not isinstance(config, MagiDSAV4Config):
-            raise TypeError("config must be a MagiDSAV4Config")
+    def _validate_config(cls, config: MagiDSAConfig) -> None:
+        if not isinstance(config, MagiDSAConfig):
+            raise TypeError("config must be a MagiDSAConfig")
 
         mismatches = [
             f"{name}={getattr(config, name)!r} (expected {expected!r})"

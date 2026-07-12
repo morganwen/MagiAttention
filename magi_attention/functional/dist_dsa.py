@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.distributed as dist
 
+from magi_attention.dsa.telemetry import dsa_phase
 from magi_attention.functional.dsa_comm import (
     DsaCommPlan,
     DsaDeviceCommPlan,
@@ -56,8 +57,8 @@ from magi_attention.meta.collection.dsa_meta import (
 
 if TYPE_CHECKING:
     from magi_attention.api.dsa_attn_interface import MagiDSAInput
+    from magi_attention.dsa.compressor import DSAv4Compressor
     from magi_attention.dsa_runtime_mgr import MagiDSARuntimeMgr
-    from magi_attention.experimental.dsa_v4.compressor import DSAv4Compressor
     from magi_attention.kernel.cutedsl.dsa_pack import (
         DsaDeviceCopyMap,
         DsaDeviceReduceMap,
@@ -354,11 +355,12 @@ def _project_ratio4_queries(
         runtime_mgr.plan.cp_rank
     ].fragments:
         local_end = local_begin + fragment.token_count
-        query, weights = indexer.project_queries(
-            dsa_input.x[local_begin:local_end].detach().unsqueeze(1),
-            dsa_input.qr[local_begin:local_end].detach().unsqueeze(1),
-            row_offset=fragment.q_begin,
-        )
+        with dsa_phase("indexer_projection"):
+            query, weights = indexer.project_queries(
+                dsa_input.x[local_begin:local_end].detach().unsqueeze(1),
+                dsa_input.qr[local_begin:local_end].detach().unsqueeze(1),
+                row_offset=fragment.q_begin,
+            )
         projections.append(
             DsaIndexerProjection(
                 fragment=fragment,
@@ -386,7 +388,7 @@ def _ratio4_indices_and_kl(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run fragment-local Indexer selection against sample-global keys."""
 
-    from magi_attention.experimental.dsa_v4.indexer import compute_index_scores
+    from magi_attention.dsa.indexer import compute_index_scores
 
     cfg = runtime_mgr.config
     indexer = runtime_mgr.dsa_module.indexer
@@ -424,16 +426,17 @@ def _ratio4_indices_and_kl(
         comp_sample = compressed_kv[sample_block_begin:sample_block_end].unsqueeze(1)
 
         if cfg.backend == "kernel":
-            from magi_attention.experimental.dsa_v4.kernels import indexer_select_kernel
+            from magi_attention.dsa.kernels import indexer_select_kernel
 
-            local_ids = indexer_select_kernel(
-                q_idx,
-                k_sample,
-                w_idx,
-                cfg.topk,
-                ratio,
-                pos_offset=fragment.q_begin,
-            ).to(torch.int32)
+            with dsa_phase("indexer_topk"):
+                local_ids = indexer_select_kernel(
+                    q_idx,
+                    k_sample,
+                    w_idx,
+                    cfg.topk,
+                    ratio,
+                    pos_offset=fragment.q_begin,
+                ).to(torch.int32)
         else:
             with torch.no_grad():
                 scores = compute_index_scores(q_idx, w_idx, k_sample)
@@ -475,24 +478,25 @@ def _ratio4_indices_and_kl(
 
         if runtime_mgr.training and (torch.is_grad_enabled() or force_kl):
             if cfg.backend == "kernel":
-                from magi_attention.experimental.dsa_v4.kernels import (
+                from magi_attention.dsa.kernels import (
                     indexer_kl_loss_kernel,
                 )
 
-                kl_loss = kl_loss + indexer_kl_loss_kernel(
-                    local_ids,
-                    q_idx,
-                    w_idx,
-                    k_sample,
-                    dsa_input.q[local_begin:local_end].unsqueeze(1),
-                    comp_sample,
-                    cfg.softmax_scale,
-                    indexer.softmax_scale,
-                    cfg.indexer_loss_coeff,
-                    total_global=total_global,
-                )
+                with dsa_phase("indexer_score_recompute"):
+                    kl_loss = kl_loss + indexer_kl_loss_kernel(
+                        local_ids,
+                        q_idx,
+                        w_idx,
+                        k_sample,
+                        dsa_input.q[local_begin:local_end].unsqueeze(1),
+                        comp_sample,
+                        cfg.softmax_scale,
+                        indexer.softmax_scale,
+                        cfg.indexer_loss_coeff,
+                        total_global=total_global,
+                    )
             else:
-                from magi_attention.experimental.dsa_v4.reference import (
+                from magi_attention.dsa.reference import (
                     indexer_kl_loss_selected,
                 )
 
@@ -535,7 +539,7 @@ def _run_attention_forward_state(
             (0, cfg.num_heads), dtype=torch.float32, device=q.device
         )
     if cfg.backend == "kernel":
-        from magi_attention.experimental.dsa_v4.kernels import (
+        from magi_attention.dsa.kernels import (
             _ensure_flash_mla,
             _topk_alignment,
         )
@@ -657,7 +661,10 @@ def _dist_dsa_forward_state(
             and dispatch_plan.compress_ratio == 4
             and dispatch_plan.compressed_blocks
         ):
-            projections = _project_ratio4_queries(dsa_input, runtime_mgr, forward_plan)
+            with dsa_phase("overlap_compressed_cast_indexer"):
+                projections = _project_ratio4_queries(
+                    dsa_input, runtime_mgr, forward_plan
+                )
 
         remote_window = window_work.wait().tensor
         remote_compressed = compressed_work.wait().tensor
@@ -737,7 +744,7 @@ def _attention_backward(
     if q.size(0) == 0:
         return torch.zeros_like(q), torch.zeros_like(kv_full), torch.zeros_like(sink)
     if cfg.backend == "kernel":
-        from magi_attention.experimental.dsa_v4.kernels import (
+        from magi_attention.dsa.kernels import (
             _ensure_dsa,
             _topk_alignment,
         )
@@ -764,7 +771,7 @@ def _attention_backward(
         )
         return result["dq"], result["dkv"], result["d_sink"]
 
-    from magi_attention.experimental.dsa_v4.reference import sparse_attn_with_sink
+    from magi_attention.dsa.reference import sparse_attn_with_sink
 
     with torch.enable_grad():
         q_ref = q.detach().requires_grad_(True)
@@ -831,7 +838,7 @@ def _saved_topk_kl(
         k_sample = compressed_ki[sample_begin:sample_end].unsqueeze(1)
         comp_sample = compressed_kv[sample_begin:sample_end].detach().unsqueeze(1)
         if cfg.backend == "kernel":
-            from magi_attention.experimental.dsa_v4.kernels import (
+            from magi_attention.dsa.kernels import (
                 indexer_kl_loss_kernel,
             )
 
@@ -848,7 +855,7 @@ def _saved_topk_kl(
                 total_global=total_global,
             )
         else:
-            from magi_attention.experimental.dsa_v4.reference import (
+            from magi_attention.dsa.reference import (
                 indexer_kl_loss_selected,
             )
 
@@ -1080,31 +1087,32 @@ class _DistDsa(torch.autograd.Function):
                 compressed_ki_available,
                 forward_plan.compressed_global_map,
             )
-            with torch.enable_grad():
-                compressed_ki_global = (
-                    compressed_ki_global_data.detach().requires_grad_(True)
-                )
-                kl_recomputed = _saved_topk_kl(
-                    x,
-                    qr,
-                    q,
-                    compressed_global,
-                    compressed_ki_global,
-                    indexer_topk,
-                    runtime_mgr,
-                    forward_plan,
-                )
-                kl_upstream = (
-                    torch.zeros((), dtype=torch.float32, device=x.device)
-                    if d_kl is None
-                    else d_kl.float()
-                )
-                kl_grads = torch.autograd.grad(
-                    kl_recomputed,
-                    (compressed_ki_global, *parameters),
-                    kl_upstream,
-                    allow_unused=True,
-                )
+            with dsa_phase("indexer_backward"):
+                with torch.enable_grad():
+                    compressed_ki_global = (
+                        compressed_ki_global_data.detach().requires_grad_(True)
+                    )
+                    kl_recomputed = _saved_topk_kl(
+                        x,
+                        qr,
+                        q,
+                        compressed_global,
+                        compressed_ki_global,
+                        indexer_topk,
+                        runtime_mgr,
+                        forward_plan,
+                    )
+                    kl_upstream = (
+                        torch.zeros((), dtype=torch.float32, device=x.device)
+                        if d_kl is None
+                        else d_kl.float()
+                    )
+                    kl_grads = torch.autograd.grad(
+                        kl_recomputed,
+                        (compressed_ki_global, *parameters),
+                        kl_upstream,
+                        allow_unused=True,
+                    )
             d_compressed_ki_global = kl_grads[0].float()
             _add_parameter_gradients(parameter_grads, kl_grads[1:])
             d_compressed_ki_available = reduce_dsa_rows_csr(
@@ -1137,18 +1145,24 @@ class _DistDsa(torch.autograd.Function):
         kv_full = torch.cat([token_available, compressed_global], dim=0)
         if d_output is None:
             d_output = torch.zeros_like(output)
-        dq, dkv_full, d_sink_local = _attention_backward(
-            q,
-            kv_full,
-            sink,
-            output,
-            lse,
-            sparse_indices,
-            d_output,
-            runtime_mgr,
+        sparse_phase = (
+            "overlap_dki_reduce_sparse_backward"
+            if runtime_mgr.overlap_config.dki_reduce_sparse_backward
+            else "sparse_backward"
         )
-        if owner_d_compressed_ki is None:
-            owner_d_compressed_ki = dki_reduce_work.wait().tensor
+        with dsa_phase(sparse_phase):
+            dq, dkv_full, d_sink_local = _attention_backward(
+                q,
+                kv_full,
+                sink,
+                output,
+                lse,
+                sparse_indices,
+                d_output,
+                runtime_mgr,
+            )
+            if owner_d_compressed_ki is None:
+                owner_d_compressed_ki = dki_reduce_work.wait().tensor
         available_count = forward_plan.available_token_count
         d_token_available = dkv_full[:available_count].float()
         d_compressed_global = dkv_full[available_count:].float()
@@ -1295,11 +1309,11 @@ def _single_forward_state(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """CP=1 packed forward with the same minimal kernel backward ABI."""
 
-    from magi_attention.experimental.dsa_v4.indexer import (
+    from magi_attention.dsa.indexer import (
         build_block_causal_mask,
         compute_index_scores,
     )
-    from magi_attention.experimental.dsa_v4.reference import (
+    from magi_attention.dsa.reference import (
         get_compress_topk_idxs,
         get_window_topk_idxs,
         indexer_kl_loss,
@@ -1358,7 +1372,7 @@ def _single_forward_state(
                     qr_sample.detach(),
                 )
                 if cfg.backend == "kernel":
-                    from magi_attention.experimental.dsa_v4.kernels import (
+                    from magi_attention.dsa.kernels import (
                         indexer_kl_loss_kernel,
                         indexer_select_kernel,
                     )
@@ -1539,7 +1553,7 @@ class _SingleDsa(torch.autograd.Function):
             )
         if topk_length.shape != (x.size(0),):
             raise RuntimeError("saved topk_length must contain one count per query")
-        from magi_attention.experimental.dsa_v4.reference import (
+        from magi_attention.dsa.reference import (
             get_compress_topk_idxs,
             get_window_topk_idxs,
         )
@@ -1648,7 +1662,7 @@ class _SingleDsa(torch.autograd.Function):
                     compressed_ki = module.indexer.compressor(x_sample_data.detach())
                     local_ids_batched = local_ids.unsqueeze(0)
                     if cfg.backend == "kernel":
-                        from magi_attention.experimental.dsa_v4.kernels import (
+                        from magi_attention.dsa.kernels import (
                             indexer_kl_loss_kernel,
                         )
 
@@ -1665,11 +1679,11 @@ class _SingleDsa(torch.autograd.Function):
                             total_global=max(x.size(0), 1),
                         )
                     else:
-                        from magi_attention.experimental.dsa_v4.indexer import (
+                        from magi_attention.dsa.indexer import (
                             build_block_causal_mask,
                             compute_index_scores,
                         )
-                        from magi_attention.experimental.dsa_v4.reference import (
+                        from magi_attention.dsa.reference import (
                             indexer_kl_loss,
                         )
 

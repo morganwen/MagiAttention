@@ -18,6 +18,12 @@ from dataclasses import dataclass
 
 import torch
 
+from magi_attention.dsa.config import (
+    MagiDSAConfig,
+    MagiDSAV4Config,
+    MagiDSAV4YarnConfig,
+    MagiDSAYarnConfig,
+)
 from magi_attention.dsa_runtime_mgr import DsaOverlapConfig, MagiDSARuntimeMgr
 
 
@@ -113,7 +119,11 @@ def calc_dsa(
 __all__ = [
     "DsaOverlapConfig",
     "DsaPackedMeta",
+    "MagiDSAConfig",
     "MagiDSAInput",
     "MagiDSARuntimeMgr",
+    "MagiDSAYarnConfig",
+    "MagiDSAV4Config",
+    "MagiDSAV4YarnConfig",
     "calc_dsa",
 ]

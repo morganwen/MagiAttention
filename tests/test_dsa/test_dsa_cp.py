@@ -27,7 +27,9 @@ import magi_attention.functional.dsa_comm as dsa_comm
 from magi_attention.api import (
     DsaOverlapConfig,
     DsaPackedMeta,
+    MagiDSAConfig,
     MagiDSAInput,
+    MagiDSARuntimeMgr,
     calc_dsa,
 )
 from magi_attention.comm.primitive.grpcoll._config import GrpCollConfig
@@ -35,8 +37,6 @@ from magi_attention.comm.primitive.grpcoll._mgr import grpcoll_buffer_mgr
 from magi_attention.comm.primitive.grpcoll.utils import (
     sanity_check_for_group_cast_meta_args_per_rank,
 )
-from magi_attention.dsa_runtime_mgr import MagiDSARuntimeMgr
-from magi_attention.experimental.dsa_v4 import MagiDSAV4Config
 from magi_attention.functional.dsa_comm import (
     DsaPayloadKind,
     DsaTypedPayload,
@@ -557,8 +557,8 @@ class TestDsaCommTransport(DistTestBase):
             torch.testing.assert_close(owner_gradient, expected, rtol=0, atol=0)
 
     @staticmethod
-    def _forward_config(ratio: int, backend: str) -> MagiDSAV4Config:
-        return MagiDSAV4Config(
+    def _forward_config(ratio: int, backend: str) -> MagiDSAConfig:
+        return MagiDSAConfig(
             compress_ratio=ratio,
             hidden_size=64,
             q_lora_rank=64,
@@ -568,7 +568,7 @@ class TestDsaCommTransport(DistTestBase):
 
     @staticmethod
     def _global_forward_input(
-        config: MagiDSAV4Config,
+        config: MagiDSAConfig,
         *,
         lengths=(1024, 1024),
         seed=None,

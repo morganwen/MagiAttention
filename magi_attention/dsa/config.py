@@ -24,8 +24,8 @@ from typing import Literal, Optional
 VALID_COMPRESS_RATIOS = (0, 4, 128)
 
 
-@dataclass
-class MagiDSAV4YarnConfig:
+@dataclass(frozen=True)
+class MagiDSAYarnConfig:
     """YaRN rotary parameters for compressed-position RoPE.
 
     Matches the frozen V4-Flash recipe values; consumed by the compressor
@@ -41,8 +41,8 @@ class MagiDSAV4YarnConfig:
     mscale_all_dim: float = 1.0
 
 
-@dataclass
-class MagiDSAV4Config:
+@dataclass(frozen=True)
+class MagiDSAConfig:
     """Static configuration of one Magi_DSA V4 attention instance.
 
     One instance serves exactly one layer form, fixed by ``compress_ratio``:
@@ -78,14 +78,13 @@ class MagiDSAV4Config:
     calculate_per_token_loss: bool = False
 
     # Compressed-position rotary.
-    yarn: MagiDSAV4YarnConfig = field(default_factory=MagiDSAV4YarnConfig)
+    yarn: MagiDSAYarnConfig = field(default_factory=MagiDSAYarnConfig)
 
     # Backend selection: reference is the pure-PyTorch path.
     backend: Literal["reference", "kernel"] = "reference"
 
-    # Legacy experimental/cp.py prototype switch.  The public
-    # MagiDSARuntimeMgr uses DsaOverlapConfig's two independent step-7
-    # switches; this field is retained only while the prototype remains.
+    # Deprecated compatibility field. The public runtime uses
+    # DsaOverlapConfig's two independent overlap switches.
     overlap: bool = False
 
     # Numerics.
@@ -130,3 +129,17 @@ class MagiDSAV4Config:
     @property
     def nope_dim(self) -> int:
         return self.kv_dim - self.rope_dim
+
+
+# V4-spelled compatibility aliases remain available for callers that used the
+# prototype config names. New serialization records the stable public names.
+MagiDSAV4Config = MagiDSAConfig
+MagiDSAV4YarnConfig = MagiDSAYarnConfig
+
+__all__ = [
+    "VALID_COMPRESS_RATIOS",
+    "MagiDSAConfig",
+    "MagiDSAYarnConfig",
+    "MagiDSAV4Config",
+    "MagiDSAV4YarnConfig",
+]

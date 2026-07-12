@@ -22,13 +22,18 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from magi_attention.api import DsaPackedMeta, MagiDSAInput, calc_dsa
-from magi_attention.dsa_runtime_mgr import MagiDSARuntimeMgr
-from magi_attention.experimental.dsa_v4 import DSAv4Compressor, MagiDSAV4Config
+from magi_attention.api import (
+    DsaPackedMeta,
+    MagiDSAConfig,
+    MagiDSAInput,
+    MagiDSARuntimeMgr,
+    calc_dsa,
+)
+from magi_attention.dsa import DSAv4Compressor
 from magi_attention.testing.precision import assert_close as assert_precision_close
 
 
-def _make_config(ratio: int, backend: str = "reference", **kwargs) -> MagiDSAV4Config:
+def _make_config(ratio: int, backend: str = "reference", **kwargs) -> MagiDSAConfig:
     values = dict(
         compress_ratio=ratio,
         hidden_size=64,
@@ -37,11 +42,11 @@ def _make_config(ratio: int, backend: str = "reference", **kwargs) -> MagiDSAV4C
         backend=backend,
     )
     values.update(kwargs)
-    return MagiDSAV4Config(**values)
+    return MagiDSAConfig(**values)
 
 
 def _make_input(
-    cfg: MagiDSAV4Config,
+    cfg: MagiDSAConfig,
     lengths: list[int],
     *,
     requires_grad: bool = True,
@@ -254,6 +259,127 @@ class TestCompressor:
         assert not torch.equal(base[1], compressor(previous_block_changed)[1])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+class TestReferenceSemantics:
+    def test_index_helpers_follow_sample_relative_causality(self):
+        from magi_attention.dsa.indexer import build_block_causal_mask
+        from magi_attention.dsa.reference import (
+            get_compress_topk_idxs,
+            get_window_topk_idxs,
+        )
+
+        device = torch.device("cuda")
+        seqlen, window, ratio, block_offset = 32, 8, 4, 100
+
+        window_indices = get_window_topk_idxs(window, 1, seqlen, device)[0]
+        compressed_indices = get_compress_topk_idxs(
+            ratio, 1, seqlen, block_offset, device
+        )[0]
+        causal_mask = build_block_causal_mask(
+            seqlen, seqlen // ratio, ratio, 1, device
+        )[0]
+
+        for position in range(seqlen):
+            valid_window = window_indices[position][window_indices[position] >= 0]
+            assert valid_window.numel() == min(position + 1, window)
+            assert torch.all(valid_window <= position)
+
+            visible_blocks = (position + 1) // ratio
+            valid_compressed = compressed_indices[position][
+                compressed_indices[position] >= 0
+            ]
+            torch.testing.assert_close(
+                valid_compressed,
+                torch.arange(
+                    block_offset,
+                    block_offset + visible_blocks,
+                    device=device,
+                ),
+                rtol=0,
+                atol=0,
+            )
+            assert int((causal_mask[position] == 0).sum()) == visible_blocks
+
+    def test_negative_infinite_sink_matches_plain_softmax(self):
+        from magi_attention.dsa.reference import (
+            get_window_topk_idxs,
+            sparse_attn_with_sink,
+        )
+
+        torch.manual_seed(20260713)
+        seqlen, batch, heads, head_dim, window = 16, 1, 4, 32, 8
+        query = torch.randn(
+            seqlen,
+            batch,
+            heads,
+            head_dim,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        kv = torch.randn(
+            seqlen,
+            batch,
+            head_dim,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        indices = get_window_topk_idxs(window, batch, seqlen, query.device).to(
+            torch.int32
+        )
+        sink = torch.full((heads,), float("-inf"), device=query.device)
+
+        actual = sparse_attn_with_sink(query, kv, sink, indices, head_dim**-0.5).view(
+            seqlen, batch, heads, head_dim
+        )
+
+        scores = (
+            torch.einsum("sbnh,tbh->sbnt", query.float(), kv.float()) * head_dim**-0.5
+        )
+        mask = torch.full((seqlen, seqlen), float("-inf"), device=query.device)
+        for position in range(seqlen):
+            visible = indices[0, position]
+            visible = visible[visible >= 0].long()
+            mask[position, visible] = 0.0
+        probabilities = torch.softmax(scores + mask.view(seqlen, 1, 1, seqlen), dim=-1)
+        expected = torch.einsum("sbnt,tbh->sbnh", probabilities, kv.float()).to(
+            torch.bfloat16
+        )
+
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+    def test_ratio4_eval_returns_zero_kl(self):
+        torch.manual_seed(20260714)
+        runtime = MagiDSARuntimeMgr(_make_config(4)).cuda().eval()
+        dsa_input = _make_input(runtime.config, [5, 11], requires_grad=False)
+
+        with torch.no_grad():
+            output, kl_loss = calc_dsa(dsa_input, runtime)
+
+        assert output.shape == (16, 64, 512)
+        assert torch.isfinite(output.float()).all()
+        assert kl_loss.shape == torch.Size([])
+        assert kl_loss.dtype == torch.float32
+        assert kl_loss.item() == 0.0
+
+    def test_packed_samples_are_isolated(self):
+        torch.manual_seed(20260715)
+        runtime = MagiDSARuntimeMgr(_make_config(4)).cuda().eval()
+        original = _make_input(runtime.config, [8, 8], requires_grad=False)
+
+        perturbed_x = original.x.clone()
+        perturbed_x[:8] += 1
+        perturbed_kv = original.latent_kv.clone()
+        perturbed_kv[:8] += 1
+        perturbed = replace(original, x=perturbed_x, latent_kv=perturbed_kv)
+
+        with torch.no_grad():
+            baseline, _ = calc_dsa(original, runtime)
+            changed, _ = calc_dsa(perturbed, runtime)
+
+        assert not torch.equal(baseline[:8], changed[:8])
+        torch.testing.assert_close(baseline[8:], changed[8:], rtol=0, atol=0)
+
+
 def _run_public_legacy_parity(ratio: int, backend: str) -> None:
     torch.manual_seed(20260709 + ratio)
     cfg = _make_config(ratio, backend=backend)
@@ -329,7 +455,7 @@ def test_public_api_reference_matches_legacy_full_gradients(ratio):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="B300/CUDA required")
 def test_public_api_saved_state_keeps_indexer_topk_not_sparse_indices():
     import magi_attention.functional.dist_dsa as dist_dsa_module
-    from magi_attention.experimental.dsa_v4.reference import get_window_topk_idxs
+    from magi_attention.dsa.reference import get_window_topk_idxs
 
     torch.manual_seed(20260710)
     cfg = _make_config(4, backend="reference")
@@ -361,7 +487,7 @@ def test_public_api_saved_state_keeps_indexer_topk_not_sparse_indices():
 
     with (
         patch(
-            "magi_attention.experimental.dsa_v4.indexer.compute_index_scores",
+            "magi_attention.dsa.indexer.compute_index_scores",
             side_effect=deterministic_scores,
         ),
         patch.object(
@@ -490,7 +616,7 @@ def test_public_api_kernel_matches_legacy_full_gradients(ratio):
     reason="frozen cudnn-frontend DSA package required",
 )
 def test_kernel_indexer_topk_canonicalizes_equal_score_boundary():
-    from magi_attention.experimental.dsa_v4.kernels import indexer_select_kernel
+    from magi_attention.dsa.kernels import indexer_select_kernel
 
     sq, sk, heads, dim, topk = 128, 32, 64, 128, 8
     q_idx = torch.zeros(sq, 1, heads, dim, dtype=torch.bfloat16, device="cuda")

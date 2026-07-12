@@ -259,6 +259,71 @@ def sparse_attn_with_sink_kernel(
     return out.reshape(sq, 1, -1)
 
 
+def _indexer_kl_value_only(
+    q_idx: torch.Tensor,
+    w_idx: torch.Tensor,
+    k_global: torch.Tensor,
+    query_det: torch.Tensor,
+    comp_det: torch.Tensor,
+    topk_indices: torch.Tensor,
+    softmax_scale: float,
+    indexer_scale: float,
+    loss_coeff: float,
+    total_global: int,
+) -> torch.Tensor:
+    """Compute the selected-column KL value without launching its backward.
+
+    The public runtime has its own recompute autograd boundary. Its forward is
+    executed under ``no_grad`` and may retain only the frozen minimal state,
+    so precomputing cuDNN Indexer gradients here would be discarded. The
+    explicit runtime backward invokes :class:`_KernelIndexerKL` once and owns
+    the single real ``indexer_backward`` launch.
+    """
+
+    dsa = _ensure_dsa()
+    sq = q_idx.size(0)
+    with torch.no_grad():
+        idxs = topk_indices.to(torch.int32)
+        k_in = idxs.size(-1)
+        k_pad = max(128, (k_in + 127) // 128 * 128)
+        if k_pad != k_in:
+            idxs = torch.nn.functional.pad(idxs, (0, k_pad - k_in), value=-1)
+        idxs = idxs.contiguous()
+        valid = idxs >= 0
+        safe = idxs.clamp(min=0).long()
+
+        w_scaled = (w_idx.float() * indexer_scale).to(w_idx.dtype)
+        predict = dsa.sparse_indexer_score_recompute_wrapper(
+            q_idx.permute(1, 0, 2, 3).contiguous(),
+            k_global.permute(1, 0, 2).contiguous(),
+            w_scaled.permute(1, 0, 2).contiguous(),
+            idxs,
+            qhead_per_kv_head=q_idx.size(2),
+            topk_indices_global=True,
+        )["predict"].view(1, sq, idxs.size(-1))
+
+        ckv_sel = comp_det.permute(1, 0, 2)[
+            torch.zeros(1, 1, 1, dtype=torch.long, device=idxs.device), safe
+        ]
+        q_f = query_det.permute(1, 0, 2, 3).float()
+        target_logits = (
+            torch.einsum("bqnh,bqkh->bqnk", q_f, ckv_sel.float()) * softmax_scale
+        )
+        row_has = valid.any(dim=-1, keepdim=True)
+        target_logits = target_logits.masked_fill(~valid.unsqueeze(2), float("-inf"))
+        target_logits = target_logits.masked_fill(~row_has.unsqueeze(2), 0.0)
+        target = (
+            torch.softmax(target_logits, dim=-1, dtype=torch.float32)
+            * row_has.unsqueeze(2).float()
+        ).sum(dim=2)
+        target = target / target.sum(dim=-1, keepdim=True).clamp(min=1e-10)
+
+        pred_f = predict.float().clamp(min=0)
+        kl = target * (torch.log(target + 1e-10) - torch.log(pred_f + 1e-10))
+        kl = torch.where(valid, kl, torch.zeros_like(kl))
+        return kl.sum() * (loss_coeff / total_global)
+
+
 class _KernelIndexerKL(torch.autograd.Function):
     """Selected-columns indexer KL with a fully analytic kernel backward.
 
@@ -381,6 +446,21 @@ def indexer_kl_loss_kernel(
     global token count; pass local rows for the single-device token-mean).
     """
     assert q_idx.size(1) == 1, "kernel KL path requires batch 1"
+    if not torch.is_grad_enabled() or not any(
+        tensor.requires_grad for tensor in (q_idx, w_idx, k_idx)
+    ):
+        return _indexer_kl_value_only(
+            q_idx,
+            w_idx,
+            k_idx,
+            query.detach(),
+            compressed_kv.detach(),
+            topk_indices,
+            softmax_scale,
+            indexer_scale,
+            loss_coeff,
+            total_global,
+        )
     return _KernelIndexerKL.apply(
         q_idx,
         w_idx,

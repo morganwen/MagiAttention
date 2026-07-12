@@ -101,7 +101,9 @@ def build_standard_freqs(
     return torch.outer(positions, inv_freq)
 
 
-def apply_rope_last_dims(x: torch.Tensor, freqs: torch.Tensor, rope_dim: int) -> torch.Tensor:
+def apply_rope_last_dims(
+    x: torch.Tensor, freqs: torch.Tensor, rope_dim: int
+) -> torch.Tensor:
     """Rotate the last ``rope_dim`` dims of ``x`` by ``freqs``; keep the rest.
 
     MLA interleaved convention, matching Megatron's ``_apply_unfused_rope``

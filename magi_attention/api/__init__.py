@@ -38,8 +38,12 @@ from magi_attention.meta.solver.dispatch_solver import ToppHeapDispatchAlg
 from .dsa_attn_interface import (
     DsaOverlapConfig,
     DsaPackedMeta,
+    MagiDSAConfig,
     MagiDSAInput,
     MagiDSARuntimeMgr,
+    MagiDSAYarnConfig,
+    MagiDSAV4Config,
+    MagiDSAV4YarnConfig,
     calc_dsa,
 )
 from .functools import (
@@ -103,6 +107,10 @@ __all__ = [
     "DsaPackedMeta",
     "DsaOverlapConfig",
     "MagiDSAInput",
+    "MagiDSAConfig",
+    "MagiDSAYarnConfig",
+    "MagiDSAV4Config",
+    "MagiDSAV4YarnConfig",
     # ---- config classes ----
     "DistAttnConfig",
     "DispatchConfig",

@@ -48,7 +48,9 @@ from .reference import (
 class MagiDSAV4(nn.Module):
     """DeepSeek V4 hybrid sparse attention, reference backend."""
 
-    def __init__(self, config: MagiDSAV4Config, dtype: torch.dtype = torch.bfloat16) -> None:
+    def __init__(
+        self, config: MagiDSAV4Config, dtype: torch.dtype = torch.bfloat16
+    ) -> None:
         super().__init__()
         self.config = config
 

@@ -12,26 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Magi_DSA V4: DeepSeek V4 hybrid sparse attention runtime.
+"""Stable implementation package for DeepSeek V4 hybrid sparse attention.
 
-API v1 frozen 2026-07-09 after full-layer drop-in parity inside Megatron's
-DSv4HybridSelfAttention (all three layer forms, outputs and every shared
-parameter gradient matching). Inputs: hidden x, query latent qr, RoPE-applied
-main query and latent KV, learnable sink; indexer projections and compressed
-entries are runtime-internal.
+Application code should use :mod:`magi_attention.api`; this package contains
+the reusable implementation behind that public surface.
 """
 
 __api_version__ = "1.0.0"
 
 from .attention import MagiDSAV4
 from .compressor import DSAv4Compressor
-from .config import MagiDSAV4Config, MagiDSAV4YarnConfig
+from .config import (
+    MagiDSAConfig,
+    MagiDSAV4Config,
+    MagiDSAV4YarnConfig,
+    MagiDSAYarnConfig,
+)
 from .indexer import DSAv4Indexer
+from .telemetry import DsaTelemetry
 
 __all__ = [
     "MagiDSAV4",
+    "MagiDSAConfig",
+    "MagiDSAYarnConfig",
     "MagiDSAV4Config",
     "MagiDSAV4YarnConfig",
     "DSAv4Compressor",
     "DSAv4Indexer",
+    "DsaTelemetry",
 ]

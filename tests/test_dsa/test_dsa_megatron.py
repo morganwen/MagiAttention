@@ -24,11 +24,11 @@ from pathlib import Path
 import pytest
 import torch
 
-from magi_attention.experimental.dsa_v4 import (
-    DSAv4Compressor,
-    MagiDSAV4Config,
-    MagiDSAV4YarnConfig,
+from magi_attention.api import (
+    MagiDSAConfig,
+    MagiDSAYarnConfig,
 )
+from magi_attention.dsa import DSAv4Compressor
 
 _MEGATRON_REVISION = "c6449f0b23be397449f21c0967c5fc90785e55ea"
 _DEFAULT_MEGATRON_PATHS = (
@@ -187,7 +187,7 @@ def _make_megatron_config(megatron):
 
 
 def _make_magi_config():
-    return MagiDSAV4Config(
+    return MagiDSAConfig(
         compress_ratio=4,
         hidden_size=256,
         q_lora_rank=64,
@@ -200,7 +200,7 @@ def _make_magi_config():
         indexer_heads=8,
         indexer_dim=64,
         norm_eps=1e-5,
-        yarn=MagiDSAV4YarnConfig(rotary_base=10000.0, scaling_factor=1.0),
+        yarn=MagiDSAYarnConfig(rotary_base=10000.0, scaling_factor=1.0),
     )
 
 
