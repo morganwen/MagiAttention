@@ -467,6 +467,25 @@ def run_preflight(
     build_manifest = load_json(manifest_path)
     if build_manifest.get("schema_version") != 1:
         raise MatrixError(f"invalid build manifest schema in {manifest_path}")
+    runtime_version = getattr(package, "__version__", None)
+    wheel_version = _distribution_version("magi_attention")
+    manifest_version = build_manifest.get("magi_attention_package_version")
+    version_evidence = {
+        "runtime": runtime_version,
+        "wheel": wheel_version,
+        "manifest_package": manifest_version,
+        "manifest_runtime": build_manifest.get("magi_attention_runtime_version"),
+        "manifest_wheel": build_manifest.get("magi_attention_wheel_version"),
+    }
+    if not isinstance(manifest_version, str) or not manifest_version:
+        raise MatrixError("build manifest has no MagiAttention package version")
+    if set(version_evidence.values()) != {manifest_version}:
+        raise MatrixError(
+            f"MagiAttention package version evidence disagrees: {version_evidence}"
+        )
+    evidence["installed_package"].update(
+        {"wheel_version": wheel_version, "manifest_version": manifest_version}
+    )
     revision = build_manifest.get("magi_attention_revision")
     if not isinstance(revision, str) or not GIT_SHA_RE.fullmatch(revision):
         raise MatrixError("build manifest has no full MagiAttention revision")

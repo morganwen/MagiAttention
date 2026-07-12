@@ -71,7 +71,7 @@
       "cwd": "/tmp",
       "timeout_seconds": 1800,
       "junit": true,
-      "min_tests": 80,
+      "min_tests": 90,
       "expected_exit_codes": [0],
       "env": {
         "CUDA_VISIBLE_DEVICES": "0",
