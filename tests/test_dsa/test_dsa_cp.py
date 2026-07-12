@@ -15,6 +15,8 @@
 """CP=8 transport, numerical, overlap and concurrency tests for Magi_DSA."""
 
 import inspect
+import os
+from contextlib import contextmanager
 from unittest.mock import patch
 
 import pytest
@@ -423,6 +425,10 @@ class TestDsaCommTransport(DistTestBase):
         # cuDNN's first sparse-backward call also compiles CUTLASS DSL kernels
         # independently on every device, so cold kernel tests need a wider bound.
         name = self._testMethodName
+        if self._force_native_matrix() and (
+            "full_" in name or "overlap_matrix" in name
+        ):
+            return 1800
         if "full_kernel_backward" in name:
             return 1200
         if any(
@@ -446,6 +452,26 @@ class TestDsaCommTransport(DistTestBase):
     @property
     def process_group(self):
         return dist.distributed_c10d._get_default_group()
+
+    @staticmethod
+    def _force_native_matrix() -> bool:
+        return os.environ.get("MAGI_DSA_RUN_FINAL_NATIVE_MATRIX") == "1"
+
+    @contextmanager
+    def _full_path_transport(self):
+        """Run ordinary full-path tests on A2AV or the final native backend."""
+
+        use_native = self._force_native_matrix()
+        if use_native:
+            self._initialize_native_grpcoll_or_skip()
+        try:
+            with switch_envvar_context(
+                "MAGI_ATTENTION_NATIVE_GRPCOLL", enable=use_native
+            ):
+                yield
+        finally:
+            if use_native:
+                grpcoll_buffer_mgr.release_group(self.process_group)
 
     @staticmethod
     def _width(kind: DsaPayloadKind) -> int:
@@ -789,6 +815,7 @@ class TestDsaCommTransport(DistTestBase):
         *,
         ratio: int,
         backend: str,
+        policy: str = "balanced",
         overlap_config: DsaOverlapConfig | None = None,
         lengths=(1024, 1024),
     ):
@@ -798,7 +825,7 @@ class TestDsaCommTransport(DistTestBase):
         runtime = MagiDSARuntimeMgr(
             config,
             cp_group=self.process_group,
-            dispatch_policy="balanced",
+            dispatch_policy=policy,
             overlap_config=overlap_config,
         ).cuda()
         torch.manual_seed(1403 + ratio)
@@ -1011,7 +1038,7 @@ class TestDsaCommTransport(DistTestBase):
     def test_cp8_ratio4_reference_overlap_matrix_matches_cp1(self):
         import magi_attention.functional.dist_dsa as dist_dsa
 
-        with switch_envvar_context("MAGI_ATTENTION_NATIVE_GRPCOLL", enable=False):
+        with self._full_path_transport():
             for compressed_cast_indexer in (False, True):
                 for dki_reduce_sparse_backward in (False, True):
                     events = []
@@ -1092,7 +1119,7 @@ class TestDsaCommTransport(DistTestBase):
     def test_cp8_coordinated_forward_exception_drains_real_collectives(self):
         import magi_attention.functional.dist_dsa as dist_dsa
 
-        with switch_envvar_context("MAGI_ATTENTION_NATIVE_GRPCOLL", enable=False):
+        with self._full_path_transport():
             torch.cuda.set_device(self.rank % torch.cuda.device_count())
             config = self._forward_config(4, "reference")
             torch.manual_seed(1700)
@@ -1352,7 +1379,7 @@ class TestDsaCommTransport(DistTestBase):
     @skip_if_lt_x_gpu(8)
     @with_comms
     def test_cp8_retain_graph_backward_is_repeatable(self):
-        with switch_envvar_context("MAGI_ATTENTION_NATIVE_GRPCOLL", enable=False):
+        with self._full_path_transport():
             torch.cuda.set_device(self.rank % torch.cuda.device_count())
             config = self._forward_config(4, "reference")
             torch.manual_seed(1702)
@@ -1417,7 +1444,7 @@ class TestDsaCommTransport(DistTestBase):
     @skip_if_lt_x_gpu(8)
     @with_comms
     def test_cp8_full_reference_empty_rank_matches_cp1(self):
-        with switch_envvar_context("MAGI_ATTENTION_NATIVE_GRPCOLL", enable=False):
+        with self._full_path_transport():
             torch.cuda.set_device(self.rank % torch.cuda.device_count())
             config = self._forward_config(4, "reference")
             torch.manual_seed(1703)
@@ -1496,7 +1523,7 @@ class TestDsaCommTransport(DistTestBase):
     @skip_if_lt_x_gpu(8)
     @with_comms
     def test_cp8_short_sample_without_blocks_has_zero_differentiable_kl(self):
-        with switch_envvar_context("MAGI_ATTENTION_NATIVE_GRPCOLL", enable=False):
+        with self._full_path_transport():
             self._run_full_backward(
                 ratio=4,
                 backend="reference",
@@ -1506,7 +1533,7 @@ class TestDsaCommTransport(DistTestBase):
     @skip_if_lt_x_gpu(8)
     @with_comms
     def test_cp8_full_reference_forward_matches_cp1(self):
-        with switch_envvar_context("MAGI_ATTENTION_NATIVE_GRPCOLL", enable=False):
+        with self._full_path_transport():
             for policy in ("sequential", "balanced"):
                 for ratio in (0, 4, 128):
                     self._run_full_forward(
@@ -1520,7 +1547,7 @@ class TestDsaCommTransport(DistTestBase):
     def test_cp8_full_kernel_forward_matches_cp1(self):
         if not self._kernel_dependencies_available():
             self.skipTest("FlashMLA and cudnn-frontend DSA packages are required")
-        with switch_envvar_context("MAGI_ATTENTION_NATIVE_GRPCOLL", enable=False):
+        with self._full_path_transport():
             for ratio in (0, 4, 128):
                 self._run_full_forward(
                     ratio=ratio,
@@ -1531,18 +1558,34 @@ class TestDsaCommTransport(DistTestBase):
     @skip_if_lt_x_gpu(8)
     @with_comms
     def test_cp8_full_reference_backward_matches_cp1(self):
-        with switch_envvar_context("MAGI_ATTENTION_NATIVE_GRPCOLL", enable=False):
-            for ratio in (0, 4, 128):
-                self._run_full_backward(ratio=ratio, backend="reference")
+        with self._full_path_transport():
+            policies = (
+                ("sequential", "balanced")
+                if self._force_native_matrix()
+                else ("balanced",)
+            )
+            for policy in policies:
+                for ratio in (0, 4, 128):
+                    self._run_full_backward(
+                        ratio=ratio, backend="reference", policy=policy
+                    )
 
     @skip_if_lt_x_gpu(8)
     @with_comms
     def test_cp8_full_kernel_backward_matches_cp1(self):
         if not self._kernel_dependencies_available():
             self.skipTest("FlashMLA and cudnn-frontend DSA packages are required")
-        with switch_envvar_context("MAGI_ATTENTION_NATIVE_GRPCOLL", enable=False):
-            for ratio in (0, 4, 128):
-                self._run_full_backward(ratio=ratio, backend="kernel")
+        with self._full_path_transport():
+            policies = (
+                ("sequential", "balanced")
+                if self._force_native_matrix()
+                else ("balanced",)
+            )
+            for policy in policies:
+                for ratio in (0, 4, 128):
+                    self._run_full_backward(
+                        ratio=ratio, backend="kernel", policy=policy
+                    )
 
 
 if __name__ == "__main__":
