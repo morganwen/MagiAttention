@@ -24,6 +24,7 @@ computed in FP32; top-k is taken over the compressed-KV axis under the
 block-level causal mask (position p sees ``(p + 1) // ratio`` blocks).
 """
 
+from threading import RLock
 from typing import Optional, Tuple
 
 import torch
@@ -82,16 +83,26 @@ class DSAv4Indexer(nn.Module):
             config, head_dim=self.head_dim, rotate=True, dtype=dtype
         )
 
-        self._freqs_cache: Optional[torch.Tensor] = None
-        self._freqs_cache_len: int = 0
+        self._freqs_cache: dict[tuple[str, int | None], tuple[int, torch.Tensor]] = {}
+        self._freqs_cache_lock = RLock()
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state.pop("_freqs_cache_lock", None)
+        return state
+
+    def __setstate__(self, state) -> None:
+        self.__dict__.update(state)
+        self._freqs_cache_lock = RLock()
 
     def _q_freqs(self, sq: int, device: torch.device) -> torch.Tensor:
-        if self._freqs_cache is None or self._freqs_cache_len < sq:
-            self._freqs_cache = build_yarn_freqs(
-                self.rope_dim, sq, self.config.yarn, device
-            )
-            self._freqs_cache_len = sq
-        return self._freqs_cache[:sq]
+        key = (device.type, device.index)
+        with self._freqs_cache_lock:
+            cached_len, cached = self._freqs_cache.get(key, (0, None))
+            if cached is None or cached_len < sq:
+                cached = build_yarn_freqs(self.rope_dim, sq, self.config.yarn, device)
+                self._freqs_cache[key] = (sq, cached)
+        return cached[:sq]
 
     def forward_before_topk(
         self,
@@ -139,4 +150,17 @@ class DSAv4Indexer(nn.Module):
     ) -> torch.Tensor:
         """Top-k block ids [b, sq, k] from masked FP32 scores [b, sq, n_compressed]."""
         effective_topk = min(self.topk, n_compressed)
-        return index_scores.topk(effective_topk, dim=-1)[1]
+        # Stable descending sort implements the frozen tie-break: input columns
+        # are ascending block ids, so equal scores retain the smaller id first.
+        selected = torch.argsort(index_scores, dim=-1, descending=True, stable=True)[
+            ..., :effective_topk
+        ]
+        selected_scores = torch.gather(index_scores, -1, selected)
+        selected = torch.where(
+            torch.isfinite(selected_scores), selected, torch.full_like(selected, -1)
+        ).to(torch.int32)
+        if effective_topk < self.topk:
+            selected = torch.nn.functional.pad(
+                selected, (0, self.topk - effective_topk), value=-1
+            )
+        return selected

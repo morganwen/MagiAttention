@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SM90/SM10x correctness and watchdog tests for DSA packing kernels."""
+"""Architecture-aware DSA packing tests; current acceptance runs on SM103."""
 
 from __future__ import annotations
 

@@ -25,6 +25,7 @@ Arbitrary-length rule: only ``seqlen // ratio`` full blocks are pooled;
 trailing tokens have no compressed entry and rely on the sliding window.
 """
 
+from threading import RLock
 from typing import Optional
 
 import torch
@@ -90,15 +91,28 @@ class DSAv4Compressor(nn.Module):
         self.rotate = rotate
 
         proj_out = self.coff * head_dim
-        self.linear_wkv = nn.Linear(config.hidden_size, proj_out, bias=False, dtype=dtype)
-        self.linear_wgate = nn.Linear(config.hidden_size, proj_out, bias=False, dtype=dtype)
+        self.linear_wkv = nn.Linear(
+            config.hidden_size, proj_out, bias=False, dtype=dtype
+        )
+        self.linear_wgate = nn.Linear(
+            config.hidden_size, proj_out, bias=False, dtype=dtype
+        )
         # Intra-block position embedding, kept in FP32 like the reference.
         self.ape = nn.Parameter(torch.empty(self.ratio, proj_out, dtype=torch.float32))
         nn.init.normal_(self.ape, mean=0.0, std=0.02)
         self.norm = DSAv4RMSNorm(head_dim, eps=config.norm_eps)
 
-        self._freqs_cache: Optional[torch.Tensor] = None
-        self._freqs_cache_len: int = 0
+        self._freqs_cache: dict[tuple[str, int | None], tuple[int, torch.Tensor]] = {}
+        self._freqs_cache_lock = RLock()
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state.pop("_freqs_cache_lock", None)
+        return state
+
+    def __setstate__(self, state) -> None:
+        self.__dict__.update(state)
+        self._freqs_cache_lock = RLock()
 
     def _compressed_freqs(
         self, n_compressed: int, device: torch.device, block_offset: int = 0
@@ -109,17 +123,22 @@ class DSAv4Compressor(nn.Module):
         context parallelism (0 in the single-rank case).
         """
         total = (block_offset + n_compressed) * self.ratio
-        if self._freqs_cache is None or self._freqs_cache_len < total:
-            self._freqs_cache = build_yarn_freqs(
-                self.rope_dim, total, self.config.yarn, device
-            )
-            self._freqs_cache_len = total
+        key = (device.type, device.index)
+        with self._freqs_cache_lock:
+            cached_len, cached = self._freqs_cache.get(key, (0, None))
+            if cached is None or cached_len < total:
+                cached = build_yarn_freqs(
+                    self.rope_dim, total, self.config.yarn, device
+                )
+                self._freqs_cache[key] = (total, cached)
         strided = strided_freqs_for_compressed(
-            self._freqs_cache, block_offset + n_compressed, self.ratio
+            cached, block_offset + n_compressed, self.ratio
         )
         return strided[block_offset:]
 
-    def _overlap_transform(self, tensor: torch.Tensor, fill_value: float) -> torch.Tensor:
+    def _overlap_transform(
+        self, tensor: torch.Tensor, fill_value: float
+    ) -> torch.Tensor:
         """[n, ratio, b, coff*d] -> [n, 2*ratio, b, d]; block i's first slots
         take block i-1's give-away halves, block 0 keeps ``fill_value``."""
         n_groups, ratio, b_dim, _ = tensor.size()

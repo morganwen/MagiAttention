@@ -1,6 +1,6 @@
 # Magi_DSA V4 设计文档
 
-本文与仓库根目录 `PLAN.md` 共同冻结 Magi_DSA V4 的实现口径；发生冲突时以 `PLAN.md` 的“冻结合同”为准。当前验收平台仅为 SM90/H100 80GB：CP=1 使用 1 卡，CP=2 使用同机 2 卡。
+本文与仓库根目录 `PLAN.md` 共同冻结 Magi_DSA V4 的实现口径；发生冲突时以 `PLAN.md` 的“冻结合同”为准。步骤 1–7 已在 8× NVIDIA B300 SXM6 AC 节点（SM103）上的单个 `world_size=cp=8` 进程组完成复验，固定使用 GPU 0–7。CP=1 只作为同权重、同全局输入的数值/梯度 oracle，不是分布式出口；CP=2 只保留兼容回归，也不能替代 CP=8 出口。此前把 8 卡拆成四个 CP=2 pair 的结果已废弃。
 
 ## 可复现基线
 
@@ -12,9 +12,9 @@
 - NVIDIA cudnn-frontend：`f00538322e9d3d439fe8c5f3144644e58ee66823`（安装包 `nvidia-cudnn-frontend==1.27.0`）。
 - fast-hadamard-transform：`e7706faf8d1c3b9f241e36860640ad1dac644ede`。
 - CUTLASS 子仓：`81a43e6d92cdd8c20d22392f9579604ed5f710a1`；FA4 子仓：`ee1d15159cda6f3f97bfab9e487da146a8254970`；`nvidia-cutlass-dsl==4.5.2`。
-- 开发镜像：`magi-dsa-dev:v2`，本机 image id `sha256:9c51e29d1fda8fc1a6e2a8e16c7b0773309e91dcbd44cf6d0182e5e3327c1029`；其 v1 基础层为 `sha256:000b7bb606e306ca31050615e2896a5becc1eda2ede3e8c4ab4f76113969479d`。NGC PyTorch 26.05 固定为 registry digest `sha256:222d8b18e671be5c3ef91cb41727a2572a0b23f59ded6c39f373a96946f6f2ba`（build `313520559`，build ref `30a5fc6cbfce157e75fae3d0cf1fd8e273a3dc25`）。
-
-`agents/docker/magi-dsa-dev/Dockerfile` 和 `magi-dsa-flashmla/Dockerfile` 分别固定 cudnn-frontend、fast-hadamard-transform 和 FlashMLA commit。镜像 tag 只作为易读别名，测试报告同时记录 image id。
+- B300 镜像的权威构建源是主 checkout 中的 `/home/scratch.wewen_gpu/MagiAttention/agents/docker/magi-dsa-b300-step5/Dockerfile`（目录名保留了历史步骤号）。它直接固定 `nvcr.io/nvidia/pytorch:26.06-py3@sha256:43c018d6a12963f1a1bad85ef8574b5c2a978eec2be0ebcacfb87f69e0d210e1`（NGC build `337426143`，build ref `d557151f4c7ddca284cb5e8d5ce78cee4d80f7e5`）。
+- 该配方把 fast-hadamard-transform 构建到 compute capability 10.3，并使用 `FLASH_MLA_DISABLE_SM90=1` 只构建 FlashMLA SM100-family 对象；B300 上由 SM103 路径运行。本轮步骤 1–7 测试 tag 为 `magi-dsa-b300-step7:dev`，image id 为 `sha256:b4aca4fdd2ad71ba398ea9ef9a93e9530c8df9c17bfe021ec9b725a362ee49da`；tag 可变，报告以 image id 为准。
+- 上述基础配方固定 FlashMLA、cudnn-frontend、fast-hadamard-transform 和 CUTLASS DSL revision，但仍不等于步骤 8/9 的最终 clean、不可变 native 镜像。本轮容器安装 `nvidia-nvshmem-cu13==3.6.5`，并挂载当前源码与扩展：`magi_attn_ext` SHA256 为 `0427073e7a0f16450bade229528638bfd1c9f610bf31d00f04d7f7899ffa0eaf`，`magi_attn_comm` SHA256 为 `ca98aa8439007b647c52b8aa4e18b6b0beb631593846445bd877528346c87030`。CP8 native 用例已断言实际 handle 为 `GrpCollIntraHandle`，不是 A2AV fallback。每个 `(group, buffer_name)` 固定 `GrpCollConfig.num_nvl_bytes=1073741824`（1 GiB）；四个 typed payload buffer 加一个 replicated-gradient buffer含 workspace 后，每 GPU 静态下限为 `5,536,482,080` B（约 5.15625 GiB），native full backward 已实际通过。单节点全 NVLink 且 `num_rdma_bytes=0` 时 `NVSHMEM_SYMMETRIC_SIZE` 保持 unset，报告为 N/A；步骤 8 仍须在最终 packs 上独立 dry-allocation。
 
 ## 数值与模块边界
 
@@ -43,7 +43,7 @@ magi_attention/functional/dist_dsa.py
 - `MagiDSAInput` 具名保存 `x`、`qr`、`q`、`latent_kv`、FP32 `sink` 和 `packed_meta`。
 - 行张量均为 packed THD：`x [T,hidden_size]`、`qr [T,q_lora_rank]`、`q [T,64,512]`、`latent_kv [T,512]`、`sink [64]`。
 - `calc_dsa(input, runtime_mgr)` 返回 `O [T,64,512]` 与可微 FP32 标量 `kl_loss`。
-- 一个 `MagiDSARuntimeMgr` 只服务其 config 固定的一种 ratio，并持有 compressor/Indexer 参数。CP=1 计算路径继续复用 `MagiDSAV4.forward_packed`；步骤 2 按 packed layout/policy 缓存真实 fragment plan。步骤 3 已提供独立的 CP=2 transport 层；`calc_dsa` 的完整 CP=2 attention 编排仍在步骤 5/6 接入。
+- 一个 `MagiDSARuntimeMgr` 只服务其 config 固定的一种 ratio，并持有 compressor/Indexer 参数。CP=1 计算路径继续复用 `MagiDSAV4.forward_packed`，仅作为 oracle；步骤 2 按 packed layout/policy 缓存 fragment plan，步骤 3/4 为分布式 CP 提供 transport 和 device packing，步骤 5/6 把完整分布式 forward/backward 接入 `calc_dsa`，步骤 7 在同一 runtime 中加入可独立开关的 overlap 与 per-call 并发状态。当前验收必须在一个 CP=8 进程组上覆盖这些路径。
 - ratio=0 不构建 compressor/Indexer；ratio=128 只构建 compressor；ratio=4 同时构建 compressor 和 Indexer。
 
 V1 固定配置为：Hq=64、Hkv=1、D=512、rope dim=64、window=128、Hidx=64、Didx=128、topk=512，主路径 BF16，sink FP32。`hidden_size`、`q_lora_rank` 和 `softmax_scale` 由模型配置提供。
@@ -54,7 +54,7 @@ V1 固定配置为：Hq=64、Hkv=1、D=512、rope dim=64、window=128、Hidx=64�
 - sparse backward/d_sink、Indexer forward/top-k、score recompute 和 Indexer backward 复用 cudnn-frontend `cudnn.deepseek_sparse_attention`。
 - 统一 wrapper 位于 `experimental/dsa_v4/kernels.py`；步骤 1 只接线，不重写、不 fork 外部 kernel。
 - reference backend 只用于数值对拍；正式 kernel backend 的输入为 CUDA BF16，top-k 保持 device resident。
-- 唯一计划内新增的计算辅助 kernel 是 `kernel/cutedsl/dsa_pack.py`，用于 packing、remap 与 FP32 CSR reduction。步骤 4 只在 SM90/H100 验收，但 public frontend、device mapping schema 和带 arch 的编译 cache key 不绑定 SM90；kernel 只使用 SM90/SM100 共有的通用 global copy、寄存器 FP32 累加和 128-bit vector copy。
+- 唯一计划内新增的计算辅助 kernel 是 `kernel/cutedsl/dsa_pack.py`，用于 packing、remap 与 FP32 CSR reduction。public frontend 和 device mapping schema 不绑定具体 minor arch，编译 cache key 包含设备的 `(major, minor)`、dtype、feature width 和 operation；因此 B300 使用独立 SM103 cache entry。kernel 仅使用 SM100-family 可用的通用 global copy、寄存器 FP32 累加和 128-bit vector copy。
 
 ## CP plan 与通信
 
@@ -95,10 +95,13 @@ device。CSR kernel 支持重复 source、空 destination row、极端 fan-in，
 非空 row或累加到已有 FP32 accumulator两种模式，为步骤 5/6 的 KV bank
 packing 和多路径梯度合并提供固定接口。
 
-native grpcoll 的 BF16 transport row 要求 256-element 对齐；compressed Ki 的
-逻辑宽度固定为 128，因此仅在 native send/receive buffer 内部右侧补零到 256，
-接收后立即裁回 128。A2AV、logical row id 和对外 tensor schema 均不改变；反向
-FP32 的 128-element row 已满足该 dtype 的 native 对齐要求。
+native grpcoll 的每一条 transport row 都按 dtype 查询对齐要求，并只在内部
+send/receive/reduce buffer 右侧补零：例如 BF16 compressed Ki 从逻辑宽度 128
+补到 256，FP32 hidden=64 的 GroupReduce 从 64 补到 128；wait 后统一裁回并恢复
+原 logical row shape。A2AV、logical row id 和对外 tensor schema 均不改变。
+replicated 参数或 sink 梯度若展平为超宽 FP32 row，会按不超过 4096 elements 的
+对齐 row 分块再做 GroupReduce，避免 native scratch 随单 row 宽度膨胀；归约后按
+原 numel/shape 裁回。
 
 `DsaCommBufferSlot`、`DsaGroupCastWork`、`DsaGroupReduceWork` 和 native handle
 dictionary 都按单次调用、单 payload 创建，不进入 runtime 共享静态对象。生产
@@ -121,44 +124,52 @@ fallback，不在 DSA 层直接调用。
 - 不保存 compressed、remote/packed tensor、work 或 CUDA event；backward 按静态 plan 重收输入并重算压缩条，不重算 top-k 或 sparse forward。
 - work、event、remote buffer 和 saved-state 都属于单次 autograd 调用，不放入 runtime 共享静态状态。
 - d_sink 与 runtime replicated 参数梯度由 DSA 内部 GroupReduce，并标记为 CP-reduced，外层不得对同一 CP group 重复归约。
+- 步骤 7 的 `DsaOverlapConfig` 独立控制 compressed GroupCast/Indexer projection 与 dKi GroupReduce/sparse backward 两组 overlap。CP=8 出口必须同时检查 2×2 开关矩阵、两个 in-flight microbatch、reentrant/retain-graph backward、gradient accumulation 和空 rank，并分别实际执行 A2AV 与 native。旧 CP=2 对真正嵌套 backward 的通过结果只保留为兼容历史，不能证明 CP=8 的 payload-private 状态与 grpcoll stream 串行语义。
+- CP=1 runtime 支持完整 module deepcopy/`torch.save`，反序列化时重建锁并清空 device/process-group 绑定的 forward-plan cache。CP>1（包括 CP=8）的 `ProcessGroup` 是 PyTorch 不可 pickle 的外部状态，只支持保存 `state_dict`，再在目标进程组上新建 runtime 并加载。
+- 正常退出和协调可恢复异常会 drain 已发起 work；collective wait 或 rank-local compute/kernel 失败会在公共前缀 drain 后 best-effort 请求 `ProcessGroup.abort()`。真实 B300 探针表明该调用不能保证解除 peer 已进入的 CUDA stream wait，因此不可恢复 CUDA/NCCL/NVSHMEM 故障采用 fail-stop 语义，必须由外部 launcher 在 60 秒 watchdog 内终止全部 worker；不承诺同一进程组恢复。步骤 7 测试覆盖真实协调异常 drain/reuse 与 abort 请求，隔离单 rank 故障的 launcher teardown 留给步骤 9 最终子进程矩阵。
 
 ## 正式测试与当前命令
 
-正式测试固定在 `tests/test_dsa`。步骤 1 提供公共 API 的配置/字段拒绝测试，以及 CP=1 三种 ratio、packed、sink、compressor、KL、输出和梯度与原型 API 的对拍。
-
-当前 H100 镜像命令：
+正式测试只从当前 worktree 的 `tests/test_dsa/` 运行。宿主机权威 worktree 是 `/home/scratch.wewen_gpu/MagiAttention/agents/worktrees/magi-dsa-v4-plan-grpcoll`；不再从旧 native 镜像的 `/tmp/native-test/test_dsa_cp.py` 或主 checkout 的同名文件运行。下面是本轮步骤 1–7 的 CP8 复验命令；CP=1 命令只生成 oracle 证据，分布式出口由同一个 8-rank 组完成。增量 native 容器不是步骤 8/9 尚待构建的最终不可变 native 镜像。
 
 ```bash
-# 公共 API（步骤 1）
-docker run --rm --gpus all --ipc=host \
-  -v /home/scratch.wewen_gpu:/ws -w /ws/MagiAttention/agents/worktrees/magi-dsa-v4-plan-grpcoll \
-  magi-dsa-dev:v2 timeout 300 pytest -q tests/test_dsa/test_dsa_api.py
+WORKTREE=/home/scratch.wewen_gpu/MagiAttention/agents/worktrees/magi-dsa-v4-plan-grpcoll
+B300_BASE_IMAGE=sha256:b4aca4fdd2ad71ba398ea9ef9a93e9530c8df9c17bfe021ec9b725a362ee49da
+NATIVE_CONTAINER=magi-dsa-b300-cp8-native
+GPU=0
+GPU_GROUP=0,1,2,3,4,5,6,7
+GRPCOLL_NUM_NVL_BYTES=1073741824  # 1 GiB；test config 必须使用同一固定值
 
-# 步骤 2 host fragment/solver plan（不需要 GPU）
-docker run --rm \
-  -v /home/scratch.wewen_gpu:/ws -w /ws/MagiAttention/agents/worktrees/magi-dsa-v4-plan-grpcoll \
-  magi-dsa-dev:v2 timeout 300 pytest -q \
-  tests/test_dsa/test_dsa_dispatch.py tests/test_dsa/test_dsa_solver.py
-
-# 步骤 3 CP=2 transport-only（双 H100，60 秒 watchdog）
+# CP=1 只作为数值/梯度 oracle，不计为分布式出口。
 docker run --rm --gpus all --ipc=host \
-  --ulimit memlock=-1 --ulimit stack=67108864 \
-  -v /home/scratch.wewen_gpu:/ws -w /ws/MagiAttention/agents/worktrees/magi-dsa-v4-plan-grpcoll \
-  magi-dsa-dev:v2 timeout 60 pytest -q tests/test_dsa/test_dsa_cp.py
+  -e CUDA_VISIBLE_DEVICES="${GPU}" \
+  -v "${WORKTREE}:/workspace/MagiAttention" \
+  -v /home/scratch.wewen_gpu/megatron-lm:/ws/megatron-lm:ro \
+  -e MAGI_DSA_MEGATRON_PATH=/ws/megatron-lm \
+  -w /workspace/MagiAttention "${B300_BASE_IMAGE}" \
+  timeout 1200 pytest -q -rs \
+    tests/test_dsa/test_dsa_api.py \
+    tests/test_dsa/test_dsa_dispatch.py \
+    tests/test_dsa/test_dsa_megatron.py \
+    tests/test_dsa/test_dsa_solver.py \
+    tests/test_dsa/test_dsa_pack_kernel.py
 
-# 步骤 3 native grpcoll 完整出口（已编译扩展的本地验证镜像）
-docker run --rm --gpus all --ipc=host \
-  --ulimit memlock=-1 --ulimit stack=67108864 \
-  -w /tmp/native-test magi-dsa-native-step3:final \
-  timeout 60 pytest -q test_dsa_cp.py
-
-# 已有 DSA 原型回归
-docker run --rm --gpus all --ipc=host \
-  -v /home/scratch.wewen_gpu:/ws -w /ws/MagiAttention/agents/worktrees/magi-dsa-v4-plan-grpcoll \
-  magi-dsa-dev:v2 timeout 300 pytest -q tests/test_attn/test_dsa_v4.py
+# 步骤 3/5/6/7 的唯一分布式出口：一个 GPU0..7、world_size=cp=8 组。
+# 单节点 NVLink 路径使用 num_rdma_bytes=0；NVSHMEM_SYMMETRIC_SIZE 必须 unset/N/A。
+docker exec \
+  -e CUDA_VISIBLE_DEVICES="${GPU_GROUP}" \
+  -e MASTER_ADDR=127.0.0.1 -e MASTER_PORT=29617 \
+  -w /workspace "${NATIVE_CONTAINER}" \
+  bash -lc 'unset NVSHMEM_SYMMETRIC_SIZE; \
+    test -z "${NVSHMEM_SYMMETRIC_SIZE+x}"; \
+    timeout 5400 pytest -q -rs tests/test_dsa/test_dsa_cp.py'
 ```
 
-编译后的单 kernel 测试使用 30 秒 watchdog，CP 通信测试使用 60 秒 watchdog；kernel 单次执行超过 10 秒按死锁处理。探索脚本和原始日志保留在 `agents/tests/magi-dsa-v4`，不替代正式测试。
+当前 `test_dsa_cp.py` 不再是 transport-only：CP=8 目标矩阵包含 A2AV/native transport、reference/kernel forward、reference/kernel backward/saved-state，以及步骤 7 的 overlap、并发、reentrant/retain-graph、空 rank、协调异常 drain/reuse 和 abort-request 用例。其中所有 `test_native_grpcoll_*` 用例必须在安装了 `magi_attn_comm` 和 NVSHMEM 的 B300 镜像内实际执行；`-rs` 输出中出现 skip 即为验收失败。CP=2 节点只算兼容回归。`test_dsa_megatron.py` 同样必须加载只读挂载且 HEAD 精确为 `c6449f0b23be397449f21c0967c5fc90785e55ea` 的 checkout，不能以 skip 代替 parity。编译后的单 kernel 测试使用 30 秒 watchdog；CP8 transport、完整路径/并发和首次 sparse-backward 冷编译分别使用 180、600–900 和 1200 秒预算，隔离故障的 launcher fail-stop 硬期限仍为 60 秒。
+
+2026-07-12 的当前 CP8 结果：API `32 passed`，dispatch+solver `36 passed`，packing+Megatron `18 passed`，单个八卡 `test_dsa_cp.py` `27 passed, 0 skipped`（637.08 秒），正式目录合计 `113 passed, 0 skipped`；旧回归为单卡 `17 passed`、CP8 `2 passed`。CP8 文件覆盖 A2AV/native、7168-wide reverse、三 ratio reference/kernel forward/backward、全部梯度、7 空 rank、2×2 overlap、并发/reentrant、retain-graph 和协调异常 drain/reuse。Black、isort、Ruff 0.12.5、compileall 与 `git diff --check` 通过。
+
+步骤 8 的性能校准、最终 solver 系数回填、固定 20 packs 和 E2E 门槛没有运行；步骤 9 的最终不可变镜像、launcher 隔离故障矩阵、集成与原子提交也没有运行。当前步骤 1–7 证据不得被解读为步骤 8/9 已完成。
 
 ## grpcoll 探针保存
 

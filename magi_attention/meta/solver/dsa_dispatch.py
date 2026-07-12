@@ -32,7 +32,15 @@ from magi_attention.meta.collection.dsa_meta import (
 
 @dataclass(frozen=True)
 class DsaCostModel:
-    """Uncalibrated step-2 predictor; H100 coefficients are filled in step 8."""
+    """Uncalibrated step-2 predictor; B300 coefficients are filled in step 8.
+
+    Compressed communication weights are charged per logical compressed block:
+    owner sends count every remote destination, while receives count unique
+    remote blocks.  Memory coefficients separately model the owner result,
+    packed send buffer, receive buffer and globally reordered resident tensor.
+    A ratio=4 runtime configures one block as the combined KV+Ki row size;
+    ratio=128 configures KV only.
+    """
 
     token_weight: float = 1.0
     indexer_weight: float = 1.0
@@ -42,6 +50,13 @@ class DsaCostModel:
     token_memory_bytes: int = 1
     compressed_block_memory_bytes: int = 1
     remote_row_memory_bytes: int = 1
+    # Keep new coefficients after the original positional fields so existing
+    # callers that did not use keywords retain their argument mapping.
+    compressed_owner_send_weight: float = 1.0
+    compressed_remote_receive_weight: float = 1.0
+    compressed_owner_send_memory_bytes: int = 1
+    compressed_remote_receive_memory_bytes: int = 1
+    compressed_global_memory_bytes: int = 1
 
     def __post_init__(self) -> None:
         numeric = (
@@ -50,12 +65,17 @@ class DsaCostModel:
             self.fragment_overhead,
             self.window_transfer_weight,
             self.overlap_transfer_weight,
+            self.compressed_owner_send_weight,
+            self.compressed_remote_receive_weight,
         )
         if any(value < 0 for value in numeric):
             raise ValueError("DSA cost weights must be non-negative")
         memory = (
             self.token_memory_bytes,
             self.compressed_block_memory_bytes,
+            self.compressed_owner_send_memory_bytes,
+            self.compressed_remote_receive_memory_bytes,
+            self.compressed_global_memory_bytes,
             self.remote_row_memory_bytes,
         )
         if any(value < 0 for value in memory):
@@ -342,10 +362,20 @@ def build_dsa_dispatch_plan(
         overlap_rows[transfer.destination_rank] += transfer.row_count
 
     ranks: list[DsaRankPlan] = []
+    total_compressed_blocks = len(blocks)
     for rank, fragments in enumerate(canonical):
         token_count = sum(fragment.token_count for fragment in fragments)
         indexer_cost = sum(
             fragment_indexer_cost(fragment, compress_ratio) for fragment in fragments
+        )
+        local_compressed_blocks = len(blocks_per_rank[rank])
+        # Compressed KV (and Ki for ratio=4) are broadcast to every peer.  The
+        # transport packs each owner row once, but its network send volume has
+        # one copy per remote destination.  Every rank then retains all blocks
+        # in logical order for its local attention/Indexer work.
+        compressed_owner_send_rows = local_compressed_blocks * (len(canonical) - 1)
+        compressed_remote_receive_rows = (
+            total_compressed_blocks - local_compressed_blocks
         )
         predicted_e2e = (
             model.token_weight * token_count
@@ -353,10 +383,18 @@ def build_dsa_dispatch_plan(
             + model.fragment_overhead * len(fragments)
             + model.window_transfer_weight * window_rows[rank]
             + model.overlap_transfer_weight * overlap_rows[rank]
+            + model.compressed_owner_send_weight * compressed_owner_send_rows
+            + model.compressed_remote_receive_weight * compressed_remote_receive_rows
         )
         estimated_memory_bytes = (
             model.token_memory_bytes * token_count
-            + model.compressed_block_memory_bytes * len(blocks_per_rank[rank])
+            + model.compressed_block_memory_bytes * local_compressed_blocks
+            + model.compressed_owner_send_memory_bytes
+            * local_compressed_blocks
+            * int(len(canonical) > 1)
+            + model.compressed_remote_receive_memory_bytes
+            * compressed_remote_receive_rows
+            + model.compressed_global_memory_bytes * total_compressed_blocks
             + model.remote_row_memory_bytes * (window_rows[rank] + overlap_rows[rank])
         )
         ranks.append(

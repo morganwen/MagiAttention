@@ -27,7 +27,6 @@ SM100) with ``-1`` sentinels.
 """
 
 from functools import lru_cache
-from typing import Optional, Tuple
 
 import torch
 
@@ -164,16 +163,71 @@ def indexer_select_kernel(
     seq_lens = ((rows + 1) // ratio).clamp(max=sk).to(torch.int32).repeat(b)
 
     topk_k = min(topk, sk)
+    if topk_k == 0:
+        return torch.full((b, sq, topk), -1, dtype=torch.int32, device=q_idx.device)
     res = dsa.indexer_top_k_wrapper(
         scores_flat, seq_lens, top_k=topk_k, next_n=1, return_val=False
     )
     idx = res["indices"]  # (b*sq, topk_k) int32, -1 invalid
+    valid = (idx >= 0) & (idx < seq_lens.unsqueeze(1))
+    safe_idx = idx.clamp(min=0, max=max(sk - 1, 0)).long()
+    selected_scores = torch.gather(scores_flat, 1, safe_idx)
+    selected_scores = selected_scores.masked_fill(~valid, float("-inf"))
+
+    # cuDNN promises the largest set but does not promise output order or the
+    # secondary key at the K-boundary. Canonicalize the selected rows first,
+    # then replace boundary-score members with the smallest visible block ids.
+    invalid_id = torch.iinfo(torch.int32).max
+    id_order = torch.argsort(
+        torch.where(valid, idx, torch.full_like(idx, invalid_id)),
+        dim=-1,
+        stable=True,
+    )
+    idx = torch.gather(idx, 1, id_order)
+    selected_scores = torch.gather(selected_scores, 1, id_order)
+    score_order = torch.argsort(selected_scores, dim=-1, descending=True, stable=True)
+    idx = torch.gather(idx, 1, score_order)
+    selected_scores = torch.gather(selected_scores, 1, score_order)
+
+    selected_count = seq_lens.clamp(min=0, max=topk_k).long()
+    threshold_position = (selected_count - 1).clamp(min=0).unsqueeze(1)
+    threshold = torch.gather(selected_scores, 1, threshold_position).squeeze(1)
+    threshold = torch.where(
+        selected_count > 0,
+        threshold,
+        torch.full_like(threshold, float("inf")),
+    )
+    block_ids = torch.arange(sk, device=q_idx.device).unsqueeze(0)
+    visible = block_ids < seq_lens.unsqueeze(1)
+    above_count = (visible & (scores_flat > threshold.unsqueeze(1))).sum(dim=1)
+    boundary_tie = visible & (scores_flat == threshold.unsqueeze(1))
+    tie_keys = torch.where(
+        boundary_tie,
+        -block_ids.to(scores_flat.dtype),
+        torch.full_like(scores_flat, float("-inf")),
+    )
+    smallest_tie_ids = torch.topk(
+        tie_keys,
+        k=topk_k,
+        dim=-1,
+        largest=True,
+        sorted=True,
+    ).indices.to(torch.int32)
+    positions = torch.arange(topk_k, device=q_idx.device).unsqueeze(0)
+    tie_positions = (positions - above_count.unsqueeze(1)).clamp(min=0, max=topk_k - 1)
+    idx = torch.where(
+        positions < above_count.unsqueeze(1),
+        idx,
+        torch.gather(smallest_tie_ids, 1, tie_positions),
+    )
+    idx = torch.where(
+        positions < selected_count.unsqueeze(1), idx, torch.full_like(idx, -1)
+    )
     if topk_k < topk:
         pad = torch.full(
             (b * sq, topk - topk_k), -1, dtype=torch.int32, device=q_idx.device
         )
         idx = torch.cat([idx, pad], dim=-1)
-    idx = idx.masked_fill(idx >= seq_lens.unsqueeze(1), -1)
     return idx.view(b, sq, -1)
 
 
@@ -273,9 +327,7 @@ class _KernelIndexerKL(torch.autograd.Function):
             target = target / target.sum(dim=-1, keepdim=True).clamp(min=1e-10)
 
             pred_f = predict.float().clamp(min=0)
-            kl = target * (
-                torch.log(target + 1e-10) - torch.log(pred_f + 1e-10)
-            )
+            kl = target * (torch.log(target + 1e-10) - torch.log(pred_f + 1e-10))
             kl = torch.where(valid, kl, torch.zeros_like(kl))
             loss = kl.sum() * (loss_coeff / total_global)
 

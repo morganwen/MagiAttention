@@ -25,6 +25,7 @@ from magi_attention.meta.collection.dsa_meta import (
     DsaTransferSpec,
 )
 from magi_attention.meta.solver.dsa_dispatch import (
+    DsaCostModel,
     build_dsa_dispatch_plan,
     make_sequential_plan,
     validate_dsa_dispatch_plan,
@@ -205,3 +206,71 @@ class TestDsaTransferPlan:
         )
         assert ratio4.overlap_transfers == (DsaTransferSpec(0, 1, 0, 124, 128),)
         assert ratio128.overlap_transfers == ()
+
+
+class TestDsaCompressedBroadcastCost:
+    @staticmethod
+    def _isolated_cost_model() -> DsaCostModel:
+        return DsaCostModel(
+            token_weight=0,
+            indexer_weight=0,
+            fragment_overhead=0,
+            window_transfer_weight=0,
+            overlap_transfer_weight=0,
+            compressed_owner_send_weight=2,
+            compressed_remote_receive_weight=3,
+            token_memory_bytes=0,
+            compressed_block_memory_bytes=5,
+            compressed_owner_send_memory_bytes=7,
+            compressed_remote_receive_memory_bytes=11,
+            compressed_global_memory_bytes=13,
+            remote_row_memory_bytes=0,
+        )
+
+    @pytest.mark.parametrize("cp_size", [1, 2, 8])
+    def test_full_peer_broadcast_cost_and_global_residency(self, cp_size):
+        plan = make_sequential_plan(
+            [1024],
+            cp_size,
+            4,
+            cost_model=self._isolated_cost_model(),
+        )
+        total_blocks = 256
+        for rank in plan.ranks:
+            local_blocks = len(rank.compressed_block_ids)
+            owner_send_rows = local_blocks * (cp_size - 1)
+            remote_receive_rows = total_blocks - local_blocks
+            assert rank.predicted_e2e == (2 * owner_send_rows + 3 * remote_receive_rows)
+            assert rank.estimated_memory_bytes == (
+                5 * local_blocks
+                + 7 * local_blocks * int(cp_size > 1)
+                + 11 * remote_receive_rows
+                + 13 * total_blocks
+            )
+
+    def test_cp8_owner_send_uses_peer_fanout_not_unique_rows(self):
+        plan = build_dsa_dispatch_plan(
+            [1024],
+            [[DsaFragmentSpec(0, 0, 1024)]] + [[] for _ in range(7)],
+            compress_ratio=4,
+            policy="owner-heavy",
+            cost_model=self._isolated_cost_model(),
+        )
+        owner, receiver = plan.ranks[:2]
+        assert owner.predicted_e2e == 2 * 256 * 7
+        assert receiver.predicted_e2e == 3 * 256
+        assert owner.estimated_memory_bytes == (5 + 7 + 13) * 256
+        assert receiver.estimated_memory_bytes == (11 + 13) * 256
+
+    @pytest.mark.parametrize(
+        ("field", "message"),
+        [
+            ("compressed_owner_send_weight", "weights"),
+            ("compressed_remote_receive_memory_bytes", "memory coefficients"),
+        ],
+    )
+    def test_compressed_broadcast_coefficients_must_be_non_negative(
+        self, field, message
+    ):
+        with pytest.raises(ValueError, match=message):
+            DsaCostModel(**{field: -1})

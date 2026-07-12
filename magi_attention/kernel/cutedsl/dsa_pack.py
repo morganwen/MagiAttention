@@ -15,10 +15,10 @@
 """Device-resident Magi_DSA row packing, id remapping and CSR reduction.
 
 The public frontend and mapping schema deliberately do not encode a GPU
-architecture.  Step 4 is validated on SM90, while the kernels use only
-global-memory copies and register arithmetic shared by SM90 and SM100.  The
-architecture is part of every compile-cache key so one process or persistent
-cache can safely serve both families.
+architecture.  The current step-4 acceptance target is B300/SM103, while the
+kernels use only global-memory copies and register arithmetic shared by the
+supported SM90 and SM10x families.  The architecture is part of every
+compile-cache key so one process or persistent cache can safely serve both.
 
 All maps are built from static host plans and validated before upload.  Dynamic
 Indexer results only consume the device remap LUT; no data-dependent D2H is

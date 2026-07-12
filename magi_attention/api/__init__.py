@@ -36,6 +36,7 @@ from magi_attention.functional import flex_flash_attn_func
 from magi_attention.meta.solver.dispatch_solver import ToppHeapDispatchAlg
 
 from .dsa_attn_interface import (
+    DsaOverlapConfig,
     DsaPackedMeta,
     MagiDSAInput,
     MagiDSARuntimeMgr,
@@ -100,6 +101,7 @@ __all__ = [
     "DistAttnRuntimeKey",
     "GeneralAttnMaskType",
     "DsaPackedMeta",
+    "DsaOverlapConfig",
     "MagiDSAInput",
     # ---- config classes ----
     "DistAttnConfig",

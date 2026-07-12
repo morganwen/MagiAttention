@@ -27,8 +27,10 @@ only :class:`DsaCommMeta` is suitable for caching as static plan state.
 from __future__ import annotations
 
 import math
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from enum import Enum
+from types import TracebackType
 from typing import TYPE_CHECKING, Any, Iterator, Sequence
 
 import torch
@@ -240,24 +242,38 @@ class DsaGroupCastWork:
     native_handle_dict: dict[str, Any]
     _result: DsaTypedPayload | None = field(default=None, init=False, repr=False)
     _reduce_started: bool = field(default=False, init=False, repr=False)
+    _wait_error: BaseException | None = field(default=None, init=False, repr=False)
+    _collective_failed: bool = field(default=False, init=False, repr=False)
 
     def wait(self) -> DsaTypedPayload:
         if self._result is not None:
             return self._result
-        receive = self.work.wait_post_process(self.buffers.receive_buffer)
-        if not isinstance(receive, torch.Tensor):
-            raise TypeError("GroupCast must return one tensor for one DSA payload")
-        if receive.shape != self.buffers.receive_buffer.shape:
-            raise RuntimeError(
-                f"{self.meta.kind.value} GroupCast returned shape {tuple(receive.shape)}, "
-                f"expected {tuple(self.buffers.receive_buffer.shape)}"
+        if self._wait_error is not None:
+            raise self._wait_error
+        try:
+            receive = self.work.wait_post_process(self.buffers.receive_buffer)
+            if not isinstance(receive, torch.Tensor):
+                raise TypeError("GroupCast must return one tensor for one DSA payload")
+            if receive.shape != self.buffers.receive_buffer.shape:
+                raise RuntimeError(
+                    f"{self.meta.kind.value} GroupCast returned shape "
+                    f"{tuple(receive.shape)}, expected "
+                    f"{tuple(self.buffers.receive_buffer.shape)}"
+                )
+            self.buffers.receive_buffer = receive
+            logical_receive = _restore_logical_row_shape(
+                receive, self.buffers.logical_row_shape
             )
-        self.buffers.receive_buffer = receive
-        logical_receive = _restore_logical_row_shape(
-            receive, self.buffers.logical_row_shape
-        )
-        self._result = DsaTypedPayload(self.meta.kind, logical_receive)
-        return self._result
+            self._result = DsaTypedPayload(self.meta.kind, logical_receive)
+            return self._result
+        except BaseException as error:
+            # WorkWithPostProcessFn clears ``work`` only after the collective
+            # wait succeeds.  Preserve that distinction so the enclosing scope
+            # aborts a genuinely failed process group but not a recoverable
+            # validation/post-process exception.
+            self._collective_failed = getattr(self.work, "work", None) is not None
+            self._wait_error = error
+            raise
 
 
 @dataclass
@@ -271,32 +287,148 @@ class DsaGroupReduceWork:
     local_accumulator: torch.Tensor
     output_dtype: torch.dtype
     _result: DsaTypedPayload | None = field(default=None, init=False, repr=False)
+    _wait_error: BaseException | None = field(default=None, init=False, repr=False)
+    _collective_failed: bool = field(default=False, init=False, repr=False)
 
     def wait(self) -> DsaTypedPayload:
         if self._result is not None:
             return self._result
-        if self.buffers.reduce_output_buffer is None:
-            raise RuntimeError("GroupReduce output buffer is missing")
-        reduced = self.work.wait_post_process(self.buffers.reduce_output_buffer)
-        if not isinstance(reduced, torch.Tensor):
-            raise TypeError("GroupReduce must return one tensor for one DSA payload")
-        if reduced.shape != self.buffers.reduce_output_buffer.shape:
-            raise RuntimeError(
-                f"{self.meta.kind.value} GroupReduce returned shape "
-                f"{tuple(reduced.shape)}, expected "
-                f"{tuple(self.buffers.reduce_output_buffer.shape)}"
+        if self._wait_error is not None:
+            raise self._wait_error
+        try:
+            if self.buffers.reduce_output_buffer is None:
+                raise RuntimeError("GroupReduce output buffer is missing")
+            reduced = self.work.wait_post_process(self.buffers.reduce_output_buffer)
+            if not isinstance(reduced, torch.Tensor):
+                raise TypeError(
+                    "GroupReduce must return one tensor for one DSA payload"
+                )
+            if reduced.shape != self.buffers.reduce_output_buffer.shape:
+                raise RuntimeError(
+                    f"{self.meta.kind.value} GroupReduce returned shape "
+                    f"{tuple(reduced.shape)}, expected "
+                    f"{tuple(self.buffers.reduce_output_buffer.shape)}"
+                )
+
+            from magi_attention.kernel.cutedsl.dsa_pack import reduce_dsa_rows_csr
+
+            logical_reduced = _restore_logical_row_shape(
+                reduced, self.buffers.logical_row_shape
             )
+            result = reduce_dsa_rows_csr(
+                logical_reduced,
+                self.device_map.owner_restore,
+                self.local_accumulator,
+                accumulate=False,
+            ).to(self.output_dtype)
+            self._result = DsaTypedPayload(self.meta.kind, result)
+            return self._result
+        except BaseException as error:
+            self._collective_failed = getattr(self.work, "work", None) is not None
+            self._wait_error = error
+            raise
 
-        from magi_attention.kernel.cutedsl.dsa_pack import reduce_dsa_rows_csr
 
-        result = reduce_dsa_rows_csr(
-            reduced,
-            self.device_map.owner_restore,
-            self.local_accumulator,
-            accumulate=False,
-        ).to(self.output_dtype)
-        self._result = DsaTypedPayload(self.meta.kind, result)
-        return self._result
+DsaAsyncWork = DsaGroupCastWork | DsaGroupReduceWork
+_CURRENT_DSA_WORK_TRACKER: ContextVar["DsaWorkTracker | None"] = ContextVar(
+    "current_dsa_work_tracker", default=None
+)
+
+
+def _abort_failed_process_group(group: dist.ProcessGroup | None) -> None:
+    """Best-effort teardown after an unrecoverable collective wait failure."""
+
+    if group is None or not dist.is_available() or not dist.is_initialized():
+        return
+    try:
+        abort = getattr(group, "abort", None)
+        if callable(abort):
+            abort()
+            return
+    except BaseException:
+        pass
+    try:
+        dist.destroy_process_group(group)
+    except BaseException:
+        pass
+
+
+@dataclass
+class DsaWorkTracker:
+    """Per-invocation ownership and deterministic drain for async DSA work.
+
+    A context variable makes nested/reentrant autograd scopes independent.  It
+    contains only work launched by the current invocation; the runtime cache
+    remains immutable and never owns work, events, or communication tensors.
+    """
+
+    group: dist.ProcessGroup | None
+    _works: list[DsaAsyncWork] = field(default_factory=list, init=False, repr=False)
+    _token: Token | None = field(default=None, init=False, repr=False)
+    _group_aborted: bool = field(default=False, init=False, repr=False)
+
+    def __enter__(self) -> "DsaWorkTracker":
+        if self._token is not None:
+            raise RuntimeError("a DSA work tracker cannot be entered twice")
+        self._token = _CURRENT_DSA_WORK_TRACKER.set(self)
+        return self
+
+    def track(self, work: DsaAsyncWork) -> DsaAsyncWork:
+        if not isinstance(work, (DsaGroupCastWork, DsaGroupReduceWork)):
+            raise TypeError("only DSA GroupCast/GroupReduce work can be tracked")
+        self._works.append(work)
+        return work
+
+    def _abort_group_once(self) -> None:
+        if not self._group_aborted:
+            _abort_failed_process_group(self.group)
+            self._group_aborted = True
+
+    def drain(self) -> tuple[BaseException, ...]:
+        errors: list[BaseException] = []
+        for work in self._works:
+            try:
+                work.wait()
+            except BaseException as error:
+                errors.append(error)
+                if work._collective_failed:
+                    # Further waits on a failed process group can block
+                    # forever. Request fail-stop immediately and leave bounded
+                    # multi-process teardown to the external launcher.
+                    self._abort_group_once()
+                    break
+        return tuple(errors)
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool:
+        errors = self.drain()
+        if exc is not None:
+            # A rank-local compute/kernel exception can make peers enter later
+            # collectives that this rank will never launch. After draining the
+            # common prefix, request best-effort fail-stop for the group. CUDA,
+            # NCCL, or NVSHMEM faults still require an external launcher watchdog.
+            self._abort_group_once()
+        assert self._token is not None
+        _CURRENT_DSA_WORK_TRACKER.reset(self._token)
+        self._token = None
+        if errors:
+            if exc is None:
+                raise errors[0]
+            if hasattr(exc, "add_note"):
+                exc.add_note(
+                    f"DSA drain observed {len(errors)} additional work error(s): "
+                    f"{errors[0]!r}"
+                )
+        return False
+
+
+def _track_current_dsa_work(work: DsaAsyncWork) -> DsaAsyncWork:
+    tracker = _CURRENT_DSA_WORK_TRACKER.get()
+    return work if tracker is None else tracker.track(work)
 
 
 @dataclass(frozen=True)
@@ -714,12 +846,14 @@ def start_dsa_group_cast(
         native_grpcoll_handle_dict=native_handle_dict,
         **meta.collective_arg.to_group_cast_args(),
     )
-    return DsaGroupCastWork(
-        meta=meta,
-        device_map=device_map,
-        buffers=buffers,
-        work=work,
-        native_handle_dict=native_handle_dict,
+    return _track_current_dsa_work(
+        DsaGroupCastWork(
+            meta=meta,
+            device_map=device_map,
+            buffers=buffers,
+            work=work,
+            native_handle_dict=native_handle_dict,
+        )
     )
 
 
@@ -749,6 +883,13 @@ def start_dsa_group_reduce(
         raise ValueError("local and remote DSA gradients must share a CUDA device")
     if remote_gradient.tensor.shape[1:] != local_gradient.tensor.shape[1:]:
         raise ValueError("local and remote DSA gradients must share their row shape")
+    expected_row_shape = forward_work.buffers.logical_row_shape
+    if tuple(local_gradient.tensor.shape[1:]) != expected_row_shape:
+        raise ValueError(
+            f"{meta.kind.value} gradient row shape "
+            f"{tuple(local_gradient.tensor.shape[1:])} does not match the forward "
+            f"payload row shape {expected_row_shape}"
+        )
 
     # Drain the forward work before reusing its native grpcoll routing handle.
     forward_work.wait()
@@ -758,11 +899,12 @@ def start_dsa_group_reduce(
     )
     from magi_attention.kernel.cutedsl.dsa_pack import copy_dsa_rows
 
-    reduce_output = copy_dsa_rows(
+    logical_reduce_output = copy_dsa_rows(
         local_accumulator,
         forward_work.device_map.send_copy,
     )
-    reduce_input = remote_gradient.tensor.float().contiguous()
+    reduce_output = _pad_native_hidden_size(logical_reduce_output)
+    reduce_input = _pad_native_hidden_size(remote_gradient.tensor.float().contiguous())
     forward_work.buffers.reduce_output_buffer = reduce_output
     work = group_reduce(
         input=reduce_input,
@@ -778,15 +920,17 @@ def start_dsa_group_reduce(
         native_grpcoll_handle_dict=forward_work.native_handle_dict,
         **meta.collective_arg.to_group_reduce_args(),
     )
-    return DsaGroupReduceWork(
-        meta=meta,
-        device_map=forward_work.device_map,
-        buffers=forward_work.buffers,
-        work=work,
-        local_accumulator=local_accumulator,
-        output_dtype=(
-            local_gradient.tensor.dtype if output_dtype is None else output_dtype
-        ),
+    return _track_current_dsa_work(
+        DsaGroupReduceWork(
+            meta=meta,
+            device_map=forward_work.device_map,
+            buffers=forward_work.buffers,
+            work=work,
+            local_accumulator=local_accumulator,
+            output_dtype=(
+                local_gradient.tensor.dtype if output_dtype is None else output_dtype
+            ),
+        )
     )
 
 
@@ -820,15 +964,31 @@ def reduce_replicated_dsa_gradient(
     rank = dist.get_rank(group)
     peers = [peer for peer in range(world_size) if peer != rank]
     logical_numel = gradient.numel()
-    local = gradient.float().reshape(1, logical_numel).contiguous()
-    transport = _pad_native_hidden_size(local)
-    send = transport.expand(len(peers), -1).contiguous()
+    if logical_numel == 0:
+        return gradient.to(gradient.dtype if output_dtype is None else output_dtype)
+    flat = gradient.float().reshape(-1)
+    if env.comm.is_native_grpcoll_enable():
+        # Native scratch grows with the per-row hidden width. Flattening a
+        # large parameter into one row can therefore require gigabytes even
+        # when the gradient itself is only a few MiB. Bound the width and use
+        # multiple rows; GroupReduce still sums the identical logical tensor.
+        alignment = GrpCollBuffer.get_hidden_size_alignment(torch.float32)
+        row_width = min(4096, max(alignment, logical_numel))
+        row_width = (row_width + alignment - 1) // alignment * alignment
+        padded_numel = (logical_numel + row_width - 1) // row_width * row_width
+        transport = F.pad(flat, (0, padded_numel - logical_numel)).reshape(
+            -1, row_width
+        )
+    else:
+        transport = flat.reshape(1, logical_numel).contiguous()
+    row_count = transport.size(0)
+    send = transport.repeat(len(peers), 1)
     output = transport.clone()
     work = group_reduce(
         input=send,
         output=output,
-        input_split_sizes=[1] * len(peers),
-        output_split_sizes=[1],
+        input_split_sizes=[row_count] * len(peers),
+        output_split_sizes=[row_count],
         dst_index=peers,
         src_indices=[peers],
         group=group,
@@ -843,7 +1003,7 @@ def reduce_replicated_dsa_gradient(
     reduced = work.wait_post_process(output)
     if not isinstance(reduced, torch.Tensor):
         raise TypeError("replicated DSA GroupReduce must return one tensor")
-    result = reduced.reshape(1, -1)[:, :logical_numel].reshape_as(gradient)
+    result = reduced.reshape(-1)[:logical_numel].reshape_as(gradient)
     return result.to(gradient.dtype if output_dtype is None else output_dtype)
 
 
@@ -857,6 +1017,7 @@ __all__ = [
     "DsaGroupReduceWork",
     "DsaPayloadKind",
     "DsaTypedPayload",
+    "DsaWorkTracker",
     "build_dsa_comm_plan",
     "materialize_dsa_comm_map",
     "materialize_dsa_comm_plan",

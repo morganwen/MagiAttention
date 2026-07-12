@@ -159,6 +159,7 @@ def _lpt_assignment(
     cp_size: int,
     compress_ratio: int,
     token_limit: int,
+    max_items_per_rank: int | None = None,
 ) -> tuple[int, ...]:
     atom_costs = [fragment_indexer_cost(atom, compress_ratio) for atom in atoms]
     order = sorted(
@@ -173,12 +174,14 @@ def _lpt_assignment(
     assignment = [-1] * len(atoms)
     tokens = [0] * cp_size
     indexer = [0] * cp_size
+    item_counts = [0] * cp_size
     for atom_index in order:
         atom = atoms[atom_index]
         feasible_ranks = [
             rank
             for rank in range(cp_size)
             if tokens[rank] + atom.token_count <= token_limit
+            and (max_items_per_rank is None or item_counts[rank] < max_items_per_rank)
         ]
         ranks = feasible_ranks or list(range(cp_size))
         rank = min(
@@ -192,6 +195,7 @@ def _lpt_assignment(
         assignment[atom_index] = rank
         tokens[rank] += atom.token_count
         indexer[rank] += atom_costs[atom_index]
+        item_counts[rank] += 1
     return tuple(assignment)
 
 
@@ -231,6 +235,35 @@ def _outer_middle_assignments(
     return tuple(sorted(candidates))
 
 
+def _mirrored_stripe_assignment(
+    atoms: Sequence[DsaFragmentSpec], cp_size: int
+) -> tuple[int, ...]:
+    """Pair low- and high-position contiguous stripes on each rank.
+
+    Ratio-4 Indexer work grows with the sample-relative query position.  A
+    cost-sorted LPT assignment balances that work, but on a long sample it
+    alternates ownership at nearly every aligned atom and violates the
+    fragment budget.  Splitting the ordered atoms into ``2 * cp_size`` nearly
+    equal contiguous stripes and assigning the second half in reverse order
+    preserves the low/high cost pairing with at most two stripes per rank for
+    a single sample.
+
+    The returned assignment is only a candidate: the normal token and merged
+    fragment feasibility checks still reject it for irregular packed batches
+    where equal atom counts do not imply feasible token counts.
+    """
+
+    if not atoms:
+        return ()
+    stripe_count = min(len(atoms), 2 * cp_size)
+    assignment: list[int] = []
+    for atom_index in range(len(atoms)):
+        stripe = min(atom_index * stripe_count // len(atoms), stripe_count - 1)
+        rank = stripe if stripe < cp_size else 2 * cp_size - 1 - stripe
+        assignment.append(rank)
+    return tuple(assignment)
+
+
 def _surrogate_objective(
     atoms: Sequence[DsaFragmentSpec],
     assignment: Sequence[int],
@@ -241,6 +274,116 @@ def _surrogate_objective(
     fragments = _merged_fragment_counts(atoms, assignment, cp_size)
     primary = max(indexer) if compress_ratio == 4 else max(tokens, default=0)
     return primary, max(tokens, default=0), sum(fragments), tuple(assignment)
+
+
+def _coarsened_lpt_assignments(
+    atoms: Sequence[DsaFragmentSpec],
+    cp_size: int,
+    compress_ratio: int,
+    token_limit: int,
+    constraints: DsaSolverConstraints,
+) -> tuple[tuple[int, ...], ...]:
+    """Build bounded, sample-aware LPT candidates for a packed batch.
+
+    Atom-level LPT is an excellent cost balancer for a ragged packed batch, but
+    its ownership can alternate too often within each sample.  This helper
+    groups consecutive atoms from the same sample, runs LPT on those chunks,
+    and expands the result back to the original atoms.  It tests only a bounded
+    range of increasing group sizes and stops at the first assignment whose
+    *merged* fragments satisfy the real constraint.  Counting chunks directly
+    would be overly conservative because adjacent same-rank chunks merge.
+    """
+
+    if not atoms:
+        return ((),)
+    planning_fragment_budget = constraints.max_fragments_per_rank or 64
+    chunk_capacity = cp_size * planning_fragment_budget
+
+    sample_atom_counts: list[int] = []
+    for atom in atoms:
+        while len(sample_atom_counts) <= atom.sample_id:
+            sample_atom_counts.append(0)
+        sample_atom_counts[atom.sample_id] += 1
+    nonempty_counts = [count for count in sample_atom_counts if count]
+    if len(nonempty_counts) > chunk_capacity:
+        return ()
+
+    def chunk_count(group_size: int) -> int:
+        return sum((count + group_size - 1) // group_size for count in nonempty_counts)
+
+    lower, upper = 1, max(nonempty_counts)
+    while lower < upper:
+        middle = (lower + upper) // 2
+        if chunk_count(middle) <= chunk_capacity:
+            upper = middle
+        else:
+            lower = middle + 1
+    minimum_group_size = lower
+
+    # Starting below the conservative chunk-count estimate matters: chunk LPT
+    # often puts adjacent chunks from one sample on the same rank, so (for
+    # example) 523 chunks can still merge to <= 64 fragments per rank.
+    maximum_group_size = min(max(nonempty_counts), max(2, minimum_group_size + 8))
+    minimum_test_group_size = max(2, minimum_group_size - 8)
+    for group_size in range(minimum_test_group_size, maximum_group_size + 1):
+        chunks: list[DsaFragmentSpec] = []
+        atom_spans: list[tuple[int, int]] = []
+        begin = 0
+        while begin < len(atoms):
+            sample_id = atoms[begin].sample_id
+            end = begin + 1
+            while (
+                end < len(atoms)
+                and end - begin < group_size
+                and atoms[end].sample_id == sample_id
+            ):
+                end += 1
+            chunks.append(
+                DsaFragmentSpec(
+                    sample_id,
+                    atoms[begin].q_begin,
+                    atoms[end - 1].q_end,
+                )
+            )
+            atom_spans.append((begin, end))
+            begin = end
+
+        def expand(chunk_assignment: Sequence[int]) -> tuple[int, ...]:
+            expanded = [-1] * len(atoms)
+            for rank, (span_begin, span_end) in zip(chunk_assignment, atom_spans):
+                expanded[span_begin:span_end] = [rank] * (span_end - span_begin)
+            return tuple(expanded)
+
+        lpt = expand(
+            _lpt_assignment(
+                chunks,
+                cp_size,
+                compress_ratio,
+                token_limit,
+            )
+        )
+        if _cheap_feasible(
+            atoms,
+            lpt,
+            cp_size,
+            compress_ratio,
+            token_limit,
+            constraints,
+        ):
+            candidates = [lpt]
+
+            mirrored = expand(_mirrored_stripe_assignment(chunks, cp_size))
+            if _cheap_feasible(
+                atoms,
+                mirrored,
+                cp_size,
+                compress_ratio,
+                token_limit,
+                constraints,
+            ):
+                candidates.append(mirrored)
+            return tuple(candidates)
+    return ()
 
 
 def _refine_moves_and_swaps(
@@ -420,19 +563,49 @@ class DsaPlanSolver:
             _assignment_for_plan(atoms, sequential),
             tuple(index % cp_size for index in range(len(atoms))),
             tuple((len(atoms) - 1 - index) % cp_size for index in range(len(atoms))),
+            _mirrored_stripe_assignment(atoms, cp_size),
         }
         lpt = _lpt_assignment(atoms, cp_size, compress_ratio, token_limit)
         assignments.add(lpt)
-        assignments.add(
-            _refine_moves_and_swaps(
-                atoms,
-                lpt,
-                cp_size,
-                compress_ratio,
-                token_limit,
-                self.constraints,
-            )
+        lpt_feasible = _cheap_feasible(
+            atoms,
+            lpt,
+            cp_size,
+            compress_ratio,
+            token_limit,
+            self.constraints,
         )
+        if (
+            compress_ratio == 4
+            and cp_size > 2
+            and not lpt_feasible
+            and any(atom.sample_id != atoms[0].sample_id for atom in atoms)
+        ):
+            assignments.update(
+                _coarsened_lpt_assignments(
+                    atoms,
+                    cp_size,
+                    compress_ratio,
+                    token_limit,
+                    self.constraints,
+                )
+            )
+        # Refinement only accepts fully feasible intermediate assignments.  If
+        # LPT already exceeds the fragment budget (the common long-sequence
+        # case), every one-atom move is rejected and the quadratic scan cannot
+        # make progress.  Keep the bounded local search for small plans only;
+        # its move feasibility checks are quadratic in the atom count.
+        if lpt_feasible and len(atoms) <= 512:
+            assignments.add(
+                _refine_moves_and_swaps(
+                    atoms,
+                    lpt,
+                    cp_size,
+                    compress_ratio,
+                    token_limit,
+                    self.constraints,
+                )
+            )
         if cp_size == 2:
             assignments.update(_outer_middle_assignments(atoms, compress_ratio))
 

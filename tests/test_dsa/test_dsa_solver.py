@@ -14,6 +14,8 @@
 
 """Cost, determinism, constraints and selection tests for the DSA solver."""
 
+import random
+import time
 from unittest.mock import patch
 
 import pytest
@@ -37,6 +39,18 @@ def _fragment_tuples(plan):
         tuple((fragment.q_begin, fragment.q_end) for fragment in rank.fragments)
         for rank in plan.ranks
     )
+
+
+def _ragged_performance_lengths(sample_count, seed):
+    rng = random.Random(seed)
+    minimum_length = 129
+    weights = [rng.randrange(1, 1001) for _ in range(sample_count)]
+    remaining = 196608 - minimum_length * sample_count
+    weight_sum = sum(weights)
+    lengths = [minimum_length + remaining * weight // weight_sum for weight in weights]
+    for index in range(196608 - sum(lengths)):
+        lengths[index % sample_count] += 1
+    return lengths
 
 
 class TestDsaIndexerCost:
@@ -76,6 +90,90 @@ class TestDsaBalancedSolver:
         assert actual == expected or actual == expected[::-1]
         assert balanced.max_rank_indexer_cost < sequential.max_rank_indexer_cost
         assert balanced.ranks[0].indexer_cost == balanced.ranks[1].indexer_cost
+
+    def test_cp8_long_sample_balances_indexer_with_bounded_fragments(self):
+        sequential = solve_dsa_plan([196608], 8, 4, policy="sequential")
+        with patch(
+            "magi_attention.meta.solver.dsa_solver._refine_moves_and_swaps"
+        ) as refine:
+            balanced = solve_dsa_plan([196608], 8, 4, policy="balanced")
+
+        # LPT alternates nearly every atom at this scale and cannot satisfy the
+        # 64-fragment budget.  Guard against bringing back its quadratic,
+        # no-progress local search on the performance shape.
+        refine.assert_not_called()
+        assert _fragment_tuples(balanced) == (
+            ((0, 12288), (184320, 196608)),
+            ((12288, 24576), (172032, 184320)),
+            ((24576, 36864), (159744, 172032)),
+            ((36864, 49152), (147456, 159744)),
+            ((49152, 61440), (135168, 147456)),
+            ((61440, 73728), (122880, 135168)),
+            ((73728, 86016), (110592, 122880)),
+            ((86016, 110592),),
+        )
+        assert [rank.token_count for rank in balanced.ranks] == [24576] * 8
+        assert max(rank.fragment_count for rank in balanced.ranks) <= 64
+
+        mean_indexer_cost = sum(rank.indexer_cost for rank in balanced.ranks) / 8
+        assert balanced.max_rank_indexer_cost / mean_indexer_cost <= 1.01
+        assert balanced.max_rank_indexer_cost * 5 < sequential.max_rank_indexer_cost * 3
+
+    def test_cp8_equal_length_packed_scale_skips_quadratic_refinement(self):
+        started = time.perf_counter()
+        with patch(
+            "magi_attention.meta.solver.dsa_solver._refine_moves_and_swaps"
+        ) as refine:
+            balanced = solve_dsa_plan([3072] * 64, 8, 4, policy="balanced")
+        elapsed = time.perf_counter() - started
+
+        refine.assert_not_called()
+        assert elapsed < 10.0
+        assert balanced.plan_hash == (
+            "09ea6a1f5984463eb6b289d4abac7517" "a1286c91a79ff4047c2156914b16d6b6"
+        )
+        assert [rank.token_count for rank in balanced.ranks] == [24576] * 8
+        assert [rank.fragment_count for rank in balanced.ranks] == [8] * 8
+        assert len({rank.indexer_cost for rank in balanced.ranks}) == 1
+
+    @pytest.mark.parametrize(
+        ("sample_count", "seed", "expected_hash"),
+        [
+            (
+                20,
+                62,
+                "554ec4c0aee58219ffe63a0e7d7a4e927a2601b7747c6491877512c0ec00140e",
+            ),
+            (
+                80,
+                122,
+                "e562a834b05026ccdaa63a42dcfb2608fac0497be6c44fb57509e1576c6224d8",
+            ),
+        ],
+    )
+    def test_cp8_ragged_packed_scale_is_balanced_and_bounded(
+        self, sample_count, seed, expected_hash
+    ):
+        lengths = _ragged_performance_lengths(sample_count, seed)
+        assert sum(lengths) == 196608
+        sequential = solve_dsa_plan(lengths, 8, 4, policy="sequential")
+
+        started = time.perf_counter()
+        with patch(
+            "magi_attention.meta.solver.dsa_solver._refine_moves_and_swaps"
+        ) as refine:
+            balanced = solve_dsa_plan(lengths, 8, 4, policy="balanced")
+        elapsed = time.perf_counter() - started
+
+        refine.assert_not_called()
+        assert elapsed < 10.0
+        assert balanced.plan_hash == expected_hash
+        assert max(rank.fragment_count for rank in balanced.ranks) <= 64
+        assert max(abs(rank.token_count - 24576) for rank in balanced.ranks) <= 256
+
+        mean_indexer_cost = sum(rank.indexer_cost for rank in balanced.ranks) / 8
+        assert balanced.max_rank_indexer_cost / mean_indexer_cost <= 1.01
+        assert balanced.max_rank_indexer_cost < sequential.max_rank_indexer_cost
 
     @pytest.mark.parametrize("ratio", [0, 4, 128])
     def test_packed_plan_is_deterministic_for_all_layer_forms(self, ratio):

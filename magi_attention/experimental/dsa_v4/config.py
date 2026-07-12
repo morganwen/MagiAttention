@@ -83,10 +83,9 @@ class MagiDSAV4Config:
     # Backend selection: reference is the pure-PyTorch path.
     backend: Literal["reference", "kernel"] = "reference"
 
-    # Context-parallel comm/compute overlap: launch the compressed-stream
-    # all-gathers asynchronously and overlap them with independent local
-    # compute (indexer projections, window index construction). Gloo stays
-    # synchronous regardless (correctness backend).
+    # Legacy experimental/cp.py prototype switch.  The public
+    # MagiDSARuntimeMgr uses DsaOverlapConfig's two independent step-7
+    # switches; this field is retained only while the prototype remains.
     overlap: bool = False
 
     # Numerics.

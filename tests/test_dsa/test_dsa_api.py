@@ -14,6 +14,8 @@
 
 """Step-1 contract and CP=1 parity tests for the public Magi_DSA API."""
 
+import copy
+import io
 from dataclasses import replace
 from unittest.mock import patch
 
@@ -143,20 +145,36 @@ class TestDsaContract:
         with pytest.raises(ValueError):
             MagiDSARuntimeMgr(cfg)
 
-    def test_runtime_builds_cp2_forward_capability(self):
+    def test_runtime_builds_cp8_forward_capability(self):
         sentinel_group = object()
         with (
             patch(
                 "magi_attention.dsa_runtime_mgr.dist.is_initialized", return_value=True
             ),
-            patch("magi_attention.dsa_runtime_mgr.dist.get_rank", return_value=1),
-            patch("magi_attention.dsa_runtime_mgr.dist.get_world_size", return_value=2),
+            patch("magi_attention.dsa_runtime_mgr.dist.get_rank", return_value=7),
+            patch("magi_attention.dsa_runtime_mgr.dist.get_world_size", return_value=8),
         ):
             runtime = MagiDSARuntimeMgr(_make_config(0), cp_group=sentinel_group)
-        assert runtime.plan.cp_rank == 1
-        assert runtime.plan.cp_size == 2
+        assert runtime.plan.cp_rank == 7
+        assert runtime.plan.cp_size == 8
         assert runtime.plan.compress_ratio == 0
         assert runtime.plan.communication_ready
+
+    @pytest.mark.parametrize("world_size", [3, 4, 5, 6, 7, 9])
+    def test_runtime_rejects_unvalidated_cp_size(self, world_size):
+        sentinel_group = object()
+        with (
+            patch(
+                "magi_attention.dsa_runtime_mgr.dist.is_initialized", return_value=True
+            ),
+            patch("magi_attention.dsa_runtime_mgr.dist.get_rank", return_value=0),
+            patch(
+                "magi_attention.dsa_runtime_mgr.dist.get_world_size",
+                return_value=world_size,
+            ),
+            pytest.raises(ValueError, match="CP sizes 1, 2, or 8"),
+        ):
+            MagiDSARuntimeMgr(_make_config(0), cp_group=sentinel_group)
 
     def test_runtime_rejects_unknown_dispatch_policy(self):
         with pytest.raises(ValueError, match="dispatch_policy"):
@@ -176,7 +194,21 @@ class TestDsaContract:
         assert sequential.policy == "sequential"
         assert runtime.plan_cache_size == 2
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="H100/CUDA required")
+    def test_runtime_deepcopy_and_module_serialization_rebuild_locks(self):
+        runtime = MagiDSARuntimeMgr(_make_config(4))
+        packed_meta = DsaPackedMeta(torch.tensor([0, 257], dtype=torch.int32))
+        expected = runtime.get_dispatch_plan(packed_meta)
+
+        copied = copy.deepcopy(runtime)
+        assert copied.get_dispatch_plan(packed_meta).plan_hash == expected.plan_hash
+
+        buffer = io.BytesIO()
+        torch.save(runtime, buffer)
+        buffer.seek(0)
+        restored = torch.load(buffer, weights_only=False)
+        assert restored.get_dispatch_plan(packed_meta).plan_hash == expected.plan_hash
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_input_rejects_shape_dtype_and_device_mismatch(self):
         runtime = MagiDSARuntimeMgr(_make_config(0)).cuda()
         good = _make_input(runtime.config, [8])
@@ -192,7 +224,7 @@ class TestDsaContract:
             runtime.validate_input(replace(good, sink=good.sink.cpu()))
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="H100/CUDA required")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 class TestCompressor:
     def test_tail_rule_and_short_sample(self):
         cfg4 = _make_config(4)
@@ -288,25 +320,57 @@ def _run_public_legacy_parity(ratio: int, backend: str) -> None:
         assert public_kl == 0
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="H100/CUDA required")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("ratio", [0, 4, 128])
 def test_public_api_reference_matches_legacy_full_gradients(ratio):
     _run_public_legacy_parity(ratio, backend="reference")
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="H100/CUDA required")
-def test_public_api_saved_state_excludes_compressed_and_packed_tensors():
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="B300/CUDA required")
+def test_public_api_saved_state_keeps_indexer_topk_not_sparse_indices():
+    import magi_attention.functional.dist_dsa as dist_dsa_module
+    from magi_attention.experimental.dsa_v4.reference import get_window_topk_idxs
+
     torch.manual_seed(20260710)
     cfg = _make_config(4, backend="reference")
     runtime = MagiDSARuntimeMgr(cfg).cuda().train()
-    dsa_input = _make_input(cfg, [5, 27])
+    lengths = (20, 12)
+    dsa_input = _make_input(cfg, list(lengths))
     saved = []
+    final_sparse_indices = []
+
+    score_values = (5.0, 7.0, 7.0, 3.0, 6.0)
+
+    def deterministic_scores(q_idx, _weights, k_idx):
+        values = torch.tensor(
+            score_values[: k_idx.size(0)],
+            dtype=torch.float32,
+            device=q_idx.device,
+        )
+        return values.view(1, 1, -1).expand(q_idx.size(1), q_idx.size(0), -1)
+
+    run_attention = dist_dsa_module._run_attention_forward_state
+
+    def capture_sparse_indices(q, kv, sink, sparse_indices, runtime_mgr):
+        final_sparse_indices.append(sparse_indices.detach().clone())
+        return run_attention(q, kv, sink, sparse_indices, runtime_mgr)
 
     def pack(tensor):
         saved.append(tensor)
         return tensor
 
-    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+    with (
+        patch(
+            "magi_attention.experimental.dsa_v4.indexer.compute_index_scores",
+            side_effect=deterministic_scores,
+        ),
+        patch.object(
+            dist_dsa_module,
+            "_run_attention_forward_state",
+            side_effect=capture_sparse_indices,
+        ),
+        torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor),
+    ):
         output, kl_loss = calc_dsa(dsa_input, runtime)
 
     assert len(saved) == 9
@@ -323,11 +387,72 @@ def test_public_api_saved_state_excludes_compressed_and_packed_tensors():
         assert actual.data_ptr() == expected.data_ptr()
     assert saved[5].data_ptr() == output.data_ptr()
     assert saved[6].dtype == torch.float32  # LSE (empty for reference seam)
-    assert saved[7].dtype == torch.int32  # topk_idx
-    assert saved[7].size(0) == dsa_input.x.size(0)
-    assert saved[8].dtype == torch.int32  # per-sample topk_length
-    assert saved[8].numel() == dsa_input.packed_meta.num_samples
-    compressed_rows = sum(length // cfg.compress_ratio for length in (5, 27))
+    topk_idx = saved[7]
+    topk_length = saved[8]
+    assert topk_idx.dtype == torch.int32
+    assert topk_idx.shape == (dsa_input.x.size(0), cfg.topk)
+    assert topk_length.dtype == torch.int32
+    assert topk_length.shape == (dsa_input.x.size(0),)
+    torch.testing.assert_close(
+        topk_length,
+        (topk_idx >= 0).sum(dim=-1, dtype=torch.int32),
+        rtol=0,
+        atol=0,
+    )
+
+    assert len(final_sparse_indices) == len(lengths)
+    row_begin = 0
+    global_block_begin = 0
+    for length, sparse_indices in zip(lengths, final_sparse_indices):
+        row_end = row_begin + length
+        sample_topk = topk_idx[row_begin:row_end]
+        sample_topk_length = topk_length[row_begin:row_end]
+        block_count = length // cfg.compress_ratio
+
+        # The Indexer state is fixed-width global logical block ids.  Sparse
+        # attention consumes a separate window + sample-local KV-row tensor.
+        assert sparse_indices.dtype == torch.int32
+        assert sparse_indices.shape == (length, cfg.window_size + cfg.topk)
+        expected_window = (
+            get_window_topk_idxs(cfg.window_size, 1, length, sparse_indices.device)
+            .squeeze(0)
+            .to(torch.int32)
+        )
+        torch.testing.assert_close(
+            sparse_indices[:, : cfg.window_size], expected_window, rtol=0, atol=0
+        )
+        expected_compressed_rows = torch.where(
+            sample_topk >= 0,
+            sample_topk - global_block_begin + length,
+            torch.full_like(sample_topk, -1),
+        )
+        torch.testing.assert_close(
+            sparse_indices[:, cfg.window_size :],
+            expected_compressed_rows,
+            rtol=0,
+            atol=0,
+        )
+
+        for position in range(length):
+            visible = min((position + 1) // cfg.compress_ratio, block_count, cfg.topk)
+            expected_local = sorted(
+                range(visible), key=lambda block: (-score_values[block], block)
+            )
+            expected_global = torch.tensor(
+                [global_block_begin + block for block in expected_local],
+                dtype=torch.int32,
+                device=sample_topk.device,
+            )
+            assert sample_topk_length[position].item() == visible
+            torch.testing.assert_close(
+                sample_topk[position, :visible], expected_global, rtol=0, atol=0
+            )
+            assert torch.all(sample_topk[position, visible:] == -1)
+
+        row_begin = row_end
+        global_block_begin += block_count
+
+    compressed_rows = sum(length // cfg.compress_ratio for length in lengths)
     forbidden_shapes = {
         (compressed_rows, cfg.kv_dim),
         (compressed_rows, cfg.indexer_dim),
@@ -348,7 +473,7 @@ def _kernel_dependencies_available() -> bool:
 
 
 @pytest.mark.dsa_kernel
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="H100/CUDA required")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(
     not _kernel_dependencies_available(),
     reason="frozen FlashMLA and cudnn-frontend DSA packages required",
@@ -356,3 +481,31 @@ def _kernel_dependencies_available() -> bool:
 @pytest.mark.parametrize("ratio", [0, 4, 128])
 def test_public_api_kernel_matches_legacy_full_gradients(ratio):
     _run_public_legacy_parity(ratio, backend="kernel")
+
+
+@pytest.mark.dsa_kernel
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(
+    not _kernel_dependencies_available(),
+    reason="frozen cudnn-frontend DSA package required",
+)
+def test_kernel_indexer_topk_canonicalizes_equal_score_boundary():
+    from magi_attention.experimental.dsa_v4.kernels import indexer_select_kernel
+
+    sq, sk, heads, dim, topk = 128, 32, 64, 128, 8
+    q_idx = torch.zeros(sq, 1, heads, dim, dtype=torch.bfloat16, device="cuda")
+    k_idx = torch.zeros(sk, 1, dim, dtype=torch.bfloat16, device="cuda")
+    weights = torch.ones(sq, 1, heads, dtype=torch.bfloat16, device="cuda")
+
+    selected = indexer_select_kernel(q_idx, k_idx, weights, topk, ratio=4)
+    assert selected.shape == (1, sq, topk)
+    assert selected.dtype == torch.int32
+    for position in range(sq):
+        valid = min((position + 1) // 4, topk)
+        torch.testing.assert_close(
+            selected[0, position, :valid],
+            torch.arange(valid, dtype=torch.int32, device="cuda"),
+            rtol=0,
+            atol=0,
+        )
+        assert torch.all(selected[0, position, valid:] == -1)

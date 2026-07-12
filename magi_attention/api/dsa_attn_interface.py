@@ -18,7 +18,7 @@ from dataclasses import dataclass
 
 import torch
 
-from magi_attention.dsa_runtime_mgr import MagiDSARuntimeMgr
+from magi_attention.dsa_runtime_mgr import DsaOverlapConfig, MagiDSARuntimeMgr
 
 
 @dataclass(frozen=True)
@@ -80,7 +80,7 @@ class MagiDSAInput:
 
     Shapes are ``x[T_local, hidden]``, ``qr[T_local, q_lora_rank]``,
     ``q[T_local, 64, 512]``, ``latent_kv[T_local, 512]`` and ``sink[64]``.
-    For CP=1, ``T_local`` is the global packed token count. For CP=2, rows
+    For CP=1, ``T_local`` is the global packed token count. For distributed CP, rows
     follow this rank's immutable fragment order while ``packed_meta`` still
     describes the global sample boundaries. Runtime validation enforces CUDA
     BF16 row tensors and an FP32 sink.
@@ -110,4 +110,10 @@ def calc_dsa(
     return runtime_mgr.calc_dsa(dsa_input)
 
 
-__all__ = ["DsaPackedMeta", "MagiDSAInput", "MagiDSARuntimeMgr", "calc_dsa"]
+__all__ = [
+    "DsaOverlapConfig",
+    "DsaPackedMeta",
+    "MagiDSAInput",
+    "MagiDSARuntimeMgr",
+    "calc_dsa",
+]

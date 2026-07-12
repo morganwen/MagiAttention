@@ -15,6 +15,7 @@
 """Static owner of Magi_DSA parameters and context-parallel plan state."""
 
 from dataclasses import dataclass
+from threading import RLock
 from typing import TYPE_CHECKING
 
 import torch
@@ -27,7 +28,7 @@ from magi_attention.meta.solver.dsa_dispatch import DsaCostModel
 from magi_attention.meta.solver.dsa_solver import DsaPlanSolver
 
 if TYPE_CHECKING:
-    from magi_attention.api.dsa_attn_interface import MagiDSAInput
+    from magi_attention.api.dsa_attn_interface import DsaPackedMeta, MagiDSAInput
     from magi_attention.functional.dist_dsa import DsaForwardPlan
 
 
@@ -41,12 +42,37 @@ class DsaStaticPlan:
     communication_ready: bool
 
 
+@dataclass(frozen=True)
+class DsaOverlapConfig:
+    """Independent step-7 communication/compute overlap switches.
+
+    The switches are deliberately runtime properties rather than properties of
+    the mathematical DSA layer.  This lets the performance harness execute the
+    complete 2x2 ablation without changing parameters or numerical semantics.
+    """
+
+    compressed_cast_indexer: bool = True
+    dki_reduce_sparse_backward: bool = True
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("compressed_cast_indexer", self.compressed_cast_indexer),
+            ("dki_reduce_sparse_backward", self.dki_reduce_sparse_backward),
+        ):
+            if not isinstance(value, bool):
+                raise TypeError(f"{name} must be bool, got {type(value).__name__}")
+
+
 class MagiDSARuntimeMgr(nn.Module):
     """Own one fixed-ratio Magi_DSA module and its static CP plan.
 
-    CP=1 executes the packed attention path directly.  CP=2 caches immutable
+    CP=1 executes the packed attention path directly.  Distributed CP caches immutable
     fragment, communication and device-remap plans per packed layout while all
     invocation-owned tensors and collective work stay outside the manager.
+
+    Full-module deepcopy/pickle is supported for CP=1. A distributed process
+    group is external runtime state and is not pickleable by PyTorch; checkpoint
+    it with ``state_dict`` and construct a new manager bound to the target group.
     """
 
     _FIXED_CONFIG = {
@@ -65,14 +91,20 @@ class MagiDSARuntimeMgr(nn.Module):
         cp_group: dist.ProcessGroup | None = None,
         *,
         dispatch_policy: str = "balanced",
+        overlap_config: DsaOverlapConfig | None = None,
     ) -> None:
         super().__init__()
         self._validate_config(config)
         if dispatch_policy not in ("sequential", "balanced"):
             raise ValueError("dispatch_policy must be 'sequential' or 'balanced'")
+        if overlap_config is not None and not isinstance(
+            overlap_config, DsaOverlapConfig
+        ):
+            raise TypeError("overlap_config must be a DsaOverlapConfig")
         self.config = config
         self.cp_group = cp_group
         self.dispatch_policy = dispatch_policy
+        self.overlap_config = overlap_config or DsaOverlapConfig()
 
         if cp_group is None:
             cp_rank, cp_size = 0, 1
@@ -83,14 +115,16 @@ class MagiDSARuntimeMgr(nn.Module):
                 )
             cp_rank = dist.get_rank(cp_group)
             cp_size = dist.get_world_size(cp_group)
-            if cp_size not in (1, 2):
-                raise ValueError(f"Magi_DSA V1 supports CP size 1 or 2, got {cp_size}")
+            if cp_size not in (1, 2, 8):
+                raise ValueError(
+                    f"Magi_DSA V1 supports CP sizes 1, 2, or 8; got {cp_size}"
+                )
 
         self.plan = DsaStaticPlan(
             cp_rank=cp_rank,
             cp_size=cp_size,
             compress_ratio=config.compress_ratio,
-            communication_ready=cp_size in (1, 2),
+            communication_ready=cp_size in (1, 2, 8),
         )
         token_memory_bytes = 2 * (
             config.hidden_size
@@ -98,7 +132,13 @@ class MagiDSARuntimeMgr(nn.Module):
             + 2 * config.num_heads * config.kv_dim
             + config.kv_dim
         )
-        compressed_block_memory_bytes = 2 * (config.kv_dim + config.indexer_dim)
+        # One logical compressed row carries KV for both compressed layer
+        # forms, plus Ki only for the ratio=4 Indexer form.  The dispatch model
+        # accounts separately for the owner result, packed send buffer, remote
+        # receive buffer and globally reordered resident tensor.
+        compressed_block_memory_bytes = 2 * config.kv_dim
+        if config.compress_ratio == 4:
+            compressed_block_memory_bytes += 2 * config.indexer_dim
         remote_row_memory_bytes = 2 * max(config.hidden_size, config.kv_dim)
         self._plan_solver = DsaPlanSolver(
             alignment=128,
@@ -106,11 +146,30 @@ class MagiDSARuntimeMgr(nn.Module):
             cost_model=DsaCostModel(
                 token_memory_bytes=token_memory_bytes,
                 compressed_block_memory_bytes=compressed_block_memory_bytes,
+                compressed_owner_send_memory_bytes=compressed_block_memory_bytes,
+                compressed_remote_receive_memory_bytes=compressed_block_memory_bytes,
+                compressed_global_memory_bytes=compressed_block_memory_bytes,
                 remote_row_memory_bytes=remote_row_memory_bytes,
             ),
         )
         self.dsa_module = MagiDSAV4(config, dtype=torch.bfloat16)
         self._forward_plan_cache: dict[tuple[str, int], "DsaForwardPlan"] = {}
+        # Plan construction may broadcast host objects and materialize device
+        # maps.  Serialize cache misses while keeping all invocation-owned CUDA
+        # tensors, events and collective work outside the runtime manager.
+        self._plan_lock = RLock()
+
+    def __getstate__(self):
+        state = super().__getstate__()
+        state.pop("_plan_lock", None)
+        # Device communication maps contain process-group-bound state and are
+        # cheap to rematerialize after deepcopy/load. Host solver plans remain.
+        state["_forward_plan_cache"] = {}
+        return state
+
+    def __setstate__(self, state) -> None:
+        super().__setstate__(state)
+        self._plan_lock = RLock()
 
     @property
     def plan_cache_size(self) -> int:
@@ -140,19 +199,20 @@ class MagiDSARuntimeMgr(nn.Module):
         sample_lengths = tuple(
             int(end - begin) for begin, end in zip(bounds, bounds[1:])
         )
-        if self.cp_group is None:
-            return self._plan_solver.solve(
+        with self._plan_lock:
+            if self.cp_group is None:
+                return self._plan_solver.solve(
+                    sample_lengths,
+                    self.plan.cp_size,
+                    self.config.compress_ratio,
+                    policy=policy,
+                )
+            return self._plan_solver.solve_distributed(
                 sample_lengths,
-                self.plan.cp_size,
                 self.config.compress_ratio,
+                self.cp_group,
                 policy=policy,
             )
-        return self._plan_solver.solve_distributed(
-            sample_lengths,
-            self.config.compress_ratio,
-            self.cp_group,
-            policy=policy,
-        )
 
     def get_forward_plan(
         self,
@@ -170,18 +230,19 @@ class MagiDSARuntimeMgr(nn.Module):
             torch.cuda.current_device() if resolved.index is None else resolved.index
         )
         key = (dispatch_plan.plan_hash, device_index)
-        cached = self._forward_plan_cache.get(key)
-        if cached is None:
-            from magi_attention.functional.dist_dsa import build_dsa_forward_plan
+        with self._plan_lock:
+            cached = self._forward_plan_cache.get(key)
+            if cached is None:
+                from magi_attention.functional.dist_dsa import build_dsa_forward_plan
 
-            cached = build_dsa_forward_plan(
-                dispatch_plan,
-                self.plan.cp_rank,
-                self.cp_group,
-                torch.device("cuda", device_index),
-            )
-            self._forward_plan_cache[key] = cached
-        return cached
+                cached = build_dsa_forward_plan(
+                    dispatch_plan,
+                    self.plan.cp_rank,
+                    self.cp_group,
+                    torch.device("cuda", device_index),
+                )
+                self._forward_plan_cache[key] = cached
+            return cached
 
     @classmethod
     def _validate_config(cls, config: MagiDSAV4Config) -> None:
@@ -291,4 +352,4 @@ class MagiDSARuntimeMgr(nn.Module):
         return self.calc_dsa(dsa_input)
 
 
-__all__ = ["DsaStaticPlan", "MagiDSARuntimeMgr"]
+__all__ = ["DsaOverlapConfig", "DsaStaticPlan", "MagiDSARuntimeMgr"]

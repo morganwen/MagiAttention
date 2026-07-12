@@ -20,8 +20,6 @@ MQA attention with a learnable per-head sink, and the indexer KL auxiliary
 loss. All score math runs in FP32.
 """
 
-from typing import Optional, Tuple
-
 import torch
 
 
@@ -130,9 +128,15 @@ def indexer_kl_loss(
     attn_scores = attn_scores.reshape(b, np_, sq, sk)
 
     causal = causal_mask.float()
-    index_mask = torch.full(
-        (b, sq, sk), float("-inf"), dtype=torch.float32, device=causal.device
-    ).scatter_(-1, topk_indices, 0.0)
+    valid_topk = topk_indices >= 0
+    selected_counts = torch.zeros(
+        (b, sq, sk), dtype=torch.int32, device=causal.device
+    ).scatter_add_(-1, topk_indices.clamp(min=0).long(), valid_topk.to(torch.int32))
+    index_mask = torch.where(
+        selected_counts > 0,
+        torch.zeros((), dtype=torch.float32, device=causal.device),
+        torch.full((), float("-inf"), dtype=torch.float32, device=causal.device),
+    )
 
     attn_scores = attn_scores + causal.unsqueeze(1)
     pred_scores = index_scores + causal
@@ -172,9 +176,7 @@ def validate_and_offset_topk(
         torch.arange(1, sq + 1, device=topk_indices.device).unsqueeze(1) // ratio
     )  # [sq, 1]
     valid = (topk_indices >= 0) & (topk_indices < n_valid.unsqueeze(0))
-    return torch.where(
-        valid, topk_indices + offset, torch.full_like(topk_indices, -1)
-    )
+    return torch.where(valid, topk_indices + offset, torch.full_like(topk_indices, -1))
 
 
 def indexer_kl_loss_selected(
@@ -222,7 +224,9 @@ def indexer_kl_loss_selected(
     t = torch.einsum("bqnh,bqkh->bqnk", q_f, ckv_sel.float()) * softmax_scale
     t = t.masked_fill(~valid.unsqueeze(2), float("-inf"))
     t = t.masked_fill(~row_has.unsqueeze(2), 0.0)
-    target = torch.softmax(t, dim=-1, dtype=torch.float32) * row_has.unsqueeze(2).float()
+    target = (
+        torch.softmax(t, dim=-1, dtype=torch.float32) * row_has.unsqueeze(2).float()
+    )
     target = target.sum(dim=2)  # (b, sq, k)
     target = target / target.sum(dim=-1, keepdim=True).clamp(min=1e-10)
 
