@@ -1057,8 +1057,19 @@ def _cache_snapshot() -> set[str]:
     snapshot: set[str] = set()
     for name in ("_copy_compile_cache", "_remap_compile_cache", "_csr_compile_cache"):
         cache = getattr(dsa_pack, name, {})
-        snapshot.update(f"{name}:{key!r}" for key in cache)
+        snapshot.update(f"{name}:{key!r}" for key in _compile_cache_keys(cache))
     return snapshot
+
+
+def _compile_cache_keys(cache: Any) -> tuple[Any, ...]:
+    """Return in-memory keys from the project JIT cache or a plain mapping."""
+
+    mapping = getattr(cache, "cache", cache)
+    _require(
+        isinstance(mapping, dict),
+        f"unexpected dsa_pack compile cache type {type(cache)!r}",
+    )
+    return tuple(mapping.keys())
 
 
 def _contains_architecture(value: Any, architecture: tuple[int, int]) -> bool:
@@ -1082,7 +1093,7 @@ def _cache_key_evidence() -> list[dict[str, Any]]:
     architecture = (10, 3)
     for name in ("_copy_compile_cache", "_remap_compile_cache", "_csr_compile_cache"):
         cache = getattr(dsa_pack, name, {})
-        for key in cache:
+        for key in _compile_cache_keys(cache):
             _require(
                 _contains_architecture(key, architecture),
                 f"{name} cache key {key!r} is not SM103-specific",
