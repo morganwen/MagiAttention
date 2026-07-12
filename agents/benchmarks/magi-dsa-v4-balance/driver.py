@@ -188,7 +188,10 @@ def _source_preflight(expected_revision: str) -> dict[str, Any]:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     _require(manifest.get("schema_version") == 1, "unsupported build manifest")
     revision = revision_path.read_text(encoding="utf-8").strip()
-    _require(revision == expected_revision, f"source marker {revision} != {expected_revision}")
+    _require(
+        revision == expected_revision,
+        f"source marker {revision} != {expected_revision}",
+    )
     _require(
         manifest.get("magi_attention_revision") == expected_revision,
         "build manifest revision differs from --expected-revision",
@@ -213,11 +216,15 @@ def _source_preflight(expected_revision: str) -> dict[str, Any]:
         "source archive submodule markers differ from the build manifest",
     )
     artifacts = manifest.get("artifacts")
-    _require(isinstance(artifacts, dict) and artifacts, "manifest artifacts are missing")
+    _require(
+        isinstance(artifacts, dict) and artifacts, "manifest artifacts are missing"
+    )
     verified_artifacts: dict[str, str] = {}
     for name, expected_sha256 in artifacts.items():
         path = Path(str(name))
-        _require(path.is_absolute() and path.is_file(), f"manifest artifact missing: {path}")
+        _require(
+            path.is_absolute() and path.is_file(), f"manifest artifact missing: {path}"
+        )
         actual_sha256 = sha256_file(path)
         _require(
             actual_sha256 == expected_sha256,
@@ -271,7 +278,9 @@ def _package_version(name: str) -> str:
 
 def _module_evidence(name: str) -> dict[str, Any]:
     module = importlib.import_module(name)
-    path = Path(module.__file__).resolve() if getattr(module, "__file__", None) else None
+    path = (
+        Path(module.__file__).resolve() if getattr(module, "__file__", None) else None
+    )
     return {
         "module": name,
         "path": None if path is None else str(path),
@@ -369,7 +378,9 @@ def _initialize_distributed():
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     _require(world_size == WORLD_SIZE, f"WORLD_SIZE={world_size}, expected 8")
-    _require(torch.cuda.device_count() == WORLD_SIZE, "exactly eight visible GPUs required")
+    _require(
+        torch.cuda.device_count() == WORLD_SIZE, "exactly eight visible GPUs required"
+    )
     torch.cuda.set_device(local_rank)
     dist.init_process_group("nccl", timeout=timedelta(minutes=30))
     _require(dist.get_world_size() == WORLD_SIZE, "default process group is not CP8")
@@ -494,10 +505,19 @@ def _distributed_preflight(
     )
     from magi_attention.meta.solver.dsa_calibration import calibration_manifest
 
-    del DsaOverlapConfig, DsaPackedMeta, MagiDSAConfig, MagiDSAInput, MagiDSARuntimeMgr, calc_dsa
+    del (
+        DsaOverlapConfig,
+        DsaPackedMeta,
+        MagiDSAConfig,
+        MagiDSAInput,
+        MagiDSARuntimeMgr,
+        calc_dsa,
+    )
     capability = list(torch.cuda.get_device_capability())
     name = torch.cuda.get_device_name()
-    _require(capability == [10, 3], f"rank {rank} is capability {capability}, not SM103")
+    _require(
+        capability == [10, 3], f"rank {rank} is capability {capability}, not SM103"
+    )
     _require("B300" in name, f"rank {rank} device {name!r} is not B300")
     device_record = {
         "rank": rank,
@@ -529,8 +549,7 @@ def _distributed_preflight(
     dist.broadcast_object_list(flash_values, src=0, group=group)
     flash_mla_sm100 = flash_values[0]
     _require(
-        isinstance(flash_mla_sm100, dict)
-        and flash_mla_sm100.get("verified") is True,
+        isinstance(flash_mla_sm100, dict) and flash_mla_sm100.get("verified") is True,
         "FlashMLA sm_100 cubin evidence is missing",
     )
 
@@ -791,9 +810,7 @@ def _canonical_owner_tensor(torch, dist, tensor, global_rows, rank: int, group):
     order = torch.argsort(rows)
     send_rows = rows.index_select(0, order).contiguous()
     send_tensor = tensor.detach().index_select(0, order).contiguous()
-    destinations = torch.div(
-        send_rows, TARGET_TOKENS_PER_RANK, rounding_mode="floor"
-    )
+    destinations = torch.div(send_rows, TARGET_TOKENS_PER_RANK, rounding_mode="floor")
     _require(
         bool(((destinations >= 0) & (destinations < WORLD_SIZE)).all().item()),
         "global row maps outside the canonical CP8 partition",
@@ -810,9 +827,7 @@ def _canonical_owner_tensor(torch, dist, tensor, global_rows, rank: int, group):
         receive_count == TARGET_TOKENS_PER_RANK,
         f"rank {rank} canonical shard has {receive_count} rows",
     )
-    received_rows = torch.empty(
-        receive_count, dtype=torch.int64, device=tensor.device
-    )
+    received_rows = torch.empty(receive_count, dtype=torch.int64, device=tensor.device)
     received_tensor = torch.empty(
         (receive_count, *tensor.shape[1:]), dtype=tensor.dtype, device=tensor.device
     )
@@ -1113,12 +1128,13 @@ def _make_runtime(torch, case: CaseSpec, group):
     return runtime
 
 
-def _merge_rank_artifacts(run_dir: Path, suffix: str, world_size: int) -> list[dict[str, Any]]:
+def _merge_rank_artifacts(
+    run_dir: Path, suffix: str, world_size: int
+) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for rank in range(world_size):
         path = run_dir / "_rank" / f"rank{rank}.{suffix}.jsonl"
-        if not path.is_file():
-            continue
+        _require(path.is_file(), f"rank {rank} did not produce {suffix} evidence")
         for line in path.read_text(encoding="utf-8").splitlines():
             if line.strip():
                 records.append(json.loads(line))
@@ -1132,6 +1148,51 @@ def _merge_rank_artifacts(run_dir: Path, suffix: str, world_size: int) -> list[d
     )
     write_jsonl(run_dir / f"{suffix}.jsonl", records)
     return records
+
+
+def _claim_fresh_run_dir(run_dir: Path, environment: Mapping[str, Any]) -> None:
+    """Atomically reject reuse of canonical or partially written run evidence."""
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    canonical = (
+        "environment.json",
+        "packs.json",
+        "report.schema.json",
+        "raw_timing.jsonl",
+        "plans.jsonl",
+        "correctness.jsonl",
+        "calibration.json",
+        "summary.json",
+        "validation.json",
+        "artifact_manifest.sha256",
+    )
+    stale = [name for name in canonical if (run_dir / name).exists()]
+    if (run_dir / "_rank").exists():
+        stale.append("_rank")
+    _require(not stale, f"run directory contains prior canonical evidence: {stale}")
+    claim = run_dir / ".magi-dsa-run-claim.json"
+    try:
+        descriptor = os.open(claim, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError as error:
+        raise RuntimeError(f"run directory is already claimed: {claim}") from error
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        json.dump(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "run_id": environment["run_id"],
+                "mode": environment["mode"],
+                "revision": environment["revision"],
+                "image_id": environment["image_id"],
+                "calibration_id": environment["calibration_id"],
+                "claimed_at_utc": _utc_now(),
+            },
+            stream,
+            indent=2,
+            sort_keys=True,
+        )
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
 
 
 def _fit_calibration(
@@ -1172,7 +1233,9 @@ def _fit_calibration(
         predicted = x @ coefficients
         residual = y - predicted
         denominator = float(np.sum((y - y.mean()) ** 2))
-        r_squared = 1.0 - float(np.sum(residual**2)) / denominator if denominator else 1.0
+        r_squared = (
+            1.0 - float(np.sum(residual**2)) / denominator if denominator else 1.0
+        )
         ratio_weights = dict(zip(PLAN_FEATURE_NAMES, coefficients.tolist()))
         weights[str(ratio)] = {
             "token_weight": ratio_weights["token_count"],
@@ -1241,7 +1304,7 @@ def _run_distributed(args: argparse.Namespace) -> int:
             "formal measure/profile refuses bootstrap calibration coefficients",
         )
     if rank == 0:
-        run_dir.mkdir(parents=True, exist_ok=True)
+        _claim_fresh_run_dir(run_dir, environment)
         (run_dir / "_rank").mkdir(parents=True, exist_ok=True)
         atomic_write_json(run_dir / "environment.json", environment)
         atomic_write_json(run_dir / "packs.json", packs_payload)
@@ -1252,9 +1315,7 @@ def _run_distributed(args: argparse.Namespace) -> int:
     raw_records: list[dict[str, Any]] = []
     plan_records: list[dict[str, Any]] = []
     correctness_records: list[dict[str, Any]] = []
-    selected_packs = (
-        [packs[PROFILE_PACK_INDEX]] if mode == "profile" else list(packs)
-    )
+    selected_packs = [packs[PROFILE_PACK_INDEX]] if mode == "profile" else list(packs)
 
     for case in cases:
         runtime = _make_runtime(torch, case, group)
@@ -1331,6 +1392,7 @@ def _run_distributed(args: argparse.Namespace) -> int:
                             "run_id": args.run_id,
                             "mode": artifact_mode,
                             "case_id": case.case_id,
+                            "calibration_id": runtime.solver_calibration_id,
                             "pack_index": pack_index,
                             "pack_sha256": pack["sha256"],
                             "baseline_case_id": f"r{case.ratio}-sequential-00",
@@ -1385,7 +1447,9 @@ def _run_distributed(args: argparse.Namespace) -> int:
                 torch.cuda.nvtx.range_pop()
                 cache_after = _cache_snapshot()
                 miss_delta = len(cache_after - cache_before)
-                indexer_ms = sum(float(phases.get(name, 0.0)) for name in INDEXER_PHASES)
+                indexer_ms = sum(
+                    float(phases.get(name, 0.0)) for name in INDEXER_PHASES
+                )
                 raw_records.append(
                     {
                         "schema_version": SCHEMA_VERSION,
@@ -1468,7 +1532,9 @@ def _run_distributed(args: argparse.Namespace) -> int:
             )
         if mode == "measure" and not result["summary"]["all_gates_pass"]:
             exit_code = 2
-    value = torch.tensor([exit_code], dtype=torch.int32, device=torch.cuda.current_device())
+    value = torch.tensor(
+        [exit_code], dtype=torch.int32, device=torch.cuda.current_device()
+    )
     dist.broadcast(value, src=0, group=group)
     exit_code = int(value.item())
     dist.barrier(group=group)
@@ -1490,7 +1556,9 @@ def _common_distributed_arguments(parser: argparse.ArgumentParser) -> None:
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    packs = subparsers.add_parser("packs", help="generate the frozen DatasetSampler packs")
+    packs = subparsers.add_parser(
+        "packs", help="generate the frozen DatasetSampler packs"
+    )
     packs.add_argument("--output", required=True, type=Path)
     packs.add_argument(
         "--dataset", type=Path, default=REPO_ROOT / DATASET_RELATIVE_PATH

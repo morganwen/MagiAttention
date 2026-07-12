@@ -238,18 +238,26 @@
     "plan_record": {
       "type": "object",
       "required": [
+        "schema_version",
+        "run_id",
+        "mode",
         "case_id",
         "pack_index",
         "rank",
         "plan_sha256",
+        "calibration_id",
         "features",
         "dsa_pack_cache_keys"
       ],
       "properties": {
+        "schema_version": {"const": "magi-dsa-v4-balance/v1"},
+        "run_id": {"type": "string"},
+        "mode": {"enum": ["calibration", "measure", "profile"]},
         "case_id": {"$ref": "#/$defs/case_id"},
         "pack_index": {"type": "integer", "minimum": 0, "maximum": 19},
         "rank": {"type": "integer", "minimum": 0, "maximum": 7},
         "plan_sha256": {"$ref": "#/$defs/sha256"},
+        "calibration_id": {"$ref": "#/$defs/sha256"},
         "features": {
           "type": "object",
           "required": [
@@ -286,16 +294,24 @@
     "correctness_record": {
       "type": "object",
       "required": [
+        "schema_version",
+        "run_id",
+        "mode",
         "case_id",
         "pack_index",
+        "calibration_id",
         "pass",
         "native_backend",
         "method",
         "rank_comparisons"
       ],
       "properties": {
+        "schema_version": {"const": "magi-dsa-v4-balance/v1"},
+        "run_id": {"type": "string"},
+        "mode": {"enum": ["calibration", "measure"]},
         "case_id": {"$ref": "#/$defs/case_id"},
         "pack_index": {"type": "integer", "minimum": 0, "maximum": 19},
+        "calibration_id": {"$ref": "#/$defs/sha256"},
         "pass": {"const": true},
         "native_backend": {"const": true},
         "digests": {"type": "object"},

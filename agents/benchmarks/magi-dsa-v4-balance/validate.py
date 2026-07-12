@@ -96,8 +96,7 @@ class CaseSpec:
     @property
     def overlap_code(self) -> str:
         return (
-            f"{int(self.compressed_cast_indexer)}"
-            f"{int(self.dki_reduce_sparse_backward)}"
+            f"{int(self.compressed_cast_indexer)}{int(self.dki_reduce_sparse_backward)}"
         )
 
 
@@ -136,9 +135,7 @@ CALIBRATION_CASES = (
     _case(128, "sequential", "00"),
     _case(128, "balanced", "00"),
 )
-PROFILE_CASES = (
-    _case(4, "balanced", "11"),
-)
+PROFILE_CASES = (_case(4, "balanced", "11"),)
 ALL_CASES = tuple(
     {
         case.case_id: case
@@ -174,8 +171,7 @@ def pack_sha256(lengths: Sequence[int]) -> str:
 
 def pack_suite_sha256(packs: Sequence[Mapping[str, Any]]) -> str:
     payload = [
-        {"index": int(pack["index"]), "sha256": str(pack["sha256"])}
-        for pack in packs
+        {"index": int(pack["index"]), "sha256": str(pack["sha256"])} for pack in packs
     ]
     return sha256_bytes(canonical_json_bytes(payload))
 
@@ -340,8 +336,7 @@ def validate_environment(
         "FlashMLA sm_100 cubin evidence is missing",
     )
     _require(
-        environment.get("build_manifest_path")
-        == "/opt/magi-dsa-build-manifest.json"
+        environment.get("build_manifest_path") == "/opt/magi-dsa-build-manifest.json"
         and isinstance(environment.get("build_manifest_sha256"), str)
         and len(environment["build_manifest_sha256"]) == 64,
         "immutable build manifest evidence is missing",
@@ -378,6 +373,8 @@ def validate_raw_records(
     packs: Sequence[Mapping[str, Any]],
     *,
     mode: str,
+    expected_run_id: str | None = None,
+    expected_calibration_id: str | None = None,
 ) -> None:
     cases = _expected_cases(mode)
     expected_case_ids = {case.case_id for case in cases}
@@ -386,10 +383,7 @@ def validate_raw_records(
     )
     expected_iterations = {0} if mode == "profile" else set(range(MEASURE_ITERS))
     expected_count = (
-        len(cases)
-        * len(expected_pack_indices)
-        * WORLD_SIZE
-        * len(expected_iterations)
+        len(cases) * len(expected_pack_indices) * WORLD_SIZE * len(expected_iterations)
     )
     _require(
         len(records) == expected_count,
@@ -401,6 +395,13 @@ def validate_raw_records(
     for record in records:
         _require(record.get("schema_version") == SCHEMA_VERSION, "raw schema mismatch")
         _require(record.get("mode") == mode, "raw record mode mismatch")
+        if expected_run_id is not None:
+            _require(record.get("run_id") == expected_run_id, "raw run_id mismatch")
+        if expected_calibration_id is not None:
+            _require(
+                record.get("calibration_id") == expected_calibration_id,
+                "raw calibration_id mismatch",
+            )
         case_id = str(record.get("case_id"))
         _require(case_id in expected_case_ids, f"unexpected case {case_id}")
         observed_cases.add(case_id)
@@ -414,9 +415,13 @@ def validate_raw_records(
         pack_index = record.get("pack_index")
         iteration = record.get("iteration")
         rank = record.get("rank")
-        _require(pack_index in expected_pack_indices, f"invalid pack index {pack_index}")
+        _require(
+            pack_index in expected_pack_indices, f"invalid pack index {pack_index}"
+        )
         _require(iteration in expected_iterations, f"invalid iteration {iteration}")
-        _require(isinstance(rank, int) and 0 <= rank < WORLD_SIZE, f"invalid rank {rank}")
+        _require(
+            isinstance(rank, int) and 0 <= rank < WORLD_SIZE, f"invalid rank {rank}"
+        )
         _require(
             record.get("pack_sha256") == pack_hashes[pack_index],
             f"pack {pack_index} hash mismatch in raw timing",
@@ -429,14 +434,14 @@ def validate_raw_records(
         for name in ("e2e_ms", "indexer_ms"):
             value = record.get(name)
             _require(
-                isinstance(value, (int, float))
-                and math.isfinite(value)
-                and value >= 0,
+                isinstance(value, (int, float)) and math.isfinite(value) and value >= 0,
                 f"{case_id}: invalid {name}={value!r}",
             )
         phases = record.get("phases_ms")
         _require(isinstance(phases, dict), f"{case_id}: phases_ms must be an object")
-        computed_indexer_ms = sum(float(phases.get(name, 0.0)) for name in INDEXER_PHASES)
+        computed_indexer_ms = sum(
+            float(phases.get(name, 0.0)) for name in INDEXER_PHASES
+        )
         _require(
             math.isclose(
                 float(record["indexer_ms"]),
@@ -451,7 +456,9 @@ def validate_raw_records(
                 "indexer_projection" in phases,
                 f"{case_id}: Indexer projection timing is missing",
             )
-        _require(record.get("native_backend") is True, f"{case_id}: native backend false")
+        _require(
+            record.get("native_backend") is True, f"{case_id}: native backend false"
+        )
         _require(record.get("finite") is True, f"{case_id}: non-finite result")
         _require(
             record.get("jit_cache_miss_delta") == 0,
@@ -460,14 +467,24 @@ def validate_raw_records(
         key = (case_id, int(pack_index), int(rank), int(iteration))
         _require(key not in keys, f"duplicate raw timing key {key}")
         keys.add(key)
-    _require(observed_cases == expected_case_ids, "raw timing case matrix is incomplete")
+    _require(
+        observed_cases == expected_case_ids, "raw timing case matrix is incomplete"
+    )
 
 
 def validate_plan_records(
-    records: Sequence[Mapping[str, Any]], *, mode: str
+    records: Sequence[Mapping[str, Any]],
+    *,
+    mode: str,
+    expected_run_id: str | None = None,
+    expected_calibration_id: str | None = None,
 ) -> int:
     cases = _expected_cases(mode)
-    pack_count = 1 if mode == "profile" else PACK_NUM
+    expected_case_ids = {case.case_id for case in cases}
+    expected_pack_indices = (
+        {PROFILE_PACK_INDEX} if mode == "profile" else set(range(PACK_NUM))
+    )
+    pack_count = len(expected_pack_indices)
     expected_count = len(cases) * pack_count * WORLD_SIZE
     _require(
         len(records) == expected_count,
@@ -476,11 +493,23 @@ def validate_plan_records(
     seen: set[tuple[str, int, int]] = set()
     cache_key_count = 0
     for record in records:
+        _require(record.get("schema_version") == SCHEMA_VERSION, "plan schema mismatch")
+        _require(record.get("mode") == mode, "plan record mode mismatch")
+        if expected_run_id is not None:
+            _require(record.get("run_id") == expected_run_id, "plan run_id mismatch")
+        if expected_calibration_id is not None:
+            _require(
+                record.get("calibration_id") == expected_calibration_id,
+                "plan calibration_id mismatch",
+            )
         key = (
             str(record.get("case_id")),
             int(record.get("pack_index", -1)),
             int(record.get("rank", -1)),
         )
+        _require(key[0] in expected_case_ids, f"unexpected plan case {key[0]}")
+        _require(key[1] in expected_pack_indices, f"invalid plan pack index {key[1]}")
+        _require(0 <= key[2] < WORLD_SIZE, f"invalid plan rank {key[2]}")
         _require(key not in seen, f"duplicate plan record {key}")
         seen.add(key)
         features = record.get("features")
@@ -513,6 +542,13 @@ def validate_plan_records(
                 f"plan {key} has malformed cache evidence",
             )
         cache_key_count += len(cache_keys)
+    expected_keys = {
+        (case.case_id, pack_index, rank)
+        for case in cases
+        for pack_index in expected_pack_indices
+        for rank in range(WORLD_SIZE)
+    }
+    _require(seen == expected_keys, "plan matrix is incomplete")
     return cache_key_count
 
 
@@ -624,19 +660,47 @@ def summarize_records(
 
 
 def validate_correctness_records(
-    records: Sequence[Mapping[str, Any]], *, mode: str
+    records: Sequence[Mapping[str, Any]],
+    *,
+    mode: str,
+    expected_run_id: str | None = None,
+    expected_calibration_id: str | None = None,
 ) -> None:
     if mode == "profile":
         return
     expected_cases = {case.case_id for case in _expected_cases(mode)}
+    expected_count = len(expected_cases) * PACK_NUM
+    _require(
+        len(records) == expected_count,
+        f"correctness has {len(records)} records, expected {expected_count}",
+    )
     observed: set[tuple[str, int]] = set()
     for record in records:
+        _require(
+            record.get("schema_version") == SCHEMA_VERSION,
+            "correctness schema mismatch",
+        )
+        _require(record.get("mode") == mode, "correctness mode mismatch")
+        if expected_run_id is not None:
+            _require(
+                record.get("run_id") == expected_run_id,
+                "correctness run_id mismatch",
+            )
+        if expected_calibration_id is not None:
+            _require(
+                record.get("calibration_id") == expected_calibration_id,
+                "correctness calibration_id mismatch",
+            )
         case_id = str(record.get("case_id"))
         pack_index = int(record.get("pack_index", -1))
         _require(case_id in expected_cases, f"unexpected correctness case {case_id}")
         _require(0 <= pack_index < PACK_NUM, "invalid correctness pack index")
-        _require(record.get("pass") is True, f"correctness failed for {case_id}/{pack_index}")
-        _require(record.get("native_backend") is True, "correctness used non-native backend")
+        _require(
+            record.get("pass") is True, f"correctness failed for {case_id}/{pack_index}"
+        )
+        _require(
+            record.get("native_backend") is True, "correctness used non-native backend"
+        )
         expected_method = (
             "owner-local all_to_all_single to fixed contiguous 24576-row/rank "
             "global order, then chunked torch.testing.assert_close"
@@ -666,9 +730,7 @@ def validate_correctness_records(
                         f"{case_id}/{pack_index}/rank{rank} lacks elementwise {name}",
                     )
                 parameter_fields = [
-                    name
-                    for name in rank_comparison
-                    if name.startswith("parameter:")
+                    name for name in rank_comparison if name.startswith("parameter:")
                 ]
                 if case.ratio:
                     _require(
@@ -680,7 +742,9 @@ def validate_correctness_records(
                         rank_comparison[name].get("elementwise_assert_close") is True,
                         f"{case_id}/{pack_index}/rank{rank} lacks elementwise {name}",
                     )
-        observed.add((case_id, pack_index))
+        key = (case_id, pack_index)
+        _require(key not in observed, f"duplicate correctness record {key}")
+        observed.add(key)
     expected = {
         (case.case_id, pack_index)
         for case in _expected_cases(mode)
@@ -822,7 +886,14 @@ def _profile_overlap_from_sqlite(
                 )
 
         kernels: list[dict[str, Any]] = []
-        for start, end, stream_id, correlation_id, short_name, demangled_name in connection.execute(
+        for (
+            start,
+            end,
+            stream_id,
+            correlation_id,
+            short_name,
+            demangled_name,
+        ) in connection.execute(
             "SELECT start, end, streamId, correlationId, shortName, demangledName "
             "FROM CUPTI_ACTIVITY_KIND_KERNEL WHERE globalPid = ?",
             (global_pid,),
@@ -924,15 +995,12 @@ def _profile_overlap_from_sqlite(
             communication_intervals = [
                 (item["start"], item["end"]) for item in concurrent_native
             ]
-            intersection = _intersection_ns(
-                compute_intervals, communication_intervals
-            )
+            intersection = _intersection_ns(compute_intervals, communication_intervals)
             compute_duration = sum(
                 end - start for start, end in _merged_intervals(compute_intervals)
             )
             communication_duration = sum(
-                end - start
-                for start, end in _merged_intervals(communication_intervals)
+                end - start for start, end in _merged_intervals(communication_intervals)
             )
             passed = bool(intersection > 0 and concurrent_native)
             return {
@@ -958,8 +1026,7 @@ def _profile_overlap_from_sqlite(
                     {str(item["name"]) for item in concurrent_native}
                 ),
                 "compute_gpu_ms": compute_duration / 1_000_000.0,
-                "native_communication_gpu_ms": communication_duration
-                / 1_000_000.0,
+                "native_communication_gpu_ms": communication_duration / 1_000_000.0,
                 "intersection_gpu_ms": intersection / 1_000_000.0,
                 "intersection_over_compute": (
                     intersection / compute_duration if compute_duration else 0.0
@@ -1051,16 +1118,7 @@ def build_profile_overlap(profile_dir: Path) -> dict[str, Any]:
     )
     slowest = max(candidate, key=lambda item: float(item["e2e_ms"]))
     report = _one_artifact(profile_dir, "*.nsys-rep")
-    sqlite_matches = sorted(profile_dir.glob("*.sqlite"))
-    _require(
-        len(sqlite_matches) <= 1,
-        f"multiple SQLite exports found in {profile_dir}",
-    )
-    sqlite_path = (
-        sqlite_matches[0]
-        if len(sqlite_matches) == 1
-        else _export_nsys_sqlite(report, profile_dir / report.stem)
-    )
+    sqlite_path = _export_nsys_sqlite(report, profile_dir / f"{report.stem}-verified")
     payload = _profile_overlap_from_sqlite(
         sqlite_path,
         run_id=str(metadata["run_id"]),
@@ -1092,8 +1150,7 @@ def validate_profile_overlap(
     expected_revision: str | None,
     expected_image_id: str | None,
 ) -> dict[str, Any]:
-    path = profile_dir / "profile_overlap.json"
-    payload = read_json(path) if path.is_file() else build_profile_overlap(profile_dir)
+    payload = build_profile_overlap(profile_dir)
     expected_values = {
         "schema_version": SCHEMA_VERSION,
         "case_id": "r4-balanced-11",
@@ -1161,9 +1218,7 @@ def create_manifest(
     return entries
 
 
-def write_manifest(
-    perf_dir: Path, profile_dir: Path | None = None
-) -> Path:
+def write_manifest(perf_dir: Path, profile_dir: Path | None = None) -> Path:
     entries = create_manifest(perf_dir, profile_dir)
     path = perf_dir / "artifact_manifest.sha256"
     temporary = path.with_suffix(".sha256.tmp")
@@ -1207,9 +1262,27 @@ def validate_run(
     raw = read_jsonl(run_dir / "raw_timing.jsonl")
     plans = read_jsonl(run_dir / "plans.jsonl")
     correctness = read_jsonl(run_dir / "correctness.jsonl")
-    validate_raw_records(raw, packs, mode=mode)
-    cache_key_count = validate_plan_records(plans, mode=mode)
-    validate_correctness_records(correctness, mode=mode)
+    run_id = str(environment["run_id"])
+    calibration_id = str(environment["calibration_id"])
+    validate_raw_records(
+        raw,
+        packs,
+        mode=mode,
+        expected_run_id=run_id,
+        expected_calibration_id=calibration_id,
+    )
+    cache_key_count = validate_plan_records(
+        plans,
+        mode=mode,
+        expected_run_id=run_id,
+        expected_calibration_id=calibration_id,
+    )
+    validate_correctness_records(
+        correctness,
+        mode=mode,
+        expected_run_id=run_id,
+        expected_calibration_id=calibration_id,
+    )
     profile_overlap: dict[str, Any] | None = None
     if mode == "measure":
         summary = summarize_records(raw, packs)
@@ -1221,6 +1294,14 @@ def validate_run(
                 expected_revision=str(environment["revision"]),
                 expected_image_id=str(environment["image_id"]),
             )
+            _require(
+                profile_environment["run_id"] == environment["run_id"],
+                "profile and measure use different run IDs",
+            )
+            _require(
+                profile_environment["calibration_id"] == environment["calibration_id"],
+                "profile and measure use different calibration IDs",
+            )
             profile_packs = validate_packs(read_json(profile_dir / "packs.json"))
             _require(
                 pack_suite_sha256(profile_packs) == pack_suite_sha256(packs),
@@ -1230,9 +1311,14 @@ def validate_run(
                 read_jsonl(profile_dir / "raw_timing.jsonl"),
                 profile_packs,
                 mode="profile",
+                expected_run_id=str(profile_environment["run_id"]),
+                expected_calibration_id=str(profile_environment["calibration_id"]),
             )
             validate_plan_records(
-                read_jsonl(profile_dir / "plans.jsonl"), mode="profile"
+                read_jsonl(profile_dir / "plans.jsonl"),
+                mode="profile",
+                expected_run_id=str(profile_environment["run_id"]),
+                expected_calibration_id=str(profile_environment["calibration_id"]),
             )
             profile_overlap = validate_profile_overlap(
                 profile_dir,
@@ -1308,7 +1394,7 @@ def _profile_sqlite_self_test(path: Path) -> None:
     connection.executemany(
         "INSERT INTO StringIds(id, value) VALUES (?, ?)", labels.items()
     )
-    global_pid = (42 << 24)
+    global_pid = 42 << 24
     global_tid = global_pid + 123
     ranges = (
         (0, 1_000, None, 1, global_tid),
@@ -1387,7 +1473,9 @@ def _self_test() -> None:
             for rank in range(WORLD_SIZE):
                 for iteration in range(MEASURE_ITERS):
                     baseline = 10.0 + rank * 0.001
-                    e2e = baseline * (0.8 if candidate and case.ratio in (4, 128) else 1.0)
+                    e2e = baseline * (
+                        0.8 if candidate and case.ratio in (4, 128) else 1.0
+                    )
                     indexer = (
                         baseline * (0.7 if candidate else 1.0)
                         if case.ratio == 4
