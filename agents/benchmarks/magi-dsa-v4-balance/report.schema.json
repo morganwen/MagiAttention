@@ -1,0 +1,378 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/SandAI-org/MagiAttention/magi-dsa-v4-balance-v1.schema.json",
+  "title": "Magi_DSA V4 B300 CP8 benchmark artifacts",
+  "description": "Schema definitions for environment.json, packs.json, JSONL timing/plan/correctness records, summary.json and calibration.json. The executable validator additionally enforces exact counts, hashes and performance inequalities.",
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "git_revision": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "case_id": {
+      "enum": [
+        "r0-sequential-00",
+        "r0-balanced-00",
+        "r0-balanced-11",
+        "r4-sequential-00",
+        "r4-balanced-00",
+        "r4-balanced-01",
+        "r4-balanced-10",
+        "r4-balanced-11",
+        "r128-sequential-00",
+        "r128-balanced-00",
+        "r128-balanced-11"
+      ]
+    },
+    "pack": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["index", "lengths", "sha256"],
+      "properties": {
+        "index": {"type": "integer", "minimum": 0, "maximum": 19},
+        "lengths": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "integer", "minimum": 1}
+        },
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "packs_file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "sampler", "packs", "packs_sha256"],
+      "properties": {
+        "schema_version": {"const": "magi-dsa-v4-balance/v1"},
+        "created_at_utc": {"type": "string"},
+        "sampler": {
+          "type": "object",
+          "required": [
+            "implementation",
+            "dataset_path",
+            "dataset_sha256",
+            "seed",
+            "pack_num",
+            "chunk_ratio",
+            "pack_len",
+            "is_binned"
+          ],
+          "properties": {
+            "implementation": {"const": "exps.dist_attn.benchmark.utils.DatasetSampler"},
+            "dataset_path": {"type": "string"},
+            "dataset_sha256": {"$ref": "#/$defs/sha256"},
+            "seed": {"const": 42},
+            "pack_num": {"const": 20},
+            "chunk_ratio": {"const": 0.25},
+            "pack_len": {"const": 196608},
+            "is_binned": {"const": true},
+            "drop_thres": {"const": -1}
+          }
+        },
+        "packs": {
+          "type": "array",
+          "minItems": 20,
+          "maxItems": 20,
+          "items": {"$ref": "#/$defs/pack"}
+        },
+        "packs_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "environment_file": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "run_id",
+        "mode",
+        "revision",
+        "image_id",
+        "worktree_clean",
+        "world_size",
+        "cp_size",
+        "gpu_count",
+        "gpu_capability",
+        "nvlink_all_pairs",
+        "native_backend",
+        "native_handle",
+        "num_rdma_ranks",
+        "native_buffers",
+        "calibration_id",
+        "calibration_target",
+        "hf_config_sha256",
+        "flash_mla_sm100_cubin",
+        "source_mode",
+        "build_manifest_path",
+        "build_manifest_sha256",
+        "installed_wheel"
+      ],
+      "properties": {
+        "schema_version": {"const": "magi-dsa-v4-balance/v1"},
+        "run_id": {"type": "string", "minLength": 1},
+        "mode": {"enum": ["calibration", "measure", "profile"]},
+        "revision": {"$ref": "#/$defs/git_revision"},
+        "image_id": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "worktree_clean": {"const": true},
+        "world_size": {"const": 8},
+        "cp_size": {"const": 8},
+        "global_tokens": {"const": 196608},
+        "target_tokens_per_rank": {"const": 24576},
+        "dtype": {"const": "torch.bfloat16"},
+        "kernel_backend": {"const": "kernel"},
+        "gpu_count": {"const": 8},
+        "gpu_capability": {
+          "type": "array",
+          "prefixItems": [{"const": 10}, {"const": 3}],
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "nvlink_all_pairs": {"const": true},
+        "native_backend": {"const": true},
+        "native_handle": {"const": "GrpCollIntraHandle"},
+        "num_rdma_ranks": {"const": 1},
+        "num_sms": {"const": 20},
+        "num_nvl_bytes": {"const": 1073741824},
+        "num_rdma_bytes": {"const": 0},
+        "native_buffers": {
+          "type": "array",
+          "minItems": 5,
+          "maxItems": 5,
+          "uniqueItems": true,
+          "items": {"type": "string"}
+        },
+        "calibration_id": {"$ref": "#/$defs/sha256"},
+        "calibration_target": {"type": "string"},
+        "hf_config_sha256": {
+          "const": "b628e63398a645abc711d92207f8737dd8140f7a4ef1e0a5b3616019e0ddd818"
+        },
+        "flash_mla_sm100_cubin": {
+          "type": "object",
+          "required": ["verified", "architecture", "tool", "objects"],
+          "properties": {
+            "verified": {"const": true},
+            "architecture": {"const": "sm_100"},
+            "tool": {"const": "cuobjdump --list-elf"},
+            "objects": {"type": "array", "minItems": 1}
+          }
+        },
+        "source_mode": {"const": "immutable_git_archive"},
+        "build_manifest_path": {"const": "/opt/magi-dsa-build-manifest.json"},
+        "build_manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "installed_wheel": {
+          "type": "object",
+          "required": [
+            "module_path",
+            "distribution_path",
+            "distribution_version",
+            "wheel_record_path",
+            "wheel_record_sha256",
+            "outside_source_checkout"
+          ],
+          "properties": {
+            "module_path": {"type": "string"},
+            "distribution_path": {"type": "string"},
+            "distribution_version": {"type": "string"},
+            "wheel_record_path": {"type": "string"},
+            "wheel_record_sha256": {"$ref": "#/$defs/sha256"},
+            "outside_source_checkout": {"const": true}
+          }
+        }
+      }
+    },
+    "raw_timing_record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "run_id",
+        "mode",
+        "case_id",
+        "ratio",
+        "policy",
+        "overlap_code",
+        "pack_index",
+        "pack_sha256",
+        "plan_sha256",
+        "iteration",
+        "rank",
+        "e2e_ms",
+        "indexer_ms",
+        "phases_ms",
+        "overlap_windows_ms",
+        "calibration_id",
+        "native_backend",
+        "finite",
+        "jit_cache_miss_delta"
+      ],
+      "properties": {
+        "schema_version": {"const": "magi-dsa-v4-balance/v1"},
+        "run_id": {"type": "string"},
+        "mode": {"enum": ["calibration", "measure", "profile"]},
+        "case_id": {"$ref": "#/$defs/case_id"},
+        "ratio": {"enum": [0, 4, 128]},
+        "policy": {"enum": ["sequential", "balanced"]},
+        "overlap_code": {"enum": ["00", "01", "10", "11"]},
+        "pack_index": {"type": "integer", "minimum": 0, "maximum": 19},
+        "pack_sha256": {"$ref": "#/$defs/sha256"},
+        "plan_sha256": {"$ref": "#/$defs/sha256"},
+        "iteration": {"type": "integer", "minimum": 0, "maximum": 9},
+        "rank": {"type": "integer", "minimum": 0, "maximum": 7},
+        "e2e_ms": {"type": "number", "minimum": 0},
+        "indexer_ms": {"type": "number", "minimum": 0},
+        "phases_ms": {
+          "type": "object",
+          "additionalProperties": {"type": "number", "minimum": 0}
+        },
+        "overlap_windows_ms": {
+          "type": "object",
+          "additionalProperties": {"type": "number", "minimum": 0}
+        },
+        "calibration_id": {"$ref": "#/$defs/sha256"},
+        "native_backend": {"const": true},
+        "finite": {"const": true},
+        "jit_cache_miss_delta": {"const": 0}
+      }
+    },
+    "plan_record": {
+      "type": "object",
+      "required": [
+        "case_id",
+        "pack_index",
+        "rank",
+        "plan_sha256",
+        "features",
+        "dsa_pack_cache_keys"
+      ],
+      "properties": {
+        "case_id": {"$ref": "#/$defs/case_id"},
+        "pack_index": {"type": "integer", "minimum": 0, "maximum": 19},
+        "rank": {"type": "integer", "minimum": 0, "maximum": 7},
+        "plan_sha256": {"$ref": "#/$defs/sha256"},
+        "features": {
+          "type": "object",
+          "required": [
+            "token_count",
+            "indexer_cost",
+            "fragment_count",
+            "window_transfer_rows",
+            "overlap_transfer_rows",
+            "compressed_owner_send_rows",
+            "compressed_remote_receive_rows"
+          ],
+          "additionalProperties": {"type": "number", "minimum": 0}
+        },
+        "dsa_pack_cache_keys": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["cache", "key", "architecture"],
+            "properties": {
+              "cache": {"type": "string"},
+              "key": {"type": "string", "minLength": 1},
+              "architecture": {
+                "type": "array",
+                "prefixItems": [{"const": 10}, {"const": 3}],
+                "minItems": 2,
+                "maxItems": 2
+              }
+            }
+          }
+        }
+      }
+    },
+    "correctness_record": {
+      "type": "object",
+      "required": [
+        "case_id",
+        "pack_index",
+        "pass",
+        "native_backend",
+        "method",
+        "rank_comparisons"
+      ],
+      "properties": {
+        "case_id": {"$ref": "#/$defs/case_id"},
+        "pack_index": {"type": "integer", "minimum": 0, "maximum": 19},
+        "pass": {"const": true},
+        "native_backend": {"const": true},
+        "digests": {"type": "object"},
+        "method": {
+          "const": "owner-local all_to_all_single to fixed contiguous 24576-row/rank global order, then chunked torch.testing.assert_close"
+        },
+        "rank_comparisons": {
+          "type": "array",
+          "minItems": 8,
+          "maxItems": 8,
+          "items": {"type": "object"}
+        }
+      }
+    },
+    "calibration_file": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "target",
+        "source_run_id",
+        "source_revision",
+        "source_image_id",
+        "weights",
+        "fits"
+      ],
+      "properties": {
+        "schema_version": {"const": 1},
+        "target": {"const": "b300-sm103"},
+        "source_run_id": {"type": "string"},
+        "source_revision": {"$ref": "#/$defs/git_revision"},
+        "source_image_id": {"type": "string"},
+        "weights": {
+          "type": "object",
+          "required": ["0", "4", "128"]
+        },
+        "fits": {"type": "object"}
+      }
+    },
+    "profile_overlap_file": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "revision",
+        "image_id",
+        "case_id",
+        "pack_index",
+        "slowest_rank",
+        "phases",
+        "all_required_overlaps_observed",
+        "nsys_report_sha256",
+        "nsys_sqlite_sha256"
+      ],
+      "properties": {
+        "schema_version": {"const": "magi-dsa-v4-balance/v1"},
+        "revision": {"$ref": "#/$defs/git_revision"},
+        "image_id": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "case_id": {"const": "r4-balanced-11"},
+        "pack_index": {"const": 0},
+        "slowest_rank": {"type": "integer", "minimum": 0, "maximum": 7},
+        "phases": {
+          "type": "object",
+          "minProperties": 2,
+          "maxProperties": 2
+        },
+        "all_required_overlaps_observed": {"const": true},
+        "nsys_report_sha256": {"$ref": "#/$defs/sha256"},
+        "nsys_sqlite_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    }
+  },
+  "oneOf": [
+    {"$ref": "#/$defs/packs_file"},
+    {"$ref": "#/$defs/environment_file"},
+    {"$ref": "#/$defs/raw_timing_record"},
+    {"$ref": "#/$defs/plan_record"},
+    {"$ref": "#/$defs/correctness_record"},
+    {"$ref": "#/$defs/calibration_file"},
+    {"$ref": "#/$defs/profile_overlap_file"}
+  ]
+}
