@@ -45,7 +45,13 @@ def wait_for(path: Path, timeout_seconds: float) -> None:
         time.sleep(0.02)
 
 
-def native_round(group: Any, rank: int, world_size: int) -> dict[str, Any]:
+def native_round(
+    group: Any,
+    rank: int,
+    world_size: int,
+    *,
+    launch_evidence: Path | None = None,
+) -> dict[str, Any]:
     import torch
 
     from magi_attention.comm.primitive.grpcoll._config import GrpCollConfig
@@ -92,6 +98,15 @@ def native_round(group: Any, rank: int, world_size: int) -> dict[str, Any]:
             device_map=mapping,
             async_op=True,
         )
+        if launch_evidence is not None:
+            write_json(
+                launch_evidence,
+                {
+                    "rank": rank,
+                    "pid": os.getpid(),
+                    "native_group_cast_launched_at": utc_now(),
+                },
+            )
         remote = cast_work.wait()
         handle = cast_work.native_handle_dict.get("group_cast")
         if not isinstance(handle, GrpCollIntraHandle):
@@ -251,12 +266,13 @@ def main(argv: list[str] | None = None) -> int:
 
     (args.coord_dir / f"armed.{args.rank}").touch()
     wait_for(args.coord_dir / "faulted.json", args.coord_timeout_seconds)
-    write_json(
-        args.coord_dir / f"entered.{args.rank}.json",
-        {"rank": args.rank, "pid": os.getpid(), "entered_at": utc_now()},
-    )
     try:
-        native_round(group, args.rank, args.world_size)
+        native_round(
+            group,
+            args.rank,
+            args.world_size,
+            launch_evidence=args.coord_dir / f"launched.{args.rank}.json",
+        )
     except BaseException as error:
         write_json(
             args.coord_dir / f"peer_error.{args.rank}.json",

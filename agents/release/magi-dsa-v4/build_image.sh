@@ -58,6 +58,7 @@ if [[ ! ${REVISION} =~ ^[0-9a-f]{40}$ ]]; then
   exit 1
 fi
 SOURCE_DATE_EPOCH=$(git -C "${REPO_ROOT}" show -s --format=%ct "${REVISION}")
+PACKAGE_VERSION="1.1.1+dsa.${REVISION:0:12}"
 TAG=${TAG:-"magi-dsa-v4-b300:${REVISION:0:12}"}
 if [[ -z ${OUTPUT_DIR} ]]; then
   RUN_STAMP=$(date -u +%Y%m%dT%H%M%SZ)
@@ -139,6 +140,7 @@ docker build \
   --pull=false \
   --progress=plain \
   --build-arg "MAGI_ATTENTION_REVISION=${REVISION}" \
+  --build-arg "MAGI_ATTENTION_PACKAGE_VERSION=${PACKAGE_VERSION}" \
   --build-arg "SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}" \
   --tag "${TAG}" \
   --file "${DOCKERFILE}" \
@@ -150,9 +152,14 @@ if [[ ! ${IMAGE_ID} =~ ^sha256:[0-9a-f]{64}$ ]]; then
   exit 1
 fi
 LABEL_REVISION=$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "${IMAGE_ID}")
+LABEL_VERSION=$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "${IMAGE_ID}")
 LABEL_BASE=$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.base.digest"}}' "${IMAGE_ID}")
 if [[ ${LABEL_REVISION} != "${REVISION}" ]]; then
   echo "image revision label mismatch: ${LABEL_REVISION} != ${REVISION}" >&2
+  exit 1
+fi
+if [[ ${LABEL_VERSION} != "${PACKAGE_VERSION}" ]]; then
+  echo "image package-version label mismatch: ${LABEL_VERSION} != ${PACKAGE_VERSION}" >&2
   exit 1
 fi
 if [[ ${LABEL_BASE} != "sha256:43c018d6a12963f1a1bad85ef8574b5c2a978eec2be0ebcacfb87f69e0d210e1" ]]; then
@@ -161,6 +168,7 @@ if [[ ${LABEL_BASE} != "sha256:43c018d6a12963f1a1bad85ef8574b5c2a978eec2be0ebcac
 fi
 
 printf '%s\n' "${IMAGE_ID}" > "${OUTPUT_DIR}/image_id.txt"
+printf '%s\n' "${PACKAGE_VERSION}" > "${OUTPUT_DIR}/package_version.txt"
 docker image inspect "${IMAGE_ID}" > "${OUTPUT_DIR}/image_inspect.json"
 
 # This smoke has no source bind mount.  It proves the wheel and native modules
@@ -169,13 +177,16 @@ docker run --rm \
   --gpus all \
   --ipc=host \
   --ulimit memlock=-1:-1 \
+  --ulimit stack=67108864 \
   --network host \
   --user "$(id -u):$(id -g)" \
-  --env HOME=/tmp/magi-dsa-home \
+  --env HOME=/tmp \
+  --env "USER=$(id -un)" \
+  --env "LOGNAME=$(id -un)" \
   --env "MAGI_DSA_IMAGE_ID=${IMAGE_ID}" \
   --workdir /tmp \
   "${IMAGE_ID}" \
-  python -c 'import pathlib,torch,magi_attention,nvidia.nvshmem; import magi_attention.magi_attn_comm; from magi_attention.api import MagiDSAConfig,MagiDSARuntimeMgr,calc_dsa; assert torch.cuda.device_count()==8; assert all(torch.cuda.get_device_capability(i)==(10,3) for i in range(8)); assert not pathlib.Path(magi_attention.__file__).resolve().is_relative_to(pathlib.Path("/opt/MagiAttention")); print("installed native wheel smoke: PASS")' \
+  python -c 'import os,pathlib,torch,magi_attention,nvidia.nvshmem; import magi_attention.magi_attn_comm; from magi_attention.api import MagiDSAConfig,MagiDSARuntimeMgr,calc_dsa; assert torch.cuda.device_count()==8; assert all(torch.cuda.get_device_capability(i)==(10,3) for i in range(8)); assert not pathlib.Path(magi_attention.__file__).resolve().is_relative_to(pathlib.Path("/opt/MagiAttention")); assert magi_attention.__version__ == os.environ["MAGI_ATTENTION_PACKAGE_VERSION"]; print(f"installed native wheel smoke: PASS ({magi_attention.__version__})")' \
   > "${OUTPUT_DIR}/installed-wheel-smoke.log" 2>&1
 
 if ((RUN_FINAL_MATRIX)); then
@@ -185,9 +196,12 @@ if ((RUN_FINAL_MATRIX)); then
     --gpus all \
     --ipc=host \
     --ulimit memlock=-1:-1 \
+    --ulimit stack=67108864 \
     --network host \
     --user "$(id -u):$(id -g)" \
-    --env HOME=/tmp/magi-dsa-home \
+    --env HOME=/tmp \
+    --env "USER=$(id -un)" \
+    --env "LOGNAME=$(id -un)" \
     --env "MAGI_DSA_IMAGE_ID=${IMAGE_ID}" \
     --env "MAGI_DSA_EXPECTED_REVISION=${REVISION}" \
     --volume "${MATRIX_OUTPUT}:/artifacts" \

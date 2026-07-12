@@ -337,15 +337,17 @@ def run_fault_phase(args: argparse.Namespace, run_id: str) -> dict[str, Any]:
         if first_failure is None:
             raise TimeoutError("no rank failure was observed before the 60-second deadline")
 
-        # The fault rank exits only after all seven peers have armed.  Give those
-        # peers a bounded window to record entry into the poisoned native round.
-        entered_deadline = min(fault_deadline, time.monotonic() + 5.0)
+        # Each marker is written only after start_dsa_group_cast returned an
+        # async native work object, immediately before the peer waits on it.
+        # This proves the launcher is reclaiming actually launched poisoned
+        # collectives rather than merely killing workers at a pre-call barrier.
+        launched_deadline = min(fault_deadline, time.monotonic() + 5.0)
         while (
-            len(list(coord_dir.glob("entered.*.json"))) < args.world_size - 1
-            and time.monotonic() < entered_deadline
+            len(list(coord_dir.glob("launched.*.json"))) < args.world_size - 1
+            and time.monotonic() < launched_deadline
         ):
             time.sleep(0.02)
-        entered_paths = list(coord_dir.glob("entered.*.json"))
+        launched_paths = list(coord_dir.glob("launched.*.json"))
         terminate_all(
             records,
             grace_seconds=args.term_grace_seconds,
@@ -362,9 +364,9 @@ def run_fault_phase(args: argparse.Namespace, run_id: str) -> dict[str, Any]:
                 f"fault rank returned {return_codes.get(args.fault_rank)}, "
                 f"expected {EXPECTED_FAULT_EXIT}"
             )
-        if len(entered_paths) != args.world_size - 1:
+        if len(launched_paths) != args.world_size - 1:
             violations.append(
-                f"only {len(entered_paths)}/{args.world_size - 1} peers entered "
+                f"only {len(launched_paths)}/{args.world_size - 1} peers launched "
                 "the poisoned native round"
             )
         if alive(records):
@@ -389,7 +391,8 @@ def run_fault_phase(args: argparse.Namespace, run_id: str) -> dict[str, Any]:
             "first_failure": first_failure,
             "reclaimed_seconds": round(reclaimed_seconds, 6),
             "deadline_seconds": args.fault_timeout_seconds,
-            "entered_peer_count": len(entered_paths),
+            "launched_peer_count": len(launched_paths),
+            "launch_evidence": [load_json(path) for path in launched_paths],
             "ready_evidence": ready_evidence,
             "return_codes": return_codes,
             "survivors": survivors,

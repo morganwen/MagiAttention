@@ -5,6 +5,7 @@
 FROM nvcr.io/nvidia/pytorch:26.06-py3@sha256:43c018d6a12963f1a1bad85ef8574b5c2a978eec2be0ebcacfb87f69e0d210e1
 
 ARG MAGI_ATTENTION_REVISION
+ARG MAGI_ATTENTION_PACKAGE_VERSION
 ARG SOURCE_DATE_EPOCH=0
 ARG FAST_HADAMARD_COMMIT=e7706faf8d1c3b9f241e36860640ad1dac644ede
 ARG CUDNN_FRONTEND_COMMIT=f00538322e9d3d439fe8c5f3144644e58ee66823
@@ -14,6 +15,7 @@ ARG BASE_IMAGE_DIGEST=sha256:43c018d6a12963f1a1bad85ef8574b5c2a978eec2be0ebcacfb
 
 LABEL org.opencontainers.image.title="MagiAttention DSA V4 B300 native acceptance" \
       org.opencontainers.image.revision="${MAGI_ATTENTION_REVISION}" \
+      org.opencontainers.image.version="${MAGI_ATTENTION_PACKAGE_VERSION}" \
       org.opencontainers.image.base.digest="${BASE_IMAGE_DIGEST}" \
       io.sandai.magi-dsa.fast-hadamard-transform.revision="${FAST_HADAMARD_COMMIT}" \
       io.sandai.magi-dsa.cudnn-frontend.revision="${CUDNN_FRONTEND_COMMIT}" \
@@ -32,6 +34,7 @@ ENV SHELL=/bin/bash \
     MAGI_DSA_REPO_ROOT=/opt/MagiAttention \
     MAGI_DSA_MEGATRON_PATH=/opt/megatron-lm \
     MAGI_DSA_SOURCE_REVISION=${MAGI_ATTENTION_REVISION} \
+    MAGI_ATTENTION_PACKAGE_VERSION=${MAGI_ATTENTION_PACKAGE_VERSION} \
     MAGI_DSA_BASE_IMAGE_DIGEST=${BASE_IMAGE_DIGEST} \
     MAGI_DSA_FAST_HADAMARD_COMMIT=${FAST_HADAMARD_COMMIT} \
     MAGI_DSA_CUDNN_FRONTEND_COMMIT=${CUDNN_FRONTEND_COMMIT} \
@@ -43,6 +46,7 @@ ENV SHELL=/bin/bash \
 # deliberately compiles magi_attn_comm with DISABLE_NVSHMEM, which is forbidden
 # for this image.
 RUN test -n "${MAGI_ATTENTION_REVISION}" && \
+    test -n "${MAGI_ATTENTION_PACKAGE_VERSION}" && \
     python -m pip install --no-cache-dir \
       nvidia-nvshmem-cu13==3.6.5 && \
     python -c 'import nvidia.nvshmem; print(nvidia.nvshmem.__file__)'
@@ -98,7 +102,9 @@ WORKDIR /opt/MagiAttention
 RUN test ! -e .git && \
     test -f .magi-source-revision && \
     test "$(cat .magi-source-revision)" = "${MAGI_ATTENTION_REVISION}" && \
-    test -s .magi-submodules
+    test -s .magi-submodules && \
+    printf "__version__ = '%s'\n" "${MAGI_ATTENTION_PACKAGE_VERSION}" \
+      > magi_attention/_version.py
 
 RUN rm -rf /opt/magi-wheels /opt/MagiAttention/build /opt/MagiAttention/dist && \
     mkdir -p /opt/magi-wheels && \
@@ -111,6 +117,7 @@ RUN { python -m pip uninstall -y magi_attention || true; } && \
     python -m pip install --no-deps --no-cache-dir /opt/magi-wheels/magi_attention-*.whl && \
     cd /tmp && \
     python -c 'import pathlib, magi_attention; p=pathlib.Path(magi_attention.__file__).resolve(); assert not p.is_relative_to(pathlib.Path("/opt/MagiAttention")); print(p)' && \
+    python -c 'import os, importlib.metadata, magi_attention; expected=os.environ["MAGI_ATTENTION_PACKAGE_VERSION"]; assert importlib.metadata.version("magi_attention") == expected; assert magi_attention.__version__ == expected; print(expected)' && \
     python -c 'from magi_attention.api import DsaOverlapConfig,DsaPackedMeta,MagiDSAConfig,MagiDSAInput,MagiDSARuntimeMgr,MagiDSAYarnConfig,calc_dsa' && \
     python -c 'import nvidia.nvshmem; import magi_attention.magi_attn_ext; import magi_attention.magi_attn_comm' && \
     python -m pip check
@@ -131,6 +138,7 @@ RUN python -m pip freeze --all | LC_ALL=C sort > /opt/magi-dsa-pip-freeze.txt &&
 RUN python - <<'PY'
 import hashlib
 import importlib
+import importlib.metadata
 import json
 import os
 from pathlib import Path
@@ -169,6 +177,11 @@ manifest = {
         "nvidia_cutlass_dsl": "4.5.2",
         "pytest": "8.4.1",
     },
+    "magi_attention_package_version": os.environ["MAGI_ATTENTION_PACKAGE_VERSION"],
+    "magi_attention_runtime_version": importlib.import_module(
+        "magi_attention"
+    ).__version__,
+    "magi_attention_wheel_version": importlib.metadata.version("magi_attention"),
     "submodules": submodules,
     "build": {
         "compute_capability": "100",
@@ -192,6 +205,9 @@ from pathlib import Path
 manifest = json.loads(Path("/opt/magi-dsa-build-manifest.json").read_text())
 assert manifest["build"]["nvshmem_disabled"] is False
 assert manifest["magi_attention_revision"] == os.environ["MAGI_DSA_SOURCE_REVISION"]
+assert manifest["magi_attention_package_version"] == os.environ["MAGI_ATTENTION_PACKAGE_VERSION"]
+assert manifest["magi_attention_runtime_version"] == manifest["magi_attention_package_version"]
+assert manifest["magi_attention_wheel_version"] == manifest["magi_attention_package_version"]
 assert manifest["submodules"]["magi_attention/csrc/cutlass"] == "81a43e6d92cdd8c20d22392f9579604ed5f710a1"
 assert manifest["submodules"]["magi_attention/functional/flash-attention"] == "ee1d15159cda6f3f97bfab9e487da146a8254970"
 PY

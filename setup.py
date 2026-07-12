@@ -37,6 +37,7 @@ with open("./README.md", "r", encoding="utf-8") as fh:
 # Note: ninja build requires include_dirs to be absolute paths
 project_root = os.path.dirname(os.path.abspath(__file__))
 PACKAGE_NAME = "magi_attention"
+PACKAGE_VERSION = os.getenv("MAGI_ATTENTION_PACKAGE_VERSION")
 exe_extension = sysconfig.get_config_var("EXE")
 USER_HOME = os.getenv("MAGI_ATTENTION_HOME")
 
@@ -840,6 +841,7 @@ cmdclass = {"bdist_wheel": _bdist_wheel, "build_ext": MagiAttnBuildExtension}
 # setup
 setup(
     name=PACKAGE_NAME,
+    **({"version": PACKAGE_VERSION} if PACKAGE_VERSION else {}),
     packages=find_namespace_packages(
         exclude=(
             "build",
