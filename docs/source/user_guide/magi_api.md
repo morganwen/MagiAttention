@@ -8,6 +8,23 @@
 :local: true
 ```
 
+## Magi DSA
+
+Magi DSA is exposed from the stable `magi_attention.api` namespace. See the
+[Magi DSA user guide](./magi_dsa.md) for its runnable CP=1 example and the
+CP=8 input, gradient, checkpoint, native-collective, and failure contracts.
+
+```{eval-rst}
+.. currentmodule:: magi_attention.api
+
+.. autoclass:: MagiDSAConfig
+.. autoclass:: DsaPackedMeta
+.. autoclass:: MagiDSAInput
+.. autoclass:: DsaOverlapConfig
+.. autoclass:: MagiDSARuntimeMgr
+.. autofunction:: calc_dsa
+```
+
 ## Flexible Flash Attention
 
 To support computing irregular-shaped masks, we implemented a `flexible_flash_attention` kernel, which can be invoked through the following interface.
