@@ -123,6 +123,10 @@ RUN { python -m pip uninstall -y magi_attention || true; } && \
     python -c 'import nvidia.nvshmem; import magi_attention.magi_attn_ext; import magi_attention.magi_attn_comm' && \
     python -m pip check
 
+# Every remaining Python import must resolve the installed wheel.  Persisting
+# this workdir avoids source shadowing across Docker RUN layer boundaries.
+WORKDIR /tmp
+
 RUN python -m pip freeze --all | LC_ALL=C sort > /opt/magi-dsa-pip-freeze.txt && \
     MAGI_EXT_SO=$(python -c 'import pathlib,magi_attention.magi_attn_ext as m; print(pathlib.Path(m.__file__).resolve())') && \
     MAGI_COMM_SO=$(python -c 'import pathlib,magi_attention.magi_attn_comm as m; print(pathlib.Path(m.__file__).resolve())') && \
