@@ -86,6 +86,7 @@ RUN git clone --branch nv_dev https://github.com/deepseek-ai/FlashMLA.git && \
     CXXFLAGS="-I/usr/local/cuda/include/cccl" \
       python -m pip install --no-build-isolation --no-cache-dir . && \
     git rev-parse HEAD > /opt/flashmla.commit && \
+    cd /tmp && \
     python -c 'from flash_mla import flash_mla_sparse_fwd; assert flash_mla_sparse_fwd is not None'
 
 # The fixed Megatron checkout is baked into the image solely as the parity

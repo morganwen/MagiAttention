@@ -306,7 +306,15 @@ def topology_is_all_nvlink(topology: str, gpu_count: int, prefix: str) -> bool:
 def git_revision(path: Path) -> str:
     try:
         return subprocess.check_output(
-            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            [
+                "git",
+                "-c",
+                f"safe.directory={path}",
+                "-C",
+                str(path),
+                "rev-parse",
+                "HEAD",
+            ],
             text=True,
             stderr=subprocess.STDOUT,
         ).strip()
