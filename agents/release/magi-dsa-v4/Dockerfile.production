@@ -1,0 +1,202 @@
+# syntax=docker/dockerfile:1.7
+
+# The base is content-addressed.  All project/dependency revisions below are
+# repeated as OCI labels and in /opt/magi-dsa-build-manifest.json.
+FROM nvcr.io/nvidia/pytorch:26.06-py3@sha256:43c018d6a12963f1a1bad85ef8574b5c2a978eec2be0ebcacfb87f69e0d210e1
+
+ARG MAGI_ATTENTION_REVISION
+ARG SOURCE_DATE_EPOCH=0
+ARG FAST_HADAMARD_COMMIT=e7706faf8d1c3b9f241e36860640ad1dac644ede
+ARG CUDNN_FRONTEND_COMMIT=f00538322e9d3d439fe8c5f3144644e58ee66823
+ARG FLASHMLA_COMMIT=b7643bd54521f563b839b98289b5cd048c062ba2
+ARG MEGATRON_COMMIT=c6449f0b23be397449f21c0967c5fc90785e55ea
+ARG BASE_IMAGE_DIGEST=sha256:43c018d6a12963f1a1bad85ef8574b5c2a978eec2be0ebcacfb87f69e0d210e1
+
+LABEL org.opencontainers.image.title="MagiAttention DSA V4 B300 native acceptance" \
+      org.opencontainers.image.revision="${MAGI_ATTENTION_REVISION}" \
+      org.opencontainers.image.base.digest="${BASE_IMAGE_DIGEST}" \
+      io.sandai.magi-dsa.fast-hadamard-transform.revision="${FAST_HADAMARD_COMMIT}" \
+      io.sandai.magi-dsa.cudnn-frontend.revision="${CUDNN_FRONTEND_COMMIT}" \
+      io.sandai.magi-dsa.flashmla.revision="${FLASHMLA_COMMIT}" \
+      io.sandai.magi-dsa.megatron.revision="${MEGATRON_COMMIT}" \
+      io.sandai.magi-dsa.nvshmem.version="3.6.5" \
+      io.sandai.magi-dsa.cuda-arch="sm_100-family-on-sm_103"
+
+ENV SHELL=/bin/bash \
+    PYTHONUNBUFFERED=1 \
+    PYTHONNOUSERSITE=1 \
+    MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY=100 \
+    MAGI_ATTENTION_PREBUILD_FFA=0 \
+    MAX_JOBS=16 \
+    NVCC_THREADS=16 \
+    MAGI_DSA_REPO_ROOT=/opt/MagiAttention \
+    MAGI_DSA_MEGATRON_PATH=/opt/megatron-lm \
+    MAGI_DSA_SOURCE_REVISION=${MAGI_ATTENTION_REVISION} \
+    MAGI_DSA_BASE_IMAGE_DIGEST=${BASE_IMAGE_DIGEST} \
+    MAGI_DSA_FAST_HADAMARD_COMMIT=${FAST_HADAMARD_COMMIT} \
+    MAGI_DSA_CUDNN_FRONTEND_COMMIT=${CUDNN_FRONTEND_COMMIT} \
+    MAGI_DSA_FLASHMLA_COMMIT=${FLASHMLA_COMMIT} \
+    MAGI_DSA_MEGATRON_COMMIT=${MEGATRON_COMMIT} \
+    SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
+
+# NVSHMEM is installed before the MagiAttention wheel.  setup.py otherwise
+# deliberately compiles magi_attn_comm with DISABLE_NVSHMEM, which is forbidden
+# for this image.
+RUN test -n "${MAGI_ATTENTION_REVISION}" && \
+    python -m pip install --no-cache-dir \
+      nvidia-nvshmem-cu13==3.6.5 && \
+    python -c 'import nvidia.nvshmem; print(nvidia.nvshmem.__file__)'
+
+RUN python -m pip install --no-cache-dir \
+      apache-tvm-ffi==0.1.8.post0 \
+      quack-kernels==0.4.1 \
+      nvidia-cutlass-dsl==4.5.2 \
+      cuda-python==13.2.0 \
+      numpy==2.1.0 \
+      expecttest==0.3.0 \
+      hypothesis==6.156.6 \
+      pybind11==3.0.4 \
+      pytest==8.4.1 \
+      ruff==0.12.5
+
+WORKDIR /opt
+RUN git clone https://github.com/Dao-AILab/fast-hadamard-transform.git && \
+    cd fast-hadamard-transform && \
+    git checkout --detach "${FAST_HADAMARD_COMMIT}" && \
+    test "$(git rev-parse HEAD)" = "${FAST_HADAMARD_COMMIT}" && \
+    TORCH_CUDA_ARCH_LIST=10.3 \
+      python -m pip install --no-build-isolation --no-cache-dir .
+
+RUN CMAKE_PREFIX_PATH="$(python -m pybind11 --cmakedir)" \
+      python -m pip install --no-deps --no-build-isolation --no-cache-dir \
+      "git+https://github.com/NVIDIA/cudnn-frontend.git@${CUDNN_FRONTEND_COMMIT}" && \
+    python -c 'from cudnn import DSA; assert DSA.sparse_attention_backward_wrapper is not None'
+
+RUN git clone --branch nv_dev https://github.com/deepseek-ai/FlashMLA.git && \
+    cd FlashMLA && \
+    git checkout --detach "${FLASHMLA_COMMIT}" && \
+    git submodule update --init --recursive && \
+    test "$(git rev-parse HEAD)" = "${FLASHMLA_COMMIT}" && \
+    FLASH_MLA_DISABLE_SM90=1 \
+    CFLAGS="-I/usr/local/cuda/include/cccl" \
+    CXXFLAGS="-I/usr/local/cuda/include/cccl" \
+      python -m pip install --no-build-isolation --no-cache-dir . && \
+    git rev-parse HEAD > /opt/flashmla.commit && \
+    python -c 'from flash_mla import flash_mla_sparse_fwd; assert flash_mla_sparse_fwd is not None'
+
+# The fixed Megatron checkout is baked into the image solely as the parity
+# oracle.  The final matrix never relies on a host source mount.
+RUN git clone https://github.com/NVIDIA/Megatron-LM.git /opt/megatron-lm && \
+    cd /opt/megatron-lm && \
+    git checkout --detach "${MEGATRON_COMMIT}" && \
+    test "$(git rev-parse HEAD)" = "${MEGATRON_COMMIT}"
+
+# build_image.sh supplies a Git-archive context plus exact submodule archives;
+# no .git directory, ignored .so, build cache, or dirty worktree file can enter.
+COPY . /opt/MagiAttention
+WORKDIR /opt/MagiAttention
+RUN test ! -e .git && \
+    test -f .magi-source-revision && \
+    test "$(cat .magi-source-revision)" = "${MAGI_ATTENTION_REVISION}" && \
+    test -s .magi-submodules
+
+RUN rm -rf /opt/magi-wheels /opt/MagiAttention/build /opt/MagiAttention/dist && \
+    mkdir -p /opt/magi-wheels && \
+    python -m pip wheel \
+      --no-deps --no-build-isolation --no-cache-dir \
+      --wheel-dir /opt/magi-wheels /opt/MagiAttention && \
+    test "$(find /opt/magi-wheels -maxdepth 1 -name 'magi_attention-*.whl' | wc -l)" -eq 1
+
+RUN { python -m pip uninstall -y magi_attention || true; } && \
+    python -m pip install --no-deps --no-cache-dir /opt/magi-wheels/magi_attention-*.whl && \
+    cd /tmp && \
+    python -c 'import pathlib, magi_attention; p=pathlib.Path(magi_attention.__file__).resolve(); assert not p.is_relative_to(pathlib.Path("/opt/MagiAttention")); print(p)' && \
+    python -c 'from magi_attention.api import DsaOverlapConfig,DsaPackedMeta,MagiDSAConfig,MagiDSAInput,MagiDSARuntimeMgr,MagiDSAYarnConfig,calc_dsa' && \
+    python -c 'import nvidia.nvshmem; import magi_attention.magi_attn_ext; import magi_attention.magi_attn_comm' && \
+    python -m pip check
+
+RUN python -m pip freeze --all | LC_ALL=C sort > /opt/magi-dsa-pip-freeze.txt && \
+    MAGI_EXT_SO=$(python -c 'import pathlib,magi_attention.magi_attn_ext as m; print(pathlib.Path(m.__file__).resolve())') && \
+    MAGI_COMM_SO=$(python -c 'import pathlib,magi_attention.magi_attn_comm as m; print(pathlib.Path(m.__file__).resolve())') && \
+    FLASH_MLA_SO=$(python -c 'import pathlib,flash_mla; candidates=sorted(pathlib.Path(flash_mla.__file__).resolve().parent.rglob("*.so")); assert candidates; print(candidates[0])') && \
+    { \
+      for library in "${MAGI_EXT_SO}" "${MAGI_COMM_SO}" "${FLASH_MLA_SO}"; do \
+          echo "### ${library}"; \
+          cuobjdump --list-elf "${library}"; \
+      done; \
+    } > /opt/magi-dsa-cuobjdump.txt && \
+    grep -q 'sm_100' /opt/magi-dsa-cuobjdump.txt && \
+    ! grep -q 'sm_90' /opt/magi-dsa-cuobjdump.txt
+
+RUN python - <<'PY'
+import hashlib
+import importlib
+import json
+import os
+from pathlib import Path
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+submodules = {}
+for line in Path("/opt/MagiAttention/.magi-submodules").read_text().splitlines():
+    revision, path = line.split("  ", 1)
+    submodules[path] = revision
+
+artifact_paths = [
+    next(Path("/opt/magi-wheels").glob("magi_attention-*.whl")),
+    Path(importlib.import_module("magi_attention.magi_attn_ext").__file__).resolve(),
+    Path(importlib.import_module("magi_attention.magi_attn_comm").__file__).resolve(),
+    Path("/opt/magi-dsa-pip-freeze.txt"),
+    Path("/opt/magi-dsa-cuobjdump.txt"),
+]
+manifest = {
+    "schema_version": 1,
+    "magi_attention_revision": os.environ["MAGI_DSA_SOURCE_REVISION"],
+    "base_image_digest": os.environ["MAGI_DSA_BASE_IMAGE_DIGEST"],
+    "dependency_commits": {
+        "fast_hadamard_transform": os.environ["MAGI_DSA_FAST_HADAMARD_COMMIT"],
+        "cudnn_frontend": os.environ["MAGI_DSA_CUDNN_FRONTEND_COMMIT"],
+        "flashmla": os.environ["MAGI_DSA_FLASHMLA_COMMIT"],
+        "megatron": os.environ["MAGI_DSA_MEGATRON_COMMIT"],
+    },
+    "dependency_versions": {
+        "nvidia_nvshmem_cu13": "3.6.5",
+        "nvidia_cutlass_dsl": "4.5.2",
+        "pytest": "8.4.1",
+    },
+    "submodules": submodules,
+    "build": {
+        "compute_capability": "100",
+        "target_runtime_capability": "103",
+        "source_date_epoch": os.environ["SOURCE_DATE_EPOCH"],
+        "nvshmem_disabled": False,
+    },
+    "artifacts": {str(path): sha256(path) for path in artifact_paths},
+}
+Path("/opt/magi-dsa-build-manifest.json").write_text(
+    json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+)
+PY
+
+RUN cd /tmp && \
+    python - <<'PY'
+import json
+import os
+from pathlib import Path
+
+manifest = json.loads(Path("/opt/magi-dsa-build-manifest.json").read_text())
+assert manifest["build"]["nvshmem_disabled"] is False
+assert manifest["magi_attention_revision"] == os.environ["MAGI_DSA_SOURCE_REVISION"]
+assert manifest["submodules"]["magi_attention/csrc/cutlass"] == "81a43e6d92cdd8c20d22392f9579604ed5f710a1"
+assert manifest["submodules"]["magi_attention/functional/flash-attention"] == "ee1d15159cda6f3f97bfab9e487da146a8254970"
+PY
+
+WORKDIR /opt/magi-runtime
+RUN mkdir -p /opt/magi-runtime
+
+CMD ["/bin/bash"]

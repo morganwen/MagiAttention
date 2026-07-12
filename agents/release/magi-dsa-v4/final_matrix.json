@@ -1,0 +1,164 @@
+{
+  "schema_version": 1,
+  "name": "magi-dsa-v4-b300-final",
+  "description": "Ordered installed-wheel acceptance matrix for one 8xB300 CP=8 native group.",
+  "requirements": {
+    "gpu_count": 8,
+    "gpu_name_contains": "B300",
+    "compute_capability": [10, 3],
+    "all_gpu_links_prefix": "NV",
+    "nvshmem_symmetric_size": "unset",
+    "forbid_source_bind": true,
+    "build_manifest": "/opt/magi-dsa-build-manifest.json",
+    "base_image_digest": "sha256:43c018d6a12963f1a1bad85ef8574b5c2a978eec2be0ebcacfb87f69e0d210e1",
+    "megatron_revision": "c6449f0b23be397449f21c0967c5fc90785e55ea",
+    "submodules": {
+      "magi_attention/csrc/cutlass": "81a43e6d92cdd8c20d22392f9579604ed5f710a1",
+      "magi_attention/functional/flash-attention": "ee1d15159cda6f3f97bfab9e487da146a8254970"
+    },
+    "dependency_commits": {
+      "fast_hadamard_transform": "e7706faf8d1c3b9f241e36860640ad1dac644ede",
+      "cudnn_frontend": "f00538322e9d3d439fe8c5f3144644e58ee66823",
+      "flashmla": "b7643bd54521f563b839b98289b5cd048c062ba2"
+    },
+    "dependency_versions": {
+      "nvidia_nvshmem_cu13": "3.6.5",
+      "nvidia_cutlass_dsl": "4.5.2",
+      "pytest": "8.4.1"
+    }
+  },
+  "sha256_checks": [
+    {
+      "path": "{repo_root}/exps/dist_attn/benchmark/datasets/default/doc_length_distribution.csv",
+      "sha256": "67fe5f333fa3775ba547319e897b3781fda74ff5e19f3a38dc042a2f10414593"
+    }
+  ],
+  "cases": [
+    {
+      "id": "installed_public_api_smoke",
+      "description": "Import and execute the public DSA API from the installed wheel outside the source checkout.",
+      "command": [
+        "{python}",
+        "{repo_root}/tests/test_dsa/installed_package_smoke.py",
+        "--cuda"
+      ],
+      "cwd": "/tmp",
+      "timeout_seconds": 300,
+      "expected_exit_codes": [0],
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "0",
+        "PYTHONNOUSERSITE": "1"
+      }
+    },
+    {
+      "id": "cp1_oracle",
+      "description": "CP=1 API, solver, packing kernels and frozen Megatron compressor oracle.",
+      "command": [
+        "{python}",
+        "-m",
+        "pytest",
+        "-q",
+        "-rs",
+        "-p",
+        "no:cacheprovider",
+        "--import-mode=importlib",
+        "{repo_root}/tests/test_dsa/test_dsa_api.py",
+        "{repo_root}/tests/test_dsa/test_dsa_dispatch.py",
+        "{repo_root}/tests/test_dsa/test_dsa_solver.py",
+        "{repo_root}/tests/test_dsa/test_dsa_pack_kernel.py",
+        "{repo_root}/tests/test_dsa/test_dsa_megatron.py"
+      ],
+      "cwd": "/tmp",
+      "timeout_seconds": 1800,
+      "junit": true,
+      "min_tests": 80,
+      "expected_exit_codes": [0],
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "0",
+        "MAGI_DSA_MEGATRON_PATH": "{megatron_path}",
+        "PYTHONNOUSERSITE": "1"
+      }
+    },
+    {
+      "id": "cp8_native_contract",
+      "description": "Ordered native world_size=cp_size=8 nodes covering transport, abort/drain, ratios, policies, gradients, overlap, concurrency, empty ranks and recoverable failures.",
+      "command": [
+        "{python}",
+        "-m",
+        "pytest",
+        "-q",
+        "-rs",
+        "-p",
+        "no:cacheprovider",
+        "--import-mode=importlib",
+        "{repo_root}/tests/test_dsa/test_dsa_cp.py::TestDsaCommMetadata::test_work_tracker_early_exit_drains_nested_scopes_independently",
+        "{repo_root}/tests/test_dsa/test_dsa_cp.py::TestDsaCommMetadata::test_work_tracker_drains_on_exception_and_recovers_for_next_scope",
+        "{repo_root}/tests/test_dsa/test_dsa_cp.py::TestDsaCommMetadata::test_work_tracker_aborts_after_collective_wait_failure",
+        "{repo_root}/tests/test_dsa/test_dsa_cp.py::TestDsaCommMetadata::test_work_tracker_aborts_after_rank_local_compute_failure",
+        "{repo_root}/tests/test_dsa/test_dsa_cp.py::TestDsaCommTransport::test_native_grpcoll_matches_reference_semantics",
+        "{repo_root}/tests/test_dsa/test_dsa_cp.py::TestDsaCommTransport::test_native_grpcoll_zero_length_routes_are_symmetric",
+        "{repo_root}/tests/test_dsa/test_dsa_cp.py::TestDsaCommTransport::test_native_grpcoll_full_reference_backward_matches_cp1",
+        "{repo_root}/tests/test_dsa/test_dsa_cp.py::TestDsaCommTransport::test_native_grpcoll_full_kernel_backward_matches_cp1",
+        "{repo_root}/tests/test_dsa/test_dsa_cp.py::TestDsaCommTransport::test_cp8_ratio4_reference_overlap_matrix_matches_cp1",
+        "{repo_root}/tests/test_dsa/test_dsa_cp.py::TestDsaCommTransport::test_cp8_coordinated_forward_exception_drains_real_collectives",
+        "{repo_root}/tests/test_dsa/test_dsa_cp.py::TestDsaCommTransport::test_native_grpcoll_two_inflight_reentrant_backward_is_isolated",
+        "{repo_root}/tests/test_dsa/test_dsa_cp.py::TestDsaCommTransport::test_cp8_retain_graph_backward_is_repeatable",
+        "{repo_root}/tests/test_dsa/test_dsa_cp.py::TestDsaCommTransport::test_cp8_full_reference_empty_rank_matches_cp1",
+        "{repo_root}/tests/test_dsa/test_dsa_cp.py::TestDsaCommTransport::test_cp8_short_sample_without_blocks_has_zero_differentiable_kl",
+        "{repo_root}/tests/test_dsa/test_dsa_cp.py::TestDsaCommTransport::test_cp8_full_reference_forward_matches_cp1",
+        "{repo_root}/tests/test_dsa/test_dsa_cp.py::TestDsaCommTransport::test_cp8_full_kernel_forward_matches_cp1",
+        "{repo_root}/tests/test_dsa/test_dsa_cp.py::TestDsaCommTransport::test_cp8_full_reference_backward_matches_cp1",
+        "{repo_root}/tests/test_dsa/test_dsa_cp.py::TestDsaCommTransport::test_cp8_full_kernel_backward_matches_cp1"
+      ],
+      "cwd": "/tmp",
+      "timeout_seconds": 10800,
+      "junit": true,
+      "min_tests": 18,
+      "expected_exit_codes": [0],
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
+        "MAGI_ATTENTION_NATIVE_GRPCOLL": "1",
+        "MAGI_DSA_RUN_FINAL_NATIVE_MATRIX": "1",
+        "PYTHONNOUSERSITE": "1"
+      },
+      "unset_env": [
+        "NVSHMEM_SYMMETRIC_SIZE"
+      ]
+    },
+    {
+      "id": "isolated_single_rank_fail_stop",
+      "description": "Inject one rank failure after a healthy native round, reclaim all workers within 60 seconds, then use a fresh process group for native health.",
+      "command": [
+        "{python}",
+        "{release_dir}/fault_supervisor.py",
+        "--worker",
+        "{release_dir}/fault_worker.py",
+        "--output-dir",
+        "{case_dir}/fault",
+        "--world-size",
+        "8",
+        "--fault-rank",
+        "3",
+        "--fault-timeout-seconds",
+        "60",
+        "--term-grace-seconds",
+        "5",
+        "--initialization-timeout-seconds",
+        "600",
+        "--health-timeout-seconds",
+        "600"
+      ],
+      "cwd": "/tmp",
+      "timeout_seconds": 1500,
+      "expected_exit_codes": [0],
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
+        "MAGI_ATTENTION_NATIVE_GRPCOLL": "1",
+        "PYTHONNOUSERSITE": "1"
+      },
+      "unset_env": [
+        "NVSHMEM_SYMMETRIC_SIZE"
+      ]
+    }
+  ]
+}
