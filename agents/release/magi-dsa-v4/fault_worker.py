@@ -98,21 +98,22 @@ def native_round(
             device_map=mapping,
             async_op=True,
         )
+        handle = cast_work.native_handle_dict.get("group_cast")
+        if not isinstance(handle, GrpCollIntraHandle):
+            raise RuntimeError(
+                f"native backend did not produce GrpCollIntraHandle: {type(handle)!r}"
+            )
         if launch_evidence is not None:
             write_json(
                 launch_evidence,
                 {
                     "rank": rank,
                     "pid": os.getpid(),
+                    "handle_type": type(handle).__name__,
                     "native_group_cast_launched_at": utc_now(),
                 },
             )
         remote = cast_work.wait()
-        handle = cast_work.native_handle_dict.get("group_cast")
-        if not isinstance(handle, GrpCollIntraHandle):
-            raise RuntimeError(
-                f"native backend did not produce GrpCollIntraHandle: {type(handle)!r}"
-            )
         remote_gradient = DsaTypedPayload(
             DsaPayloadKind.COMPRESSED_KV,
             torch.ones_like(remote.tensor, dtype=torch.float32),

@@ -353,6 +353,9 @@ def run_fault_phase(args: argparse.Namespace, run_id: str) -> dict[str, Any]:
             grace_seconds=args.term_grace_seconds,
             deadline=fault_deadline,
         )
+        launch_evidence = [load_json(path) for path in launched_paths]
+        unexpected_paths = list(coord_dir.glob("unexpected_completion.*.json"))
+        unexpected_evidence = [load_json(path) for path in unexpected_paths]
         reclaimed_seconds = time.monotonic() - trigger_monotonic
         survivors = scan_run_id_survivors(run_id)
         return_codes = {
@@ -369,6 +372,17 @@ def run_fault_phase(args: argparse.Namespace, run_id: str) -> dict[str, Any]:
                 f"only {len(launched_paths)}/{args.world_size - 1} peers launched "
                 "the poisoned native round"
             )
+        expected_peer_ranks = set(range(args.world_size)) - {args.fault_rank}
+        launched_ranks = {int(item.get("rank", -1)) for item in launch_evidence}
+        if launched_ranks != expected_peer_ranks:
+            violations.append(
+                f"poisoned native launch ranks {sorted(launched_ranks)} do not match "
+                f"expected peers {sorted(expected_peer_ranks)}"
+            )
+        if any(item.get("handle_type") != EXPECTED_HANDLE for item in launch_evidence):
+            violations.append(
+                "poisoned-round launch evidence did not use GrpCollIntraHandle"
+            )
         if alive(records):
             violations.append(
                 f"launcher still owns live workers: {[item['pid'] for item in alive(records)]}"
@@ -384,6 +398,11 @@ def run_fault_phase(args: argparse.Namespace, run_id: str) -> dict[str, Any]:
             code == 92 for rank, code in return_codes.items() if rank != args.fault_rank
         ):
             violations.append("a peer unexpectedly completed the poisoned native round")
+        if unexpected_evidence:
+            violations.append(
+                "unexpected completion marker exists for poisoned native round: "
+                f"{sorted(int(item.get('rank', -1)) for item in unexpected_evidence)}"
+            )
         return {
             "status": "passed" if not violations else "failed",
             "triggered": triggered,
@@ -392,7 +411,8 @@ def run_fault_phase(args: argparse.Namespace, run_id: str) -> dict[str, Any]:
             "reclaimed_seconds": round(reclaimed_seconds, 6),
             "deadline_seconds": args.fault_timeout_seconds,
             "launched_peer_count": len(launched_paths),
-            "launch_evidence": [load_json(path) for path in launched_paths],
+            "launch_evidence": launch_evidence,
+            "unexpected_completion_evidence": unexpected_evidence,
             "ready_evidence": ready_evidence,
             "return_codes": return_codes,
             "survivors": survivors,
