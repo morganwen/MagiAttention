@@ -119,6 +119,7 @@
         "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
         "MAGI_ATTENTION_NATIVE_GRPCOLL": "1",
         "MAGI_DSA_RUN_FINAL_NATIVE_MATRIX": "1",
+        "PYTHONPATH": "{repo_root}/tests/test_dsa",
         "PYTHONNOUSERSITE": "1"
       },
       "unset_env": [
