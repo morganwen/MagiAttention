@@ -73,13 +73,17 @@ not contain predictor coefficients.
 
 ## Immutable image and installed-wheel boundary
 
-Distributed commands run only in the production image from step 9. They
-require `/opt/magi-dsa-build-manifest.json`, `.magi-source-revision`, and the
-exact archived submodule marker, re-hash every artifact named by the build
-manifest, and reject a `magi_attention` import beneath `/opt/MagiAttention`.
-The benchmark script is read from the archived source, but the library under
-test must resolve from the installed wheel's `site-packages` directory. There
-is no Git fallback for calibration, measure, or profile.
+Distributed commands run only in clean immutable images produced by the
+production-image build path. Calibration uses the image built from its clean
+calibration revision; after the coefficients are frozen and committed,
+measure, profile, and the release matrix use the rebuilt final image. Both
+images require `/opt/magi-dsa-build-manifest.json`, `.magi-source-revision`,
+and the exact archived submodule marker, re-hash every artifact named by the
+build manifest, and reject a `magi_attention` import beneath
+`/opt/MagiAttention`. The benchmark script is read from the archived source,
+but the library under test must resolve from the installed wheel's
+`site-packages` directory. There is no Git fallback for calibration, measure,
+or profile.
 
 `run.sh` mounts only pack/performance/profile artifact directories; it never
 bind-mounts the host checkout. It obtains the immutable image ID and revision
