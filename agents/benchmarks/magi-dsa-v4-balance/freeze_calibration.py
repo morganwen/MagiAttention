@@ -102,14 +102,16 @@ def _render(
         "from magi_attention.meta.solver.dsa_dispatch import DsaCostModel",
         "",
         "CALIBRATION_SCHEMA_VERSION = 1",
-        f'CALIBRATION_TARGET = "{target}"',
+        f"CALIBRATION_TARGET = {json.dumps(target)}",
         f'# Generated from run {payload.get("source_run_id", "unknown")!r}.',
         "_WEIGHTS = {",
     ]
     for ratio in (0, 4, 128):
         source_lines.append(f"    {ratio}: {{")
         for name in WEIGHT_NAMES:
-            source_lines.append(f"        {name!r}: {weights[ratio][name]!r},")
+            source_lines.append(
+                f"        {json.dumps(name)}: {weights[ratio][name]!r},"
+            )
         source_lines.append("    },")
     source_lines.extend(
         [
@@ -127,7 +129,9 @@ def _render(
             "CALIBRATION_ID = hashlib.sha256(",
             '    json.dumps(_normalized_payload(), sort_keys=True, separators=(",", ":")).encode()',
             ").hexdigest()",
-            f'assert CALIBRATION_ID == "{calibration_id}"',
+            "assert (",
+            f'    CALIBRATION_ID == "{calibration_id}"',
+            ")",
             "CALIBRATED_WEIGHTS = MappingProxyType(",
             "    {ratio: MappingProxyType(dict(values)) for ratio, values in _WEIGHTS.items()}",
             ")",

@@ -4,14 +4,15 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-"""Frozen B300/SM103 cost calibration used by the DSA dispatch solver.
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-The coefficients are intentionally source-controlled rather than accepted as
-runtime overrides. Step-8 calibration produces a signed JSON candidate; a
-separate clean commit updates this module before the immutable measure image is
-built. ``CALIBRATION_ID`` covers only the normalized predictor coefficients;
-exact tensor-memory byte counts remain derived from the public config.
-"""
+"""Frozen B300/SM103 cost calibration used by the DSA dispatch solver."""
 
 from __future__ import annotations
 
@@ -22,37 +23,35 @@ from types import MappingProxyType
 from magi_attention.meta.solver.dsa_dispatch import DsaCostModel
 
 CALIBRATION_SCHEMA_VERSION = 1
-CALIBRATION_TARGET = "unfrozen-b300-sm103"
-
-# Bootstrap values used only by the calibration revision. Step 8 replaces
-# these with measured B300 coefficients before the formal measure revision.
+CALIBRATION_TARGET = "sampled-b300-sm103"
+# Generated from run 'b300-cp8-sample-calibration-20260713T083426Z'.
 _WEIGHTS = {
     0: {
-        "token_weight": 1.0,
+        "token_weight": 0.0006550394535421351,
         "indexer_weight": 0.0,
-        "fragment_overhead": 64.0,
-        "window_transfer_weight": 1.0,
+        "fragment_overhead": 0.03995484067374769,
+        "window_transfer_weight": 4.025848312478687e-24,
         "overlap_transfer_weight": 0.0,
         "compressed_owner_send_weight": 0.0,
         "compressed_remote_receive_weight": 0.0,
     },
     4: {
-        "token_weight": 1.0,
-        "indexer_weight": 1.0,
-        "fragment_overhead": 64.0,
-        "window_transfer_weight": 1.0,
-        "overlap_transfer_weight": 1.0,
-        "compressed_owner_send_weight": 1.0,
-        "compressed_remote_receive_weight": 1.0,
+        "token_weight": 2.2490712248453346e-22,
+        "indexer_weight": 1.4108896307465333e-06,
+        "fragment_overhead": 9.259778144943177e-21,
+        "window_transfer_weight": 0.08678825866072461,
+        "overlap_transfer_weight": 0.662813633177838,
+        "compressed_owner_send_weight": 0.11790754080176107,
+        "compressed_remote_receive_weight": 0.5247903536818413,
     },
     128: {
-        "token_weight": 1.0,
+        "token_weight": 0.000708633746416635,
         "indexer_weight": 0.0,
-        "fragment_overhead": 64.0,
-        "window_transfer_weight": 1.0,
+        "fragment_overhead": 3.171213766834836e-27,
+        "window_transfer_weight": 0.0001664731893305034,
         "overlap_transfer_weight": 0.0,
-        "compressed_owner_send_weight": 1.0,
-        "compressed_remote_receive_weight": 1.0,
+        "compressed_owner_send_weight": 0.028282658080009817,
+        "compressed_remote_receive_weight": 0.19844135449295092,
     },
 }
 
@@ -68,6 +67,9 @@ def _normalized_payload() -> dict[str, object]:
 CALIBRATION_ID = hashlib.sha256(
     json.dumps(_normalized_payload(), sort_keys=True, separators=(",", ":")).encode()
 ).hexdigest()
+assert (
+    CALIBRATION_ID == "df625f1805024f6c7c78e2bdcb07476c8be94347c3e762a80006a87aea0e882d"
+)
 CALIBRATED_WEIGHTS = MappingProxyType(
     {ratio: MappingProxyType(dict(values)) for ratio, values in _WEIGHTS.items()}
 )
@@ -80,8 +82,6 @@ def get_dsa_cost_model(
     compressed_block_memory_bytes: int,
     remote_row_memory_bytes: int,
 ) -> DsaCostModel:
-    """Return the immutable calibrated predictor plus exact memory bytes."""
-
     try:
         weights = dict(CALIBRATED_WEIGHTS[compress_ratio])
     except KeyError as error:
@@ -98,8 +98,6 @@ def get_dsa_cost_model(
 
 
 def calibration_manifest() -> dict[str, object]:
-    """Return a JSON-serializable copy for benchmark preflight/reporting."""
-
     return {**_normalized_payload(), "calibration_id": CALIBRATION_ID}
 
 
