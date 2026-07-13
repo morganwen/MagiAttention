@@ -90,7 +90,7 @@
         "-rs",
         "-p",
         "no:cacheprovider",
-        "--import-mode=importlib",
+        "--import-mode=append",
         "{repo_root}/tests/test_dsa/test_dsa_cp.py::TestDsaCommMetadata::test_work_tracker_early_exit_drains_nested_scopes_independently",
         "{repo_root}/tests/test_dsa/test_dsa_cp.py::TestDsaCommMetadata::test_work_tracker_drains_on_exception_and_recovers_for_next_scope",
         "{repo_root}/tests/test_dsa/test_dsa_cp.py::TestDsaCommMetadata::test_work_tracker_aborts_after_collective_wait_failure",
