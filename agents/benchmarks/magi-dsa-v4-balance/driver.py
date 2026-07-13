@@ -16,6 +16,7 @@ import json
 import os
 import platform
 import socket
+import statistics
 import subprocess
 import sys
 from collections import defaultdict
@@ -1173,6 +1174,7 @@ def _claim_fresh_run_dir(run_dir: Path, environment: Mapping[str, Any]) -> None:
         "plans.jsonl",
         "correctness.jsonl",
         "calibration.json",
+        "sample_calibration.json",
         "summary.json",
         "validation.json",
         "artifact_manifest.sha256",
@@ -1213,6 +1215,7 @@ def _write_progress(
     expected_units: Sequence[Mapping[str, Any]],
     completed_units: Sequence[Mapping[str, Any]],
     started_at_utc: str,
+    formal: bool | None = None,
 ) -> None:
     """Atomically publish run-bound progress after a synchronized unit."""
 
@@ -1221,23 +1224,251 @@ def _write_progress(
         == len(completed_units),
         "progress contains duplicate completed case-pack units",
     )
-    atomic_write_json(
-        run_dir / "progress.json",
-        {
-            "schema_version": SCHEMA_VERSION,
-            "run_id": environment["run_id"],
-            "mode": environment["mode"],
-            "revision": environment["revision"],
-            "image_id": environment["image_id"],
-            "calibration_id": environment["calibration_id"],
-            "started_at_utc": started_at_utc,
-            "updated_at_utc": _utc_now(),
-            "expected_units": list(expected_units),
-            "expected_unit_count": len(expected_units),
-            "completed_units": list(completed_units),
-            "completed_unit_count": len(completed_units),
-        },
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "run_id": environment["run_id"],
+        "mode": environment["mode"],
+        "revision": environment["revision"],
+        "image_id": environment["image_id"],
+        "calibration_id": environment["calibration_id"],
+        "started_at_utc": started_at_utc,
+        "updated_at_utc": _utc_now(),
+        "expected_units": list(expected_units),
+        "expected_unit_count": len(expected_units),
+        "completed_units": list(completed_units),
+        "completed_unit_count": len(completed_units),
+    }
+    if formal is not None:
+        payload["formal"] = formal
+    atomic_write_json(run_dir / "progress.json", payload)
+
+
+def _sample_summary(
+    environment: Mapping[str, Any],
+    cases: Sequence[CaseSpec],
+    packs: Sequence[Mapping[str, Any]],
+    raw_records: Sequence[Mapping[str, Any]],
+    plan_records: Sequence[Mapping[str, Any]],
+    correctness_records: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Validate and summarize a deliberately non-formal sample run."""
+
+    expected_units = {
+        (case.case_id, int(pack["index"])) for case in cases for pack in packs
+    }
+    expected_raw_count = len(expected_units) * WORLD_SIZE * MEASURE_ITERS
+    expected_plan_count = len(expected_units) * WORLD_SIZE
+    _require(
+        len(raw_records) == expected_raw_count,
+        f"sample has {len(raw_records)} raw records, expected {expected_raw_count}",
     )
+    _require(
+        len(plan_records) == expected_plan_count,
+        f"sample has {len(plan_records)} plan records, expected {expected_plan_count}",
+    )
+    _require(
+        len(correctness_records) == len(expected_units),
+        "sample correctness record count does not match selected units",
+    )
+
+    raw_by_key: dict[tuple[str, int, int], list[Mapping[str, Any]]] = defaultdict(list)
+    for record in raw_records:
+        key = (
+            str(record.get("case_id")),
+            int(record.get("pack_index", -1)),
+            int(record.get("rank", -1)),
+        )
+        _require(key[:2] in expected_units, f"unexpected sample raw unit {key[:2]}")
+        _require(record.get("mode") == "sample", "sample raw mode mismatch")
+        _require(record.get("formal") is False, "sample raw record is not non-formal")
+        _require(record.get("finite") is True, "sample raw record is non-finite")
+        _require(
+            record.get("jit_cache_miss_delta") == 0,
+            "sample raw record contains a timed JIT/cache miss",
+        )
+        raw_by_key[key].append(record)
+    for case_id, pack_index in expected_units:
+        for rank in range(WORLD_SIZE):
+            records = raw_by_key[(case_id, pack_index, rank)]
+            _require(
+                {int(record["iteration"]) for record in records}
+                == set(range(MEASURE_ITERS)),
+                f"sample raw iterations are incomplete for {case_id}/pack{pack_index}/rank{rank}",
+            )
+
+    plan_keys: set[tuple[str, int, int]] = set()
+    for record in plan_records:
+        key = (
+            str(record.get("case_id")),
+            int(record.get("pack_index", -1)),
+            int(record.get("rank", -1)),
+        )
+        _require(key[:2] in expected_units, f"unexpected sample plan unit {key[:2]}")
+        _require(0 <= key[2] < WORLD_SIZE, f"unexpected sample plan rank {key[2]}")
+        _require(key not in plan_keys, f"duplicate sample plan record {key}")
+        _require(record.get("mode") == "sample", "sample plan mode mismatch")
+        _require(record.get("formal") is False, "sample plan record is not non-formal")
+        _require(
+            bool(record.get("dsa_pack_cache_keys")),
+            f"sample plan {key} has no compile-cache evidence",
+        )
+        plan_keys.add(key)
+
+    correctness_keys: set[tuple[str, int]] = set()
+    for record in correctness_records:
+        key = (str(record.get("case_id")), int(record.get("pack_index", -1)))
+        _require(key in expected_units, f"unexpected sample correctness unit {key}")
+        _require(
+            key not in correctness_keys, f"duplicate sample correctness unit {key}"
+        )
+        _require(record.get("mode") == "sample", "sample correctness mode mismatch")
+        _require(
+            record.get("formal") is False,
+            "sample correctness record is not non-formal",
+        )
+        _require(record.get("pass") is True, f"sample correctness failed for {key}")
+        correctness_keys.add(key)
+    _require(
+        correctness_keys == expected_units, "sample correctness matrix is incomplete"
+    )
+
+    pack_by_index = {int(pack["index"]): pack for pack in packs}
+    case_summaries: dict[str, Any] = {}
+    for case in cases:
+        pack_summaries: list[dict[str, Any]] = []
+        for pack_index in sorted(pack_by_index):
+            e2e_medians = [
+                float(
+                    statistics.median(
+                        float(record["e2e_ms"])
+                        for record in raw_by_key[(case.case_id, pack_index, rank)]
+                    )
+                )
+                for rank in range(WORLD_SIZE)
+            ]
+            indexer_medians = [
+                float(
+                    statistics.median(
+                        float(record["indexer_ms"])
+                        for record in raw_by_key[(case.case_id, pack_index, rank)]
+                    )
+                )
+                for rank in range(WORLD_SIZE)
+            ]
+
+            def metric(values: Sequence[float]) -> dict[str, float]:
+                maximum = max(values)
+                mean = sum(values) / len(values)
+                return {
+                    "max_rank_ms": maximum,
+                    "mean_rank_ms": mean,
+                    "max_over_mean_minus_one": maximum / mean - 1.0 if mean else 0.0,
+                }
+
+            pack_summaries.append(
+                {
+                    "pack_index": pack_index,
+                    "pack_sha256": pack_by_index[pack_index]["sha256"],
+                    "rank_median_e2e_ms": e2e_medians,
+                    "e2e": metric(e2e_medians),
+                    "rank_median_indexer_ms": indexer_medians,
+                    "indexer": metric(indexer_medians),
+                }
+            )
+        case_summaries[case.case_id] = {
+            "case": asdict(case),
+            "packs": pack_summaries,
+            "mean_pack_max_rank_e2e_ms": sum(
+                item["e2e"]["max_rank_ms"] for item in pack_summaries
+            )
+            / len(pack_summaries),
+            "mean_pack_max_rank_indexer_ms": sum(
+                item["indexer"]["max_rank_ms"] for item in pack_summaries
+            )
+            / len(pack_summaries),
+        }
+
+    observations: dict[str, Any] = {}
+    for name, baseline, candidate, field in (
+        (
+            "ratio4_indexer_balanced_lt_sequential",
+            "r4-sequential-00",
+            "r4-balanced-11",
+            "mean_pack_max_rank_indexer_ms",
+        ),
+        (
+            "ratio4_e2e_balanced_lt_sequential",
+            "r4-sequential-00",
+            "r4-balanced-11",
+            "mean_pack_max_rank_e2e_ms",
+        ),
+        (
+            "ratio128_e2e_balanced_lt_sequential",
+            "r128-sequential-00",
+            "r128-balanced-11",
+            "mean_pack_max_rank_e2e_ms",
+        ),
+    ):
+        if baseline not in case_summaries or candidate not in case_summaries:
+            observations[name] = {"available": False}
+            continue
+        baseline_ms = float(case_summaries[baseline][field])
+        candidate_ms = float(case_summaries[candidate][field])
+        observations[name] = {
+            "available": True,
+            "baseline_ms": baseline_ms,
+            "candidate_ms": candidate_ms,
+            "observed": candidate_ms < baseline_ms,
+        }
+    for ratio in (4, 128):
+        case_id = f"r{ratio}-balanced-11"
+        name = f"ratio{ratio}_sampled_candidate_packs_within_5pct"
+        if case_id not in case_summaries:
+            observations[name] = {"available": False}
+            continue
+        failed = [
+            item["pack_index"]
+            for item in case_summaries[case_id]["packs"]
+            if item["e2e"]["max_over_mean_minus_one"] > 0.05 + 1e-12
+        ]
+        observations[name] = {
+            "available": True,
+            "failed_sampled_packs": failed,
+            "observed": not failed,
+        }
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "run_id": environment["run_id"],
+        "mode": "sample",
+        "formal": False,
+        "formal_acceptance": False,
+        "formal_gates_evaluated": False,
+        "all_gates_pass": None,
+        "diagnostic_complete": True,
+        "revision": environment["revision"],
+        "image_id": environment["image_id"],
+        "calibration_id": environment["calibration_id"],
+        "selected_case_ids": [case.case_id for case in cases],
+        "selected_pack_indices": sorted(pack_by_index),
+        "timing_protocol": {
+            "compile_iters": COMPILE_ITERS,
+            "correctness_iters": 1,
+            "warmup_iters": WARMUP_ITERS,
+            "measure_iters": MEASURE_ITERS,
+        },
+        "record_counts": {
+            "raw_timing": len(raw_records),
+            "plans": len(plan_records),
+            "correctness": len(correctness_records),
+        },
+        "cases": case_summaries,
+        "sampled_observations": observations,
+        "note": (
+            "Diagnostic subset only; this artifact cannot satisfy or replace the "
+            "frozen calibrate/measure/profile acceptance contracts."
+        ),
+    }
 
 
 def _fit_calibration(
@@ -1245,6 +1476,10 @@ def _fit_calibration(
     environment: Mapping[str, Any],
     raw_records: Sequence[Mapping[str, Any]],
     plan_records: Sequence[Mapping[str, Any]],
+    *,
+    target: str = "b300-sm103",
+    output_name: str = "calibration.json",
+    metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     import numpy as np
 
@@ -1307,7 +1542,7 @@ def _fit_calibration(
         }
     calibration = {
         "schema_version": CALIBRATION_SCHEMA_VERSION,
-        "target": "b300-sm103",
+        "target": target,
         "created_at_utc": _utc_now(),
         "source_run_id": environment["run_id"],
         "source_revision": environment["revision"],
@@ -1316,7 +1551,13 @@ def _fit_calibration(
         "weights": weights,
         "fits": fits,
     }
-    atomic_write_json(run_dir / "calibration.json", calibration)
+    if metadata is not None:
+        overlap = set(calibration).intersection(metadata)
+        _require(
+            not overlap, f"calibration metadata overwrites canonical keys {overlap}"
+        )
+        calibration.update(metadata)
+    atomic_write_json(run_dir / output_name, calibration)
     return calibration
 
 
@@ -1326,14 +1567,26 @@ def _run_distributed(args: argparse.Namespace) -> int:
     packs_payload = read_json(args.packs.resolve())
     packs = validate_packs(packs_payload)
     mode = args.command
-    cases = {
-        "calibrate": CALIBRATION_CASES,
-        "measure": MEASURE_CASES,
-        "profile": PROFILE_CASES,
-    }[mode]
-    artifact_mode = "calibration" if mode == "calibrate" else mode
-    selected_packs = [packs[PROFILE_PACK_INDEX]] if mode == "profile" else list(packs)
-    expected_units = expected_progress_units(artifact_mode)
+    if mode == "sample":
+        cases = tuple(CASE_BY_ID[case_id] for case_id in args.case_id)
+        selected_packs = [packs[pack_index] for pack_index in args.pack_index]
+        artifact_mode = "sample"
+        expected_units = [
+            {"case_id": case.case_id, "pack_index": int(pack["index"])}
+            for case in cases
+            for pack in selected_packs
+        ]
+    else:
+        cases = {
+            "calibrate": CALIBRATION_CASES,
+            "measure": MEASURE_CASES,
+            "profile": PROFILE_CASES,
+        }[mode]
+        artifact_mode = "calibration" if mode == "calibrate" else mode
+        selected_packs = (
+            [packs[PROFILE_PACK_INDEX]] if mode == "profile" else list(packs)
+        )
+        expected_units = expected_progress_units(artifact_mode)
     completed_units: list[dict[str, Any]] = []
     progress_started_at_utc = _utc_now()
     environment = _distributed_preflight(
@@ -1347,6 +1600,21 @@ def _run_distributed(args: argparse.Namespace) -> int:
         expected_revision=args.expected_revision,
         expected_image_id=args.expected_image_id,
     )
+    if mode == "sample":
+        environment.update(
+            {
+                "formal": False,
+                "formal_acceptance": False,
+                "selected_case_ids": [case.case_id for case in cases],
+                "selected_pack_indices": [
+                    int(pack["index"]) for pack in selected_packs
+                ],
+                "diagnostic_contract": (
+                    "subset only; never accepted by formal calibrate/measure/profile "
+                    "validation"
+                ),
+            }
+        )
     if mode in ("measure", "profile"):
         _require(
             environment["calibration_target"] == "b300-sm103",
@@ -1360,12 +1628,14 @@ def _run_distributed(args: argparse.Namespace) -> int:
             expected_units=expected_units,
             completed_units=completed_units,
             started_at_utc=progress_started_at_utc,
+            formal=False if mode == "sample" else None,
         )
         (run_dir / "_rank").mkdir(parents=True, exist_ok=True)
         atomic_write_json(run_dir / "environment.json", environment)
         atomic_write_json(run_dir / "packs.json", packs_payload)
-        schema_source = SCRIPT_DIR / "report.schema.json"
-        (run_dir / "report.schema.json").write_bytes(schema_source.read_bytes())
+        if mode != "sample":
+            schema_source = SCRIPT_DIR / "report.schema.json"
+            (run_dir / "report.schema.json").write_bytes(schema_source.read_bytes())
     dist.barrier(group=group)
 
     raw_records: list[dict[str, Any]] = []
@@ -1394,6 +1664,7 @@ def _run_distributed(args: argparse.Namespace) -> int:
                 "plan_sha256": plan.plan_hash,
                 "calibration_id": runtime.solver_calibration_id,
                 "features": _plan_features(plan, rank),
+                **({"formal": False} if mode == "sample" else {}),
             }
             plan_records.append(plan_record)
 
@@ -1478,6 +1749,7 @@ def _run_distributed(args: argparse.Namespace) -> int:
                                 "used_for_acceptance": False,
                                 "note": "elementwise rank_comparisons are authoritative",
                             },
+                            **({"formal": False} if mode == "sample" else {}),
                         }
                     )
                 del output, kl_loss, loss
@@ -1539,6 +1811,7 @@ def _run_distributed(args: argparse.Namespace) -> int:
                         "native_backend": True,
                         "finite": finite,
                         "jit_cache_miss_delta": miss_delta,
+                        **({"formal": False} if mode == "sample" else {}),
                     }
                 )
                 _require(finite, f"non-finite measured result for {case.case_id}")
@@ -1563,6 +1836,7 @@ def _run_distributed(args: argparse.Namespace) -> int:
                     expected_units=expected_units,
                     completed_units=completed_units,
                     started_at_utc=progress_started_at_utc,
+                    formal=False if mode == "sample" else None,
                 )
             del dsa_input, output_gradient, global_rows
             torch.cuda.empty_cache()
@@ -1578,16 +1852,48 @@ def _run_distributed(args: argparse.Namespace) -> int:
     if rank == 0:
         merged_raw = _merge_rank_artifacts(run_dir, "raw_timing", WORLD_SIZE)
         merged_plans = _merge_rank_artifacts(run_dir, "plans", WORLD_SIZE)
-        _merge_rank_artifacts(run_dir, "correctness", WORLD_SIZE)
+        merged_correctness = _merge_rank_artifacts(run_dir, "correctness", WORLD_SIZE)
         if mode == "calibrate":
             _fit_calibration(run_dir, environment, merged_raw, merged_plans)
-        result = validate_run(
-            run_dir,
-            mode=artifact_mode,
-            expected_revision=args.expected_revision,
-            expected_image_id=args.expected_image_id,
-            write_summary=mode == "measure",
-        )
+        if mode == "sample":
+            if args.fit_calibration:
+                _fit_calibration(
+                    run_dir,
+                    environment,
+                    merged_raw,
+                    merged_plans,
+                    target="sampled-b300-sm103",
+                    output_name="sample_calibration.json",
+                    metadata={
+                        "formal": False,
+                        "scope": "sampled_non_formal",
+                        "selected_case_ids": [case.case_id for case in cases],
+                        "selected_pack_indices": [
+                            int(pack["index"]) for pack in selected_packs
+                        ],
+                        "selected_packs_sha256": pack_suite_sha256(selected_packs),
+                    },
+                )
+            atomic_write_json(
+                run_dir / "summary.json",
+                _sample_summary(
+                    environment,
+                    cases,
+                    selected_packs,
+                    merged_raw,
+                    merged_plans,
+                    merged_correctness,
+                ),
+            )
+            result = None
+        else:
+            result = validate_run(
+                run_dir,
+                mode=artifact_mode,
+                expected_revision=args.expected_revision,
+                expected_image_id=args.expected_image_id,
+                write_summary=mode == "measure",
+            )
         if mode == "profile":
             atomic_write_json(
                 run_dir / "profile_metadata.json",
@@ -1606,7 +1912,11 @@ def _run_distributed(args: argparse.Namespace) -> int:
                     ),
                 },
             )
-        if mode == "measure" and not result["summary"]["all_gates_pass"]:
+        if (
+            mode == "measure"
+            and result is not None
+            and not result["summary"]["all_gates_pass"]
+        ):
             exit_code = 2
     value = torch.tensor(
         [exit_code], dtype=torch.int32, device=torch.cuda.current_device()
@@ -1629,6 +1939,18 @@ def _common_distributed_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--expected-image-id", required=True)
 
 
+def _pack_index(value: str) -> int:
+    try:
+        index = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"invalid pack index {value!r}") from error
+    if not 0 <= index < PACK_NUM:
+        raise argparse.ArgumentTypeError(
+            f"pack index {index} is outside the frozen range 0..{PACK_NUM - 1}"
+        )
+    return index
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1642,7 +1964,46 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     for name in ("calibrate", "measure", "profile"):
         child = subparsers.add_parser(name)
         _common_distributed_arguments(child)
-    return parser.parse_args(argv)
+    sample = subparsers.add_parser(
+        "sample",
+        help="run an explicitly non-formal subset without changing formal contracts",
+    )
+    _common_distributed_arguments(sample)
+    sample.add_argument(
+        "--case-id",
+        action="append",
+        choices=tuple(sorted(CASE_BY_ID)),
+        required=True,
+        help="case to run; repeat for each selected case",
+    )
+    sample.add_argument(
+        "--pack-index",
+        action="append",
+        type=_pack_index,
+        required=True,
+        help="frozen pack index to run; repeat for each selected pack",
+    )
+    sample.add_argument(
+        "--fit-calibration",
+        action="store_true",
+        help=(
+            "fit sample_calibration.json; requires exactly the six frozen "
+            "calibration cases and remains non-formal"
+        ),
+    )
+    args = parser.parse_args(argv)
+    if args.command == "sample":
+        if len(set(args.case_id)) != len(args.case_id):
+            parser.error("sample --case-id values must be unique")
+        if len(set(args.pack_index)) != len(args.pack_index):
+            parser.error("sample --pack-index values must be unique")
+        calibration_case_ids = {case.case_id for case in CALIBRATION_CASES}
+        if args.fit_calibration and set(args.case_id) != calibration_case_ids:
+            parser.error(
+                "sample --fit-calibration requires exactly the six frozen "
+                "calibration --case-id values"
+            )
+    return args
 
 
 def main(argv: Sequence[str] | None = None) -> int:

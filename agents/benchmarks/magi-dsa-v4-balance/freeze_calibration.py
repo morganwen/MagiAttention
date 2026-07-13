@@ -14,7 +14,6 @@ import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[2]
 DEFAULT_OUTPUT = REPO_ROOT / "magi_attention/meta/solver/dsa_calibration.py"
@@ -33,11 +32,21 @@ def _canonical_bytes(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
-def _validate(payload: Mapping[str, Any]) -> dict[int, dict[str, float]]:
+def _validate(
+    payload: Mapping[str, Any], *, allow_sampled_non_formal: bool = False
+) -> dict[int, dict[str, float]]:
     if payload.get("schema_version") != 1:
         raise ValueError("calibration schema_version must be 1")
-    if payload.get("target") != "b300-sm103":
-        raise ValueError("calibration target must be b300-sm103")
+    target = payload.get("target")
+    if target == "sampled-b300-sm103":
+        if not allow_sampled_non_formal:
+            raise ValueError("sampled calibration requires --allow-sampled-non-formal")
+        if payload.get("formal") is not False:
+            raise ValueError("sampled calibration must declare formal=false")
+        if payload.get("scope") != "sampled_non_formal":
+            raise ValueError("sampled calibration scope must be sampled_non_formal")
+    elif target != "b300-sm103":
+        raise ValueError("calibration target must be b300-sm103 or sampled-b300-sm103")
     raw_weights = payload.get("weights")
     if not isinstance(raw_weights, dict) or set(raw_weights) != {"0", "4", "128"}:
         raise ValueError("weights must contain exactly ratios 0, 4 and 128")
@@ -48,31 +57,36 @@ def _validate(payload: Mapping[str, Any]) -> dict[int, dict[str, float]]:
             raise ValueError(f"ratio {ratio} has an invalid coefficient set")
         normalized = {name: float(values[name]) for name in WEIGHT_NAMES}
         if any(value < 0 or not value < float("inf") for value in normalized.values()):
-            raise ValueError(f"ratio {ratio} coefficients must be finite and non-negative")
+            raise ValueError(
+                f"ratio {ratio} coefficients must be finite and non-negative"
+            )
         if ratio != 4 and normalized["indexer_weight"] != 0.0:
             raise ValueError(f"ratio {ratio} must have zero indexer_weight")
         weights[ratio] = normalized
     return weights
 
 
-def _render(payload: Mapping[str, Any], weights: Mapping[int, Mapping[str, float]]) -> str:
+def _render(
+    payload: Mapping[str, Any], weights: Mapping[int, Mapping[str, float]]
+) -> str:
+    target = str(payload["target"])
     normalized_payload = {
         "schema_version": 1,
-        "target": "b300-sm103",
+        "target": target,
         "weights": {str(ratio): dict(weights[ratio]) for ratio in sorted(weights)},
     }
     calibration_id = hashlib.sha256(_canonical_bytes(normalized_payload)).hexdigest()
     source_lines = [
         "# Copyright (c) 2025-2026 SandAI. All Rights Reserved.",
         "#",
-        "# Licensed under the Apache License, Version 2.0 (the \"License\");",
+        '# Licensed under the Apache License, Version 2.0 (the "License");',
         "# you may not use this file except in compliance with the License.",
         "# You may obtain a copy of the License at",
         "#",
         "#     http://www.apache.org/licenses/LICENSE-2.0",
         "#",
         "# Unless required by applicable law or agreed to in writing, software",
-        "# distributed under the License is distributed on an \"AS IS\" BASIS,",
+        '# distributed under the License is distributed on an "AS IS" BASIS,',
         "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.",
         "# See the License for the specific language governing permissions and",
         "# limitations under the License.",
@@ -88,7 +102,7 @@ def _render(payload: Mapping[str, Any], weights: Mapping[int, Mapping[str, float
         "from magi_attention.meta.solver.dsa_dispatch import DsaCostModel",
         "",
         "CALIBRATION_SCHEMA_VERSION = 1",
-        'CALIBRATION_TARGET = "b300-sm103"',
+        f'CALIBRATION_TARGET = "{target}"',
         f'# Generated from run {payload.get("source_run_id", "unknown")!r}.',
         "_WEIGHTS = {",
     ]
@@ -168,16 +182,27 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="verify that --output already matches instead of writing it",
     )
+    parser.add_argument(
+        "--allow-sampled-non-formal",
+        action="store_true",
+        help=(
+            "explicitly permit a formal=false, scope=sampled_non_formal "
+            "sampled-b300-sm103 input"
+        ),
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     payload = json.loads(args.input.read_text(encoding="utf-8"))
-    weights = _validate(payload)
+    weights = _validate(payload, allow_sampled_non_formal=args.allow_sampled_non_formal)
     source = _render(payload, weights)
     if args.check:
-        if not args.output.is_file() or args.output.read_text(encoding="utf-8") != source:
+        if (
+            not args.output.is_file()
+            or args.output.read_text(encoding="utf-8") != source
+        ):
             raise SystemExit(f"{args.output} does not match {args.input}")
         print(f"calibration source is current: {args.output}")
         return 0
