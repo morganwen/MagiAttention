@@ -78,7 +78,7 @@ class DsaCompressorRun:
 
 @dataclass(frozen=True)
 class DsaIndexerProjection:
-    """Invocation-local Indexer Q/weight projection for one fragment."""
+    """Invocation-local Indexer Q/weight projection for one canonical tile."""
 
     fragment: DsaFragmentSpec
     local_begin: int
@@ -339,6 +339,34 @@ def _run_owner_compressor(
     return source_rows.new_empty((0, compressor.head_dim))
 
 
+def _canonical_query_tiles(
+    forward_plan: DsaForwardPlan,
+    runtime_mgr: "MagiDSARuntimeMgr",
+) -> tuple[tuple[DsaFragmentSpec, int, int], ...]:
+    """Split policy-merged fragments into policy-invariant query tiles."""
+
+    dispatch_plan = forward_plan.dispatch_plan
+    alignment = dispatch_plan.alignment
+    tiles: list[tuple[DsaFragmentSpec, int, int]] = []
+    fragment_local_begin = 0
+    for fragment in dispatch_plan.ranks[runtime_mgr.plan.cp_rank].fragments:
+        for query_begin in range(fragment.q_begin, fragment.q_end, alignment):
+            query_end = min(query_begin + alignment, fragment.q_end)
+            local_begin = fragment_local_begin + query_begin - fragment.q_begin
+            local_end = local_begin + query_end - query_begin
+            tiles.append(
+                (
+                    DsaFragmentSpec(fragment.sample_id, query_begin, query_end),
+                    local_begin,
+                    local_end,
+                )
+            )
+        fragment_local_begin += fragment.token_count
+    if fragment_local_begin != forward_plan.local_token_count:
+        raise RuntimeError("canonical query tiles do not cover every local row")
+    return tuple(tiles)
+
+
 def _project_ratio4_queries(
     dsa_input: "MagiDSAInput",
     runtime_mgr: "MagiDSARuntimeMgr",
@@ -350,11 +378,9 @@ def _project_ratio4_queries(
     if indexer is None:
         return ()
     projections: list[DsaIndexerProjection] = []
-    local_begin = 0
-    for fragment in forward_plan.dispatch_plan.ranks[
-        runtime_mgr.plan.cp_rank
-    ].fragments:
-        local_end = local_begin + fragment.token_count
+    for fragment, local_begin, local_end in _canonical_query_tiles(
+        forward_plan, runtime_mgr
+    ):
         with dsa_phase("indexer_projection"):
             query, weights = indexer.project_queries(
                 dsa_input.x[local_begin:local_end].detach().unsqueeze(1),
@@ -370,9 +396,6 @@ def _project_ratio4_queries(
                 weights=weights,
             )
         )
-        local_begin = local_end
-    if local_begin != forward_plan.local_token_count:
-        raise RuntimeError("Indexer projection did not cover every local query row")
     return tuple(projections)
 
 
@@ -404,17 +427,17 @@ def _ratio4_indices_and_kl(
     kl_loss = torch.zeros((), dtype=torch.float32, device=dsa_input.q.device)
     if projections is None:
         projections = _project_ratio4_queries(dsa_input, runtime_mgr, forward_plan)
-    fragments = forward_plan.dispatch_plan.ranks[runtime_mgr.plan.cp_rank].fragments
-    if len(projections) != len(fragments):
-        raise RuntimeError("Indexer projection count does not match local fragments")
+    tiles = _canonical_query_tiles(forward_plan, runtime_mgr)
+    if len(projections) != len(tiles):
+        raise RuntimeError("Indexer projection count does not match canonical tiles")
     ratio = cfg.compress_ratio
     total_global = max(forward_plan.dispatch_plan.total_tokens, 1)
 
-    for fragment, projection in zip(fragments, projections):
+    for (fragment, local_begin, local_end), projection in zip(tiles, projections):
         if projection.fragment != fragment:
-            raise RuntimeError("Indexer projection fragment order changed")
-        local_begin = projection.local_begin
-        local_end = projection.local_end
+            raise RuntimeError("Indexer projection tile order changed")
+        if projection.local_begin != local_begin or projection.local_end != local_end:
+            raise RuntimeError("Indexer projection tile rows changed")
         sample_block_begin = forward_plan.sample_block_offsets[fragment.sample_id]
         sample_block_end = forward_plan.sample_block_offsets[fragment.sample_id + 1]
         sample_block_count = sample_block_end - sample_block_begin
@@ -814,15 +837,16 @@ def _saved_topk_kl(
     # samples shorter than one compression block while another rank makes the
     # global compressed tensor non-empty and therefore enters KL backward.
     kl_loss = compressed_ki.float().sum() * 0.0
-    local_begin = 0
-    for fragment in forward_plan.dispatch_plan.ranks[
-        runtime_mgr.plan.cp_rank
-    ].fragments:
-        local_end = local_begin + fragment.token_count
+    covered_rows = 0
+    for fragment, local_begin, local_end in _canonical_query_tiles(
+        forward_plan, runtime_mgr
+    ):
+        if local_begin != covered_rows:
+            raise RuntimeError("KL recompute tile order has a hole")
         sample_begin = forward_plan.sample_block_offsets[fragment.sample_id]
         sample_end = forward_plan.sample_block_offsets[fragment.sample_id + 1]
         if sample_end == sample_begin:
-            local_begin = local_end
+            covered_rows = local_end
             continue
         selected_global = indexer_topk[local_begin:local_end]
         local_ids = torch.where(
@@ -873,8 +897,8 @@ def _saved_topk_kl(
             )
             kl_fragment = kl_fragment / total_global
         kl_loss = kl_loss + kl_fragment
-        local_begin = local_end
-    if local_begin != forward_plan.local_token_count:
+        covered_rows = local_end
+    if covered_rows != forward_plan.local_token_count:
         raise RuntimeError("KL recompute did not cover every local query row")
     return kl_loss
 

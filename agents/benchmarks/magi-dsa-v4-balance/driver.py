@@ -24,7 +24,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[2]
 if str(SCRIPT_DIR) not in sys.path:
@@ -76,7 +75,6 @@ from validate import (  # noqa: E402
     validate_run,
     write_jsonl,
 )
-
 
 HF_REVISION = "60d8d70770c6776ff598c94bb586a859a38244f1"
 INPUT_CHUNK_ROWS = 128
@@ -1426,20 +1424,26 @@ def _run_distributed(args: argparse.Namespace) -> int:
                         ],
                     }
                 else:
-                    local_comparisons = _policy_correctness_against_sequential(
-                        torch,
-                        dist,
-                        case=case,
-                        packed_meta=packed_meta,
-                        pack_index=pack_index,
-                        rank=rank,
-                        group=group,
-                        candidate_global_rows=global_rows,
-                        candidate_input=dsa_input,
-                        candidate_output=output,
-                        candidate_kl=kl_loss,
-                        candidate_runtime=runtime,
-                    )
+                    try:
+                        local_comparisons = _policy_correctness_against_sequential(
+                            torch,
+                            dist,
+                            case=case,
+                            packed_meta=packed_meta,
+                            pack_index=pack_index,
+                            rank=rank,
+                            group=group,
+                            candidate_global_rows=global_rows,
+                            candidate_input=dsa_input,
+                            candidate_output=output,
+                            candidate_kl=kl_loss,
+                            candidate_runtime=runtime,
+                        )
+                    except RuntimeError as error:
+                        raise RuntimeError(
+                            "policy correctness failed for "
+                            f"{case.case_id}/pack{pack_index}/rank{rank}: {error}"
+                        ) from error
                 rank_comparisons: list[Any] = [None] * WORLD_SIZE
                 dist.all_gather_object(rank_comparisons, local_comparisons, group=group)
                 if rank == 0:

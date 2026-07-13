@@ -198,6 +198,12 @@ paths; correctness requires both policies to report `None`. Replicated
 `d_sink` and every parameter gradient are compared directly and also checked
 for CP replication. Moments/digests are never used for acceptance.
 
+For ratio 4, merged dispatch fragments are subdivided into sample-relative
+128-row canonical query tiles for Indexer projection, selection, forward KL and
+backward KL recompute. The tiling is policy-invariant: changing ownership may
+change communication and load balance, but cannot select a different GEMM
+shape for the same logical query and perturb its top-k boundary.
+
 ## Artifacts
 
 `agents/perf/magi-dsa-v4-balance/<RUN_ID>` contains:

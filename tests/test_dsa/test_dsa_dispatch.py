@@ -16,9 +16,11 @@
 
 import random
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
+from magi_attention.functional.dist_dsa import _canonical_query_tiles
 from magi_attention.meta.collection.dsa_meta import (
     DsaCompressedBlockSpec,
     DsaFragmentSpec,
@@ -69,6 +71,64 @@ class TestDsaFragmentPlan:
             for position in range(length)
         ]
         assert owners == sorted(owners)
+
+    def test_canonical_query_tiles_split_merged_fragment_and_tail(self):
+        plan = build_dsa_dispatch_plan(
+            [500],
+            [[DsaFragmentSpec(0, 0, 500)]],
+            compress_ratio=4,
+            policy="sequential",
+        )
+        forward_plan = SimpleNamespace(
+            dispatch_plan=plan,
+            local_token_count=500,
+        )
+        runtime = SimpleNamespace(plan=SimpleNamespace(cp_rank=0))
+        tiles = _canonical_query_tiles(forward_plan, runtime)
+
+        assert tiles == (
+            (DsaFragmentSpec(0, 0, 128), 0, 128),
+            (DsaFragmentSpec(0, 128, 256), 128, 256),
+            (DsaFragmentSpec(0, 256, 384), 256, 384),
+            (DsaFragmentSpec(0, 384, 500), 384, 500),
+        )
+
+    def test_canonical_query_tiles_are_policy_invariant(self):
+        sequential = make_sequential_plan([500], 2, 4)
+        balanced = build_dsa_dispatch_plan(
+            [500],
+            [
+                [DsaFragmentSpec(0, 0, 128), DsaFragmentSpec(0, 256, 384)],
+                [DsaFragmentSpec(0, 128, 256), DsaFragmentSpec(0, 384, 500)],
+            ],
+            compress_ratio=4,
+            policy="balanced",
+        )
+
+        def global_tiles(plan):
+            result = []
+            for rank in range(plan.cp_size):
+                forward_plan = SimpleNamespace(
+                    dispatch_plan=plan,
+                    local_token_count=plan.ranks[rank].token_count,
+                )
+                runtime = SimpleNamespace(plan=SimpleNamespace(cp_rank=rank))
+                result.extend(
+                    tile
+                    for tile, _local_begin, _local_end in _canonical_query_tiles(
+                        forward_plan, runtime
+                    )
+                )
+            return tuple(sorted(result))
+
+        expected = (
+            DsaFragmentSpec(0, 0, 128),
+            DsaFragmentSpec(0, 128, 256),
+            DsaFragmentSpec(0, 256, 384),
+            DsaFragmentSpec(0, 384, 500),
+        )
+        assert global_tiles(sequential) == expected
+        assert global_tiles(balanced) == expected
 
     def test_noncontiguous_plan_restore_map_and_transfers(self):
         plan = build_dsa_dispatch_plan(
