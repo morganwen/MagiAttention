@@ -1482,6 +1482,7 @@ def _fit_calibration(
     metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     import numpy as np
+    from scipy.optimize import lsq_linear
 
     plan_by_key = {
         (item["case_id"], item["pack_index"], item["rank"]): item
@@ -1508,8 +1509,19 @@ def _fit_calibration(
         y = np.asarray(targets, dtype=np.float64)
         scales = np.maximum(np.linalg.norm(x, axis=0), 1.0)
         normalized = x / scales
-        coefficients, *_ = np.linalg.lstsq(normalized, y, rcond=None)
-        coefficients = np.maximum(coefficients, 0.0) / scales
+        fit = lsq_linear(
+            normalized,
+            y,
+            bounds=(0.0, np.inf),
+            method="trf",
+            tol=1e-12,
+            lsmr_tol=1e-12,
+            max_iter=10_000,
+        )
+        _require(
+            fit.success, f"ratio {ratio} bounded least-squares failed: {fit.message}"
+        )
+        coefficients = fit.x / scales
         predicted = x @ coefficients
         residual = y - predicted
         denominator = float(np.sum((y - y.mean()) ** 2))
@@ -1534,7 +1546,7 @@ def _fit_calibration(
         }
         fits[str(ratio)] = {
             "observation_count": len(y),
-            "method": "column-normalized least-squares with non-negative projection",
+            "method": "column-normalized bounded least-squares (scipy lsq_linear)",
             "r_squared": r_squared,
             "rmse_ms": float(np.sqrt(np.mean(residual**2))),
             "max_abs_residual_ms": float(np.max(np.abs(residual))),
