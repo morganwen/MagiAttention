@@ -116,7 +116,9 @@
       "min_tests": 18,
       "expected_exit_codes": [0],
       "env": {
+        "CUDA_DEVICE_MAX_CONNECTIONS": "8",
         "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
+        "MAGI_ATTENTION_HIERARCHICAL_COMM": "0",
         "MAGI_ATTENTION_NATIVE_GRPCOLL": "1",
         "MAGI_DSA_RUN_FINAL_NATIVE_MATRIX": "1",
         "PYTHONPATH": "{repo_root}/tests/test_dsa",
@@ -153,7 +155,9 @@
       "timeout_seconds": 1500,
       "expected_exit_codes": [0],
       "env": {
+        "CUDA_DEVICE_MAX_CONNECTIONS": "8",
         "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
+        "MAGI_ATTENTION_HIERARCHICAL_COMM": "0",
         "MAGI_ATTENTION_NATIVE_GRPCOLL": "1",
         "PYTHONNOUSERSITE": "1"
       },
