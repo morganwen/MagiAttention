@@ -635,3 +635,38 @@ def test_kernel_indexer_topk_canonicalizes_equal_score_boundary():
             atol=0,
         )
         assert torch.all(selected[0, position, valid:] == -1)
+
+
+@pytest.mark.dsa_kernel
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(
+    not _kernel_dependencies_available(),
+    reason="frozen cudnn-frontend DSA package required",
+)
+def test_kernel_indexer_topk_supports_odd_short_sample_width():
+    """Keep K=512 when a short sample has an odd compressed-key count."""
+
+    from magi_attention.dsa.kernels import indexer_select_kernel
+
+    # floor(1893 / 4) == 473 reproduced the formal pack-1 CuTe compile
+    # assertion when the wrapper specialized top_k to the odd key count.
+    sq, sk, heads, dim, topk = 128, 473, 64, 128, 512
+    pos_offset = 1893 - sq
+    q_idx = torch.zeros(sq, 1, heads, dim, dtype=torch.bfloat16, device="cuda")
+    k_idx = torch.zeros(sk, 1, dim, dtype=torch.bfloat16, device="cuda")
+    weights = torch.ones(sq, 1, heads, dtype=torch.bfloat16, device="cuda")
+
+    selected = indexer_select_kernel(
+        q_idx, k_idx, weights, topk, ratio=4, pos_offset=pos_offset
+    )
+    assert selected.shape == (1, sq, topk)
+    assert selected.dtype == torch.int32
+    for position in range(sq):
+        valid = min((pos_offset + position + 1) // 4, sk, topk)
+        torch.testing.assert_close(
+            selected[0, position, :valid],
+            torch.arange(valid, dtype=torch.int32, device="cuda"),
+            rtol=0,
+            atol=0,
+        )
+        assert torch.all(selected[0, position, valid:] == -1)

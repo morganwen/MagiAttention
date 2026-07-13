@@ -204,6 +204,12 @@ backward KL recompute. The tiling is policy-invariant: changing ownership may
 change communication and load balance, but cannot select a different GEMM
 shape for the same logical query and perturb its top-k boundary.
 
+The cuDNN top-k launch keeps the configured output width at 512 even when a
+short sample has fewer compressed keys; unused entries remain `-1` and are
+removed before semantic boundary handling. It must not specialize the kernel K
+to an odd compressed-key count such as 473, because the frozen CuTe kernel
+statically compiles a two-element vector-store path that requires an even K.
+
 ## Artifacts
 
 `agents/perf/magi-dsa-v4-balance/<RUN_ID>` contains:

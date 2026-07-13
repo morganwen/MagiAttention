@@ -162,13 +162,22 @@ def indexer_select_kernel(
     rows = torch.arange(sq, device=q_idx.device) + pos_offset
     seq_lens = ((rows + 1) // ratio).clamp(max=sk).to(torch.int32).repeat(b)
 
-    topk_k = min(topk, sk)
-    if topk_k == 0:
+    selected_width = min(topk, sk)
+    if selected_width == 0:
         return torch.full((b, sq, topk), -1, dtype=torch.int32, device=q_idx.device)
+
+    # Keep the frozen configured width for the cuDNN launch even when this
+    # sample has fewer compressed keys.  The upstream CuTe kernel supports
+    # top_k > num_cols and fills the unused outputs with -1.  In contrast,
+    # specializing it to an odd short-sample width above one CTA (for example
+    # 473) trips its statically compiled vector-store divisibility assertion.
+    # Sorting the full result before slicing is required because cuDNN does not
+    # promise output order.
+    kernel_topk = topk
     res = dsa.indexer_top_k_wrapper(
-        scores_flat, seq_lens, top_k=topk_k, next_n=1, return_val=False
+        scores_flat, seq_lens, top_k=kernel_topk, next_n=1, return_val=False
     )
-    idx = res["indices"]  # (b*sq, topk_k) int32, -1 invalid
+    idx = res["indices"]  # (b*sq, kernel_topk) int32, -1 invalid
     valid = (idx >= 0) & (idx < seq_lens.unsqueeze(1))
     safe_idx = idx.clamp(min=0, max=max(sk - 1, 0)).long()
     selected_scores = torch.gather(scores_flat, 1, safe_idx)
@@ -189,7 +198,10 @@ def indexer_select_kernel(
     idx = torch.gather(idx, 1, score_order)
     selected_scores = torch.gather(selected_scores, 1, score_order)
 
-    selected_count = seq_lens.clamp(min=0, max=topk_k).long()
+    idx = idx[:, :selected_width]
+    selected_scores = selected_scores[:, :selected_width]
+
+    selected_count = seq_lens.clamp(min=0, max=selected_width).long()
     threshold_position = (selected_count - 1).clamp(min=0).unsqueeze(1)
     threshold = torch.gather(selected_scores, 1, threshold_position).squeeze(1)
     threshold = torch.where(
@@ -208,13 +220,15 @@ def indexer_select_kernel(
     )
     smallest_tie_ids = torch.topk(
         tie_keys,
-        k=topk_k,
+        k=selected_width,
         dim=-1,
         largest=True,
         sorted=True,
     ).indices.to(torch.int32)
-    positions = torch.arange(topk_k, device=q_idx.device).unsqueeze(0)
-    tie_positions = (positions - above_count.unsqueeze(1)).clamp(min=0, max=topk_k - 1)
+    positions = torch.arange(selected_width, device=q_idx.device).unsqueeze(0)
+    tie_positions = (positions - above_count.unsqueeze(1)).clamp(
+        min=0, max=selected_width - 1
+    )
     idx = torch.where(
         positions < above_count.unsqueeze(1),
         idx,
@@ -223,9 +237,12 @@ def indexer_select_kernel(
     idx = torch.where(
         positions < selected_count.unsqueeze(1), idx, torch.full_like(idx, -1)
     )
-    if topk_k < topk:
+    if selected_width < topk:
         pad = torch.full(
-            (b * sq, topk - topk_k), -1, dtype=torch.int32, device=q_idx.device
+            (b * sq, topk - selected_width),
+            -1,
+            dtype=torch.int32,
+            device=q_idx.device,
         )
         idx = torch.cat([idx, pad], dim=-1)
     return idx.view(b, sq, -1)
