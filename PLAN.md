@@ -135,7 +135,7 @@ tests/test_dsa/
 
 ## 当前状态
 
-- 当前结论（2026-07-12）：步骤 1–7 已按用户要求在单个 GPU0–7、`world_size=cp_size=8` 组上完成 B300/SM103 复验；先前四个 CP2 pair 的结果继续只作历史。验收代码是 branch `magi-dsa-v4-plan-grpcoll` 上以 `b9a75402320d0f067380001180804c6fddf5ff93` 为基线的当前未提交 diff；本轮未代用户创建 commit。
+- 2026-07-12 结论：步骤 1–7 已按用户要求在单个 GPU0–7、`world_size=cp_size=8` 组上完成 B300/SM103 开发复验；先前四个 CP2 pair 的结果继续只作历史。相关实现已整理为可审查 commits；本节下方的计数仍是当日开发矩阵的历史证据，不是步骤 9 的 final-image 验收结果。
 - 环境：image `sha256:b4aca4fdd2ad71ba398ea9ef9a93e9530c8df9c17bfe021ec9b725a362ee49da`，PyTorch `2.13.0a0+8145d630e8.nv26.06`、CUDA 13.3、8× B300 capability `(10,3)`、全 GPU pair `NV18`。容器内安装 `nvidia-nvshmem-cu13==3.6.5`；`magi_attn_ext`/`magi_attn_comm` SHA256 分别为 `0427073e7a0f16450bade229528638bfd1c9f610bf31d00f04d7f7899ffa0eaf` / `ca98aa8439007b647c52b8aa4e18b6b0beb631593846445bd877528346c87030`。native handle 实测为 `GrpCollIntraHandle`，`num_rdma_ranks=1`，没有 A2AV fallback。
 - CP8 native 配置固定 `num_sms=20`、`num_nvl_bytes=1073741824`（每个 `(group,buffer_name)` 1 GiB）、`num_rdma_bytes=0`，`NVSHMEM_SYMMETRIC_SIZE` unset/N/A。7168-wide BF16 GroupCast/FP32 GroupReduce 的 7-way fan-out/fan-in 逐元素精确；五个常驻 buffer 含 workspace 的静态下限为 5.15625 GiB/GPU，native full backward 已实际分配并通过。
 
@@ -149,10 +149,11 @@ tests/test_dsa/
 | 6 | CP8 reference/kernel/native 完整 backward、四路反向 GroupReduce、owner/replicated 参数与 sink 梯度、最小 saved-state、短样本可微零 KL 通过。 |
 | 7 | CP8 2×2 overlap、gradient accumulation、双 in-flight、A2AV/native reentrant、retain-graph、7 空 rank、提前退出、协调 collective drain/reuse 与 abort-request 通过。 |
 
-- 当前正式结果：`test_dsa_api.py` `32 passed`，dispatch+solver `36 passed`，packing+Megatron `18 passed`，单个 CP8 `test_dsa_cp.py` `27 passed, 0 skipped`（637.08 秒），合计 `113 passed, 0 skipped`。旧回归为单卡 `17 passed`、CP8 `2 passed`，合计 `19 passed`。Black、isort、Ruff 0.12.5、compileall 和 `git diff --check` 通过；静态扫描只允许 packed `cu_seqlens` 边界 D2H，DSA production orchestration 没有直接 torch collective。
+- 2026-07-12 canonical tiling 修复前的历史开发结果：`test_dsa_api.py` `32 passed`，dispatch+solver `36 passed`，packing+Megatron `18 passed`，单个 CP8 `test_dsa_cp.py` `27 passed, 0 skipped`（637.08 秒），当时合计 `113 passed, 0 skipped`。修复后新增两项 policy-invariant tile 回归，dispatch+solver 独立复验为 `38 passed`；不把不同 revision 的计数相加为新总数。旧回归为单卡 `17 passed`、CP8 `2 passed`，合计 `19 passed`。Black、isort、Ruff 0.12.5、compileall 和 `git diff --check` 通过；静态扫描只允许 packed `cu_seqlens` 边界 D2H，DSA production orchestration 没有直接 torch collective。最终 installed-wheel 计数以步骤 9 在同一不可变镜像上的矩阵证据为准。
 - 历史步骤 0–6 commits 和旧 H100/早期 B300 记录保留用于追溯，但出口以本表的当前 B300 零 skip 复验为准。`magi_comm.py` 技术探针未被覆盖/reset；备份仍为 `agents/backups/magi-dsa-v4-grpcoll-probe-20260709.patch`（SHA256 `b6a6b8fadb48a38dc2c9b38bb1abd1fab8d5d86f27fedb67d298bded836416ee`）。
-- 完成口径：步骤 1–7 表示 DSA 旁路在开发 worktree 中已功能接通；步骤 8 表示达到冻结的 B300 CP8 性能门槛；步骤 9 表示形成可安装、可从公共 API 使用且可合并的 MagiAttention 库级支持。真实模型接入仍不在本轮范围内。
-- 步骤 8、9 本轮均未运行：没有 B300 性能校准/20-pack timing、最终不可变 native 镜像、launcher 隔离故障矩阵或集成交付结果。
+- 完成口径：步骤 1–7 表示 DSA 旁路在开发 worktree 中已功能接通；步骤 8 的正式完成仍且仅表示达到下文冻结的 B300 CP8 20-pack 性能门槛；步骤 9 表示形成可安装、可从公共 API 使用且可合并的 MagiAttention 库级支持。真实模型接入仍不在本轮范围内。
+- 2026-07-13 用户选择在约三小时内以明确标记的 sampled/non-formal 证据先收尾仓库。该选择没有删除、降低或放宽步骤 8 的任何正式门槛：抽样结果只能支持诊断性发布判断，不能把步骤 8 标记为 formal complete，也不能由步骤 9 的测试通过反推步骤 8 已通过。
+- 已停止的正式 calibration attempt 为 `b300-cp8-calibration-66d69258-20260713T054451Z`，revision `66d69258fc9df1ee96f4c91df5d8225173b7fae2`，image `sha256:81f635bd1bcadf0eb159d75621744ab32fa978cf7961a9a6e07021791b27aba2`。其 `progress.json` 为 `57/120`：完成 ratio 0 的 40 个 case-pack 单元，以及 `r4-sequential-00` 的 packs 0–16。容器在 `2026-07-13T07:45:12Z` 收到外部 `SIGTERM` 后终止，非 OOM，也不是 fail-stop 用例；该目录只保留为 external-SIGTERM stopped-run 的 progress+正确性诊断证据，不得 resume、拟合正式系数或通过正式 validator。Run 目录内 `progress.json` 的文件 SHA256 为 `6f5520099807c290452b1a68da479e95240dbb1c9dfb19e54cc8908c025c528f`；`agents/perf/magi-dsa-v4-release/calibration-logs` 下对应 `magi-dsa-calibration-66d69258-20260713t054451z-sampled-closeout.docker-events.jsonl` 和 `magi-dsa-calibration-66d69258-20260713t054451z-sampled-closeout.termination.json` 的文件 SHA256 分别为 `308245df4cdf2cf8db521960fb6ab5f1a3b9cab7e4823909ca20f3eb4ee81ce7` 和 `927974b501330e4339a9e2793b5236697eb92d46294dc8733d0e1bd148c50870`。
 
 ## 具体实施步骤
 
@@ -183,7 +184,7 @@ tests/test_dsa/
 - commit：`5bc0ab3d`（`Add public Magi DSA runtime API`）。
 - 历史测试（非当前验收）：旧冻结镜像 `sha256:9c51e29d1fda8fc1a6e2a8e16c7b0773309e91dcbd44cf6d0182e5e3327c1029` 上 `test_dsa_api.py` 为 `21 passed`，旧回归为 `17 tests OK`；当前出口以另行追加的 B300/SM103 复验记录为准。
 - 静态检查：Black 与 isort 对新增 Python 文件检查通过；`python -m compileall` 通过。
-- 历史报告：`tests/test_dsa/README.md`、`tests/test_dsa/README_zh.md`；当时 CP=2 只构造 `DsaStaticPlan(communication_ready=False)`，未引入 collective。当前 CP8 出口以“当前状态”重新回填的正式结果为准。
+- 历史报告：`tests/test_dsa/README.md`、`tests/test_dsa/README_zh.md`；当时 CP=2 只构造 `DsaStaticPlan(communication_ready=False)`，未引入 collective。当前 CP8 出口最终以步骤 9 从同一不可变 installed-wheel 镜像产生并回填的矩阵证据为准。
 
 ### 步骤 2：实现 fragment plan 和 Indexer solver
 
@@ -312,7 +313,7 @@ tests/test_dsa/
 
 ### 步骤 8：B300 CP8 性能验收
 
-状态：未执行；步骤 1–7 全绿且公共 API 形态冻结后开始。本步骤完成性能校准和验收，不再重复功能接入。
+状态：**sampled/non-formal 诊断收尾已完成；正式步骤 8 未完成。** Sampled ratio-4 性能方向为失败，且未运行 profile；步骤 1–7 已全绿且公共 API 形态已冻结，下列 20-pack 合同仍是将来重新打开 formal acceptance 时的唯一完成标准。
 
 - 产物：新增 `agents/benchmarks/magi-dsa-v4-balance/` 下的 benchmark driver、README 和 report schema；结果写入 `agents/perf/magi-dsa-v4-balance/<RUN_ID>`，profile 写入 `agents/profiles/magi-dsa-v4-balance/<RUN_ID>`。具体命令、环境检查和字段定义放在 README/schema，不在本计划重复。
 - 前置：先补齐并冻结公共 config 导出和安装 smoke，使用户无需依赖 `experimental` import；再使用 clean pinned commit、不可变 native 镜像和单节点 GPU `0..7` 的唯一 `world_size=cp_size=8` 组。实际装载 `GrpCollIntraHandle`，禁止 A2AV fallback；镜像 revision、依赖、SM103、NVLink 和冻结的 1 GiB-per-buffer 配置由 driver preflight 校验。
@@ -325,12 +326,27 @@ tests/test_dsa/
   4. 20/20 packs、8/8 ranks、10/10 iterations 和 native backend 证据完整，ratio=4 timeline 证明两个 overlap 区间真实发生；无 skip、NaN、watchdog、OOM、JIT/cache miss 或工作量不等价。
 - 证据：保存 revision/image/environment、pack hashes、raw timing、summary、固定 pack profile 和 `artifact_manifest.sha256`。measure 后若 runtime/kernel/solver 行为变化，必须使用新 revision、image 和 RUN_ID 重跑本步骤。
 
+本轮 time-boxed sampled closure 冻结为以下独立口径；它不修改上述正式合同：
+
+- 非正式 calibration 使用相同 seed-42 冻结 pack 文件，但只选择 packs `[0, 1]`，并执行六个 calibration cases：`r0-sequential-00`、`r0-balanced-00`、`r4-sequential-00`、`r4-balanced-00`、`r128-sequential-00`、`r128-balanced-00`，共 12 个 case-pack 单元。输出 target 必须是 `sampled-b300-sm103`，并显式记录 `formal=false`、`scope=sampled_non_formal`；冻结工具只能通过显式 `--allow-sampled-non-formal` 接受它。
+- 从抽样系数重建 final image 后，性能诊断目标为 9 个 case-pack 单元：pack 0 运行 ratio 4 的 `sequential:00` 与 balanced `00/01/10/11` 完整 2×2 矩阵；pack 16 运行 ratio 4 的 `sequential:00`/`balanced:11`；pack 0 运行 ratio 128 的 `sequential:00`/`balanced:11`。仍执行 1 compile、2 warm-up、10 measure 和逐元素 forward/全部梯度对拍，但 summary 必须保持 `formal_acceptance=false`、`formal_gates_evaluated=false`。
+- 三类 run 的 pack 集合必须分开记录：stopped formal attempt 的 ratio 0 覆盖全部 20 packs，ratio 4 sequential 覆盖 packs 0–16；sampled calibration 只选 packs `[0, 1]`；final-image sampled measure 只选 packs `[0, 16]`。不得把它们合并成一个新 pack 集合、描述为“五个 packs 的新 measure”，或据此声称 20/20 candidate imbalance 与正式 speed gate 已验证。
+- Sampled calibration 已完成：run `b300-cp8-sample-calibration-20260713T083426Z`，revision `66d69258fc9df1ee96f4c91df5d8225173b7fae2`，image `sha256:81f635bd1bcadf0eb159d75621744ab32fa978cf7961a9a6e07021791b27aba2`，进度 `12/12`，记录数 correctness `12`、plans `96`、raw timing `960`，target `sampled-b300-sm103`、scope `sampled_non_formal`、`formal=false`。冻结系数 ID 为 `df625f1805024f6c7c78e2bdcb07476c8be94347c3e762a80006a87aea0e882d`；`sample_calibration.json` SHA256 为 `5d42c3ea327cf866f7faed7db3334d5d8c7cf56e44d1b60624c219d608e4c0e3`，`artifact_manifest.sha256` 文件 SHA256 为 `82ccd78736f7972b4160e442350ea8fee63a591bfe2597ed46d427c74e742883`，证据目录为 `agents/perf/magi-dsa-v4-balance-sampled/b300-cp8-sample-calibration-20260713T083426Z`。ratio 4 的 bounded least-squares 拟合为 `R²=0.923198`、`RMSE=83.118 ms`；它只含两个独立 packs，且 window/overlap 特征严格共线（`window_rows = 31.75 * overlap_rows`，design rank `6/7`），因此两项系数不可分别识别，只能作为 sampled diagnostic，不能证明正式模型拟合质量。
+- 已从仅含 matrix 修复的 clean revision `f8ad2e5d4f8bfa1b8f80ffdc02411379e20930f9` 构建当前 sampled-closeout candidate：installed package `1.1.1+dsa.f8ad2e5d4f8b`，不可变 image ID `sha256:12075f8738456a417cac72f39a328378bb1bb1ee313c5fd7c34c92c6d0bf5c37`，证据目录 `agents/perf/magi-dsa-v4-release/sampled-final-f8ad2e5d-20260713T104133Z`。嵌入的 `/opt/magi-dsa-build-manifest.json` SHA256 为 `c07f71865a118786e43a54d3c980b14ffaa2db0484ec5e8094ed671ae57e7519`；目录内 `artifact_manifest.sha256`、`image_id.txt`、`package_version.txt`、`installed-wheel-smoke.log`、`image_inspect.json` 和 `docker-build.log` 的文件 SHA256 依次为 `fa69dad9035c326cea00f6dc8ec7865ec3ea9f8bc568cf6a54a64fc7dfd13eff`、`27f7f3362179b16d6faf7541b55db5f86bce8506cab0af8164293b2a29b55985`、`965323aa062b7753d197ccf7b0920ad546316c6da7182a5c59224f8976768cce`、`eebb12ff3aa2518e74cbc3b9dad5cb04e0b3a2d75877228758eaf6bc534951c5`、`7417ec701e0b6f592be477df8269dbbf58ce9c7204c0c6ea8a4d778177f1c674`、`15d5a5be9c7b496b930fc02b236496e840f3fed01f1dfbfc6e4efc3635fc02a8`。Installed-wheel smoke 已通过；该镜像只用于 sampled-closeout final matrix，不是 formal release image，也不满足正式步骤 8。修复未改变 runtime/kernel/solver，已封存的 9-unit sampled timing 仍归属于旧 f88 镜像且不重跑；旧 f88 镜像同时作为失败矩阵前身保留。
+- Predecessor f88 sampled timing 已完成 9/9 个 case-pack 单元的 correctness，产生 plans `72`、raw timing `720`。三个源 run `b300-cp8-sample-measure-a-f88ca22d-20260713T093515Z`、`b300-cp8-sample-measure-b-f88ca22d-20260713T101533Z` 和 `b300-cp8-sample-measure-c-f88ca22d-20260713T103247Z` 的 `artifact_manifest.sha256` 文件 SHA256 分别为 `8ec095b475228012a2029a49066595692ae7c431fb12fe0a33981c952a7948f5`、`a508503306049cc5460640b6babdb1ef69be2a942ea3bd210ba5c37e7013741e` 和 `7423cfc56ad63ee8f2f9f6c4716eff7f9f6164ca7890e9e8a76f8c19dcf6d64c`。聚合证据目录为 `agents/perf/magi-dsa-v4-balance-sampled/b300-cp8-sample-measure-f88ca22d-20260713T103500Z-aggregate`；其中 `sampled_measure_diagnostic.json` SHA256 为 `47fb9e1ab4e852be90046c03438ac29ef8c29c552193cfe68e9ff36e262cded5`，`artifact_manifest.sha256` 文件 SHA256 为 `955e17348d4ab00c11a582be2c2dfb4b7bcb6abe79bd9d8eadb6d89dfc93a62b`。Artifact 明确记录 `formal=false`、`formal_acceptance=false`、`formal_gates_evaluated=false`、`all_gates_pass=null`。ratio 4 packs 0/16 两包诊断的 baseline/candidate E2E 为 `28602.9863/29245.3057 ms`，candidate 慢 `2.245637%`；Indexer 为 `474.7959/493.6558 ms`，candidate 慢 `3.972199%`，因此 `sampled_performance_observation_pass=false`，但两包 candidate E2E rank imbalance 均不超过 5%。ratio 128 pack 0 的 E2E 为 `321.7919/320.7076 ms`，candidate 快 `0.336954%`，rank imbalance 为 `0.10824%`。这些只是 sampled observations，不是正式 gate 结果。Sampled/diagnostic profile 未运行，未产生 profile artifact；正式 ratio-4 Nsight overlap 门槛未评估。任何 sampled 值都不能填入正式 `validation.json`/20-pack 门槛栏。
+
 ### 步骤 9：最终验收与交付
 
-状态：未执行；步骤 8 全部门槛通过并冻结 artifact manifest 后开始。
+状态：**sampled closure 下的安装包/交付已完成；formal step-8 prerequisite 未满足，不宣称 formal release qualification。** Final image 上的 public API、CP1、CP8 native 和隔离 fail-stop 四个有序 case 已全部通过并封存；这不会把 sampled 性能证据升级为 formal acceptance。
+
+首次步骤 9 run `b300-cp8-final-f88ca22d-20260713T103532Z` 使用旧 f88 `sha256:4bd9b55dd1303043256fd6accf79a5362f630b85448a5425958c42a2467d0bea` 镜像：public smoke `8.679 s` 通过，CP1 `93/93` 在 `99.657 s` 通过，CP8 在 `7.728 s` 得到 `4 passed, 14 failed` 后按序停止。根因是 pytest importlib mode 下从 `/tmp` 启动的 spawn 子进程无法导入 `tests`（`ModuleNotFoundError: tests`），不是 DSA correctness、OOM 或 watchdog 故障；将单项诊断改为 `--import-mode=append` 后，native 8-rank test 为 `1 passed`（`36.61 s`），同时 `magi_attention` 仍从 installed-wheel `site-packages` 导入。失败 run 的 manifest 文件 SHA256 为 `81f8f21a524f4d2dd050ca591358234b133f222de8e03523c75b083caf44757d`，outer manifest 文件 SHA256 为 `0818fe00f144b63d7718e8d38f3a775a91da4acef824419b639491b3a59107b3`。修复 commits 为 DEV `e8f50e97896fec4eee5646988e6797e9c5a8b76c`、integration `f8ad2e5d4f8bfa1b8f80ffdc02411379e20930f9`；重建后的 final Step9 candidate 是上文已封存的 f8 镜像。旧 f88 镜像现仅作为 sampled timing 与失败矩阵前身保留。
+
+封存的最终矩阵 run 为 `b300-cp8-final-f8ad2e5d-20260713T110210Z`，使用 revision `f8ad2e5d4f8bfa1b8f80ffdc02411379e20930f9`、package `1.1.1+dsa.f8ad2e5d4f8b` 和 image `sha256:12075f8738456a417cac72f39a328378bb1bb1ee313c5fd7c34c92c6d0bf5c37`；`status=passed`、`error=null`。Installed public-API smoke 用时 `8.629054 s`；CP1 用时 `100.860094 s`，JUnit `93/93`、fail/error/skip 均为 0；CP8 native 用时 `550.507443 s`，JUnit `18/18`、fail/error/skip 均为 0；隔离 fail-stop case 用时 `47.943240 s`。fault rank 3 以 rc `86` 退出，7 个 peer 均已发起 native GroupCast，并在 `3.064738 s` 内全部回收，`survivors=[]`；新进程组的 8/8 ranks 均 rc `0`、handle 为 `GrpCollIntraHandle`，配置为 NVL `1073741824`、RDMA `0`、`num_rdma_ranks=1`、`num_sms=20`。
+
+容器 inspect 证明 exit `0`、OOM false、image 精确匹配、仅挂载一个 artifact 目录、无 source bind，且未设置 `NVSHMEM_SYMMETRIC_SIZE`。证据根为 `agents/perf/magi-dsa-v4-release/final-matrix-f8ad2e5d`；inner `artifact_manifest.sha256`、outer `artifact_manifest.sha256`、`final_result.json`、`fault_result.json` 和 inspect 文件 SHA256 分别为 `fdc9a4cd0a96a5f69d554d6b89c898f6c83de1a26e81ab53de7e22285ae20c11`、`b045d7fb03db5e03f47c16c43a5dfde862e64545791bc3ad58c68eda47977d11`、`bb83d46d7f1e0b2a2db4591b4cbe8f45dffafaf3b5adc8d5dc5a7859e5cf1687`、`77cfa8a1a937a8281bc590cd3c6b7fdf2098e68796adfe52c2133ef3c24783e1` 和 `6420dcac04ca064a2bbe4d9ec239e52a9e550fbd154de2d0247273807ff59449`；只读 verify 对 80 个 artifacts 全部通过。矩阵测试的 integration HEAD 为 `f8ad2e5d4f8bfa1b8f80ffdc02411379e20930f9`，对应 DEV commit 为 `e8f50e97896fec4eee5646988e6797e9c5a8b76c`，两者文档编辑前的 committed tree 均为 `38846f45dc5c10b30d0679f1f6decc252e78c1b2`；最终文档 commits 由交付回复记录，以避免把 commit 自引用写进其自身内容。
 
 
-- 公共接口：从安装后的 `magi_attention.api` 可稳定导入并运行 `calc_dsa`、结构化输入、runtime 和所需 config；用户示例不得依赖 `experimental` import。删除experimental。
+- 公共接口：从安装后的 `magi_attention.api` 可稳定导入并运行 `calc_dsa`、结构化输入、runtime 和所需 config；用户示例只能依赖该稳定命名空间，production-wheel smoke 必须证明 `magi_attention.experimental` 无法解析。其他历史 worktree 或备份中的 prototype 不属于已安装 wheel/public API，本步骤不以物理删除这些外部历史文件为交付条件。
 - 最终矩阵：用 `final_matrix.json` 顺序运行 CP=1 oracle 和单个 CP8 native 零-skip 测试，覆盖三种 ratio、reference/kernel、sequential/balanced、packed forward/backward 与全部梯度、solver/packing/Megatron compressor parity、四类 GroupCast/Reduce、2×2 overlap、并发/reentrant、空 rank、drain/abort/提前退出。隔离单 rank 不可恢复故障由外部 launcher 在 60 秒内回收全部 8 个 worker。
 - 文档：同步设计、公共 API/config、最小可运行示例、tensor/ratio/KL/梯度与 saved-state 合同、CP8 native 配置、故障语义、测试命令和性能结果；删除或降级尚无正式证据的 full-layer/drop-in 声明。
 - 交付：保留用户现有 dirty worktree，不 reset/clean/stash；把本任务整理为可审查原子 commits，并在独立干净 integration worktree 验证 cherry-pick、最终矩阵和固定子仓指针。
@@ -350,3 +366,4 @@ tests/test_dsa/
 - 2026-07-12：按用户澄清，8 卡验收必须是单个 `world_size=cp_size=8` 组；CP1 只作 oracle，CP2 只作兼容且不计出口。步骤 1–7 必须以 CP8 在 B300 重跑，步骤 8/9 也只能使用唯一八卡组，禁止 pair 分片；步骤 8/9 本轮仅修改计划、不运行。
 - 2026-07-12：真实 B300 A2AV 故障探针确认 `ProcessGroup.abort()` 不能保证解除已经卡在 CUDA stream wait 的 peer。冻结异常合同据此改为 best-effort abort + 外部 launcher 60 秒 fail-stop watchdog；协调异常继续验证 drain/reuse，不再声称不可恢复 native 故障可在同一进程组恢复。
 - 2026-07-12：步骤 8/9 的顶层计划只保留前置、动作、硬门槛和出口；命令、schema 字段、容器挂载与 Git 操作细节下沉到 benchmark README/validator。完成口径限定为 MagiAttention 库级 DSA 支持，真实模型接入另立任务。
+- 2026-07-13：为在约三小时内先收尾仓库，用户选择 sampled/non-formal 路径。正式 calibration attempt 在 `57/120` 停止并只作诊断；抽样系数 target 固定为 `sampled-b300-sm103`，最终 summary 必须保持 `formal_acceptance=false`。步骤 8 的 20-pack、10-iteration、逐 pack 5% imbalance、speed 和 Nsight overlap 门槛均未被放宽，后续若要求正式关闭必须从 fresh RUN_ID 完整重跑。
