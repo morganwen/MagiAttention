@@ -67,6 +67,7 @@ from validate import (  # noqa: E402
     WORLD_SIZE,
     CaseSpec,
     atomic_write_json,
+    expected_progress_units,
     pack_sha256,
     pack_suite_sha256,
     read_json,
@@ -1167,6 +1168,7 @@ def _claim_fresh_run_dir(run_dir: Path, environment: Mapping[str, Any]) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     canonical = (
         "environment.json",
+        "progress.json",
         "packs.json",
         "report.schema.json",
         "raw_timing.jsonl",
@@ -1204,6 +1206,40 @@ def _claim_fresh_run_dir(run_dir: Path, environment: Mapping[str, Any]) -> None:
         stream.write("\n")
         stream.flush()
         os.fsync(stream.fileno())
+
+
+def _write_progress(
+    run_dir: Path,
+    environment: Mapping[str, Any],
+    *,
+    expected_units: Sequence[Mapping[str, Any]],
+    completed_units: Sequence[Mapping[str, Any]],
+    started_at_utc: str,
+) -> None:
+    """Atomically publish run-bound progress after a synchronized unit."""
+
+    _require(
+        len({(item["case_id"], item["pack_index"]) for item in completed_units})
+        == len(completed_units),
+        "progress contains duplicate completed case-pack units",
+    )
+    atomic_write_json(
+        run_dir / "progress.json",
+        {
+            "schema_version": SCHEMA_VERSION,
+            "run_id": environment["run_id"],
+            "mode": environment["mode"],
+            "revision": environment["revision"],
+            "image_id": environment["image_id"],
+            "calibration_id": environment["calibration_id"],
+            "started_at_utc": started_at_utc,
+            "updated_at_utc": _utc_now(),
+            "expected_units": list(expected_units),
+            "expected_unit_count": len(expected_units),
+            "completed_units": list(completed_units),
+            "completed_unit_count": len(completed_units),
+        },
+    )
 
 
 def _fit_calibration(
@@ -1298,6 +1334,10 @@ def _run_distributed(args: argparse.Namespace) -> int:
         "profile": PROFILE_CASES,
     }[mode]
     artifact_mode = "calibration" if mode == "calibrate" else mode
+    selected_packs = [packs[PROFILE_PACK_INDEX]] if mode == "profile" else list(packs)
+    expected_units = expected_progress_units(artifact_mode)
+    completed_units: list[dict[str, Any]] = []
+    progress_started_at_utc = _utc_now()
     environment = _distributed_preflight(
         torch,
         dist,
@@ -1316,6 +1356,13 @@ def _run_distributed(args: argparse.Namespace) -> int:
         )
     if rank == 0:
         _claim_fresh_run_dir(run_dir, environment)
+        _write_progress(
+            run_dir,
+            environment,
+            expected_units=expected_units,
+            completed_units=completed_units,
+            started_at_utc=progress_started_at_utc,
+        )
         (run_dir / "_rank").mkdir(parents=True, exist_ok=True)
         atomic_write_json(run_dir / "environment.json", environment)
         atomic_write_json(run_dir / "packs.json", packs_payload)
@@ -1326,7 +1373,6 @@ def _run_distributed(args: argparse.Namespace) -> int:
     raw_records: list[dict[str, Any]] = []
     plan_records: list[dict[str, Any]] = []
     correctness_records: list[dict[str, Any]] = []
-    selected_packs = [packs[PROFILE_PACK_INDEX]] if mode == "profile" else list(packs)
 
     for case in cases:
         runtime = _make_runtime(torch, case, group)
@@ -1499,6 +1545,21 @@ def _run_distributed(args: argparse.Namespace) -> int:
                 del output, kl_loss, loss
             if mode == "profile":
                 torch.cuda.cudart().cudaProfilerStop()
+            # This barrier is deliberately outside every CUDA-event timing
+            # window. Rank 0 advances durable progress only after all ranks
+            # completed this case-pack unit.
+            dist.barrier(group=group)
+            if rank == 0:
+                completed_units.append(
+                    {"case_id": case.case_id, "pack_index": pack_index}
+                )
+                _write_progress(
+                    run_dir,
+                    environment,
+                    expected_units=expected_units,
+                    completed_units=completed_units,
+                    started_at_utc=progress_started_at_utc,
+                )
             del dsa_input, output_gradient, global_rows
             torch.cuda.empty_cache()
         del runtime

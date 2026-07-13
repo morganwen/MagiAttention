@@ -368,6 +368,115 @@ def _expected_cases(mode: str) -> tuple[CaseSpec, ...]:
     raise ValidationError(f"unknown run mode {mode!r}")
 
 
+def expected_progress_units(mode: str) -> list[dict[str, Any]]:
+    """Return the canonical case-pack units for one benchmark run."""
+
+    pack_indices = (
+        (PROFILE_PACK_INDEX,) if mode == "profile" else tuple(range(PACK_NUM))
+    )
+    return [
+        {"case_id": case.case_id, "pack_index": pack_index}
+        for case in _expected_cases(mode)
+        for pack_index in pack_indices
+    ]
+
+
+def validate_progress(
+    progress: Mapping[str, Any],
+    environment: Mapping[str, Any],
+    *,
+    mode: str,
+) -> None:
+    """Require a complete, run-bound set of synchronized case-pack units."""
+
+    expected_fields = {
+        "schema_version",
+        "run_id",
+        "mode",
+        "revision",
+        "image_id",
+        "calibration_id",
+        "started_at_utc",
+        "updated_at_utc",
+        "expected_units",
+        "expected_unit_count",
+        "completed_units",
+        "completed_unit_count",
+    }
+    _require(
+        set(progress) == expected_fields,
+        "progress has missing or unexpected top-level fields",
+    )
+    expected_identity = {
+        "schema_version": SCHEMA_VERSION,
+        "run_id": environment.get("run_id"),
+        "mode": mode,
+        "revision": environment.get("revision"),
+        "image_id": environment.get("image_id"),
+        "calibration_id": environment.get("calibration_id"),
+    }
+    for name, expected in expected_identity.items():
+        _require(
+            progress.get(name) == expected,
+            f"progress {name}={progress.get(name)!r}, expected {expected!r}",
+        )
+
+    expected_units = expected_progress_units(mode)
+    expected_keys = {
+        (unit["case_id"], unit["pack_index"]) for unit in expected_units
+    }
+    _require(
+        progress.get("expected_units") == expected_units,
+        "progress expected_units is not the canonical case-pack sequence",
+    )
+    _require(
+        isinstance(progress.get("expected_unit_count"), int)
+        and not isinstance(progress["expected_unit_count"], bool)
+        and progress["expected_unit_count"] == len(expected_units),
+        "progress expected_unit_count mismatch",
+    )
+    completed_units = progress.get("completed_units")
+    _require(isinstance(completed_units, list), "progress completed_units must be a list")
+    completed_keys: set[tuple[str, int]] = set()
+    for index, unit in enumerate(completed_units):
+        _require(isinstance(unit, dict), f"progress unit {index} must be an object")
+        _require(
+            set(unit) == {"case_id", "pack_index"},
+            f"progress unit {index} has unexpected fields",
+        )
+        case_id = unit.get("case_id")
+        pack_index = unit.get("pack_index")
+        _require(
+            isinstance(case_id, str)
+            and isinstance(pack_index, int)
+            and not isinstance(pack_index, bool),
+            f"progress unit {index} has invalid field types",
+        )
+        key = (case_id, pack_index)
+        _require(key in expected_keys, f"unexpected progress unit {key}")
+        _require(key not in completed_keys, f"duplicate progress unit {key}")
+        completed_keys.add(key)
+    _require(
+        isinstance(progress.get("completed_unit_count"), int)
+        and not isinstance(progress["completed_unit_count"], bool)
+        and progress["completed_unit_count"] == len(completed_units),
+        "progress completed_unit_count mismatch",
+    )
+    _require(
+        completed_keys == expected_keys,
+        "progress does not contain the exact final case-pack unit set",
+    )
+    _require(
+        completed_units == expected_units,
+        "progress completed_units is not in canonical execution order",
+    )
+    for name in ("started_at_utc", "updated_at_utc"):
+        _require(
+            isinstance(progress.get(name), str) and bool(progress[name]),
+            f"progress {name} is missing",
+        )
+
+
 def validate_raw_records(
     records: Sequence[Mapping[str, Any]],
     packs: Sequence[Mapping[str, Any]],
@@ -1258,6 +1367,9 @@ def validate_run(
         expected_revision=expected_revision,
         expected_image_id=expected_image_id,
     )
+    validate_progress(
+        read_json(run_dir / "progress.json"), environment, mode=mode
+    )
     packs = validate_packs(read_json(run_dir / "packs.json"))
     raw = read_jsonl(run_dir / "raw_timing.jsonl")
     plans = read_jsonl(run_dir / "plans.jsonl")
@@ -1293,6 +1405,11 @@ def validate_run(
                 mode="profile",
                 expected_revision=str(environment["revision"]),
                 expected_image_id=str(environment["image_id"]),
+            )
+            validate_progress(
+                read_json(profile_dir / "progress.json"),
+                profile_environment,
+                mode="profile",
             )
             _require(
                 profile_environment["run_id"] == environment["run_id"],
@@ -1466,6 +1583,79 @@ def _self_test() -> None:
         "packs_sha256": pack_suite_sha256(packs),
     }
     validate_packs(payload)
+    progress_environment = {
+        "run_id": "self-test",
+        "revision": "0" * 40,
+        "image_id": "sha256:" + "0" * 64,
+        "calibration_id": "1" * 64,
+    }
+    for progress_mode, expected_count in (
+        ("calibration", 120),
+        ("measure", 180),
+        ("profile", 1),
+    ):
+        progress_units = expected_progress_units(progress_mode)
+        _require(
+            len(progress_units) == expected_count,
+            f"{progress_mode} progress unit count changed",
+        )
+        progress_payload = {
+            "schema_version": SCHEMA_VERSION,
+            "run_id": progress_environment["run_id"],
+            "mode": progress_mode,
+            "revision": progress_environment["revision"],
+            "image_id": progress_environment["image_id"],
+            "calibration_id": progress_environment["calibration_id"],
+            "started_at_utc": "2026-07-12T00:00:00+00:00",
+            "updated_at_utc": "2026-07-12T01:00:00+00:00",
+            "expected_units": progress_units,
+            "expected_unit_count": len(progress_units),
+            "completed_units": progress_units,
+            "completed_unit_count": len(progress_units),
+        }
+        validate_progress(
+            progress_payload, progress_environment, mode=progress_mode
+        )
+        partial_progress = dict(progress_payload)
+        partial_progress["completed_units"] = progress_units[:-1]
+        partial_progress["completed_unit_count"] = len(progress_units) - 1
+        try:
+            validate_progress(
+                partial_progress, progress_environment, mode=progress_mode
+            )
+        except ValidationError:
+            pass
+        else:
+            raise ValidationError(
+                f"{progress_mode} partial progress was incorrectly accepted"
+            )
+        extra_field_progress = dict(progress_payload)
+        extra_field_progress["unexpected"] = "field"
+        try:
+            validate_progress(
+                extra_field_progress, progress_environment, mode=progress_mode
+            )
+        except ValidationError:
+            pass
+        else:
+            raise ValidationError(
+                f"{progress_mode} progress with an extra field was accepted"
+            )
+        for count_field in ("expected_unit_count", "completed_unit_count"):
+            boolean_count_progress = dict(progress_payload)
+            boolean_count_progress[count_field] = True
+            try:
+                validate_progress(
+                    boolean_count_progress,
+                    progress_environment,
+                    mode=progress_mode,
+                )
+            except ValidationError:
+                pass
+            else:
+                raise ValidationError(
+                    f"{progress_mode} progress accepted boolean {count_field}"
+                )
     records: list[dict[str, Any]] = []
     for case in MEASURE_CASES:
         candidate = case.policy == "balanced" and case.overlap_code == "11"

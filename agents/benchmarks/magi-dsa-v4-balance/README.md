@@ -30,6 +30,10 @@ the DSA balance gates.
 - One compile pass, two warm-up passes, then ten measured iterations per
   `(case, pack, rank)`. Input construction, barriers, correctness checks,
   synchronization and artifact writes are outside the CUDA-event window.
+- `progress.json` is run-local, identity-bound evidence at case-pack
+  granularity. Rank 0 creates it with zero completed units immediately after
+  the fresh-directory claim, then atomically advances it only after an
+  out-of-window barrier proves all eight ranks completed that case-pack.
 
 The measure case matrix is fixed:
 
@@ -171,6 +175,15 @@ non-finite output, missing records, a packing cache miss during measure,
 correctness mismatch, native fallback, watchdog termination, or any worker
 failure makes the run invalid. There is no `skip` mode.
 
+The driver never resumes a claimed directory. `progress.json` binds the schema,
+run ID, mode, source revision, immutable image ID, and calibration ID, and
+contains canonical expected/completed case-pack unit lists plus both counts.
+Validation of calibration, measure, and profile runs requires the completed
+units to be unique and exactly equal to the mode's expected set (120, 180, and
+1 units respectively). A partial progress file is useful fail-stop evidence,
+but it is never accepted as a completed run; `progress.json` is also included
+in fresh-run stale-artifact detection and the final SHA256 manifest.
+
 ## Correctness gate
 
 Logical row values are generated deterministically from packed-global row IDs,
@@ -191,6 +204,7 @@ for CP replication. Moments/digests are never used for acceptance.
 
 ```text
 environment.json
+progress.json            # atomic case-pack completion evidence
 packs.json
 plans.jsonl
 correctness.jsonl

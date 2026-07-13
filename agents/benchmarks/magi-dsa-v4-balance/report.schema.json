@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/SandAI-org/MagiAttention/magi-dsa-v4-balance-v1.schema.json",
   "title": "Magi_DSA V4 B300 CP8 benchmark artifacts",
-  "description": "Schema definitions for environment.json, packs.json, JSONL timing/plan/correctness records, summary.json and calibration.json. The executable validator additionally enforces exact counts, hashes and performance inequalities.",
+  "description": "Schema definitions for environment.json, progress.json, packs.json, JSONL timing/plan/correctness records, summary.json and calibration.json. The executable validator additionally enforces exact counts, hashes and performance inequalities.",
   "$defs": {
     "sha256": {
       "type": "string",
@@ -179,6 +179,58 @@
             "outside_source_checkout": {"const": true}
           }
         }
+      }
+    },
+    "progress_unit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["case_id", "pack_index"],
+      "properties": {
+        "case_id": {"$ref": "#/$defs/case_id"},
+        "pack_index": {"type": "integer", "minimum": 0, "maximum": 19}
+      }
+    },
+    "progress_file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "run_id",
+        "mode",
+        "revision",
+        "image_id",
+        "calibration_id",
+        "started_at_utc",
+        "updated_at_utc",
+        "expected_units",
+        "expected_unit_count",
+        "completed_units",
+        "completed_unit_count"
+      ],
+      "properties": {
+        "schema_version": {"const": "magi-dsa-v4-balance/v1"},
+        "run_id": {"type": "string", "minLength": 1},
+        "mode": {"enum": ["calibration", "measure", "profile"]},
+        "revision": {"$ref": "#/$defs/git_revision"},
+        "image_id": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "calibration_id": {"$ref": "#/$defs/sha256"},
+        "started_at_utc": {"type": "string", "minLength": 1},
+        "updated_at_utc": {"type": "string", "minLength": 1},
+        "expected_units": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 180,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/progress_unit"}
+        },
+        "expected_unit_count": {"type": "integer", "minimum": 1, "maximum": 180},
+        "completed_units": {
+          "type": "array",
+          "maxItems": 180,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/progress_unit"}
+        },
+        "completed_unit_count": {"type": "integer", "minimum": 0, "maximum": 180}
       }
     },
     "raw_timing_record": {
@@ -385,6 +437,7 @@
   "oneOf": [
     {"$ref": "#/$defs/packs_file"},
     {"$ref": "#/$defs/environment_file"},
+    {"$ref": "#/$defs/progress_file"},
     {"$ref": "#/$defs/raw_timing_record"},
     {"$ref": "#/$defs/plan_record"},
     {"$ref": "#/$defs/correctness_record"},
