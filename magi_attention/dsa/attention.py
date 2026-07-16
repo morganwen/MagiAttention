@@ -193,7 +193,7 @@ class MagiDSAV4(nn.Module):
                     compress_idxs = validate_and_offset_topk(
                         topk_indices, cfg.compress_ratio, offset
                     )
-                    topk_idxs = torch.cat([window_idxs, compress_idxs], dim=-1)
+                    topk_idxs = torch.cat([compress_idxs, window_idxs], dim=-1)
                     kv_full_sel = kv_full
                     output = self._run_attention(
                         query, kv_full_sel, attn_sink, topk_idxs, cfg
@@ -237,7 +237,16 @@ class MagiDSAV4(nn.Module):
             topk_idxs = torch.cat([window_idxs, compress_idxs], dim=-1)
         else:
             kv_full = kv
-            topk_idxs = window_idxs
+            if cfg.backend == "kernel" and cfg.compress_ratio == 4:
+                compressed_idxs = torch.full(
+                    (b, sq, cfg.topk),
+                    -1,
+                    dtype=window_idxs.dtype,
+                    device=device,
+                )
+                topk_idxs = torch.cat([compressed_idxs, window_idxs], dim=-1)
+            else:
+                topk_idxs = window_idxs
 
         output = self._run_attention(query, kv_full, attn_sink, topk_idxs, cfg)
         return output, kl_loss
@@ -247,8 +256,21 @@ class MagiDSAV4(nn.Module):
         if cfg.backend == "kernel":
             from .kernels import sparse_attn_with_sink_kernel
 
+            indexer_prefix = (
+                cfg.topk
+                if (
+                    cfg.compress_ratio == 4
+                    and topk_idxs.size(-1) >= cfg.topk + cfg.window_size
+                )
+                else 0
+            )
             return sparse_attn_with_sink_kernel(
-                query, kv_full, attn_sink.float(), topk_idxs.int(), cfg.softmax_scale
+                query,
+                kv_full,
+                attn_sink.float(),
+                topk_idxs.int(),
+                cfg.softmax_scale,
+                indexer_prefix=indexer_prefix,
             )
         return sparse_attn_with_sink(
             query, kv_full, attn_sink.float(), topk_idxs.int(), cfg.softmax_scale

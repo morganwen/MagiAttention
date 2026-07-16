@@ -176,14 +176,21 @@ revision/artifact 不匹配都会使本轮无效。
 A2AV 只在步骤 1–7 的历史开发矩阵中作为兼容覆盖执行。步骤 8/9 正式出口只
 接受实际 `GrpCollIntraHandle` native 路径；A2AV 和 hierarchical fallback 都是硬失败。
 
-ratio 4 的每个 merged dispatch fragment 必须按 sample-relative 坐标细分为 128-row
-canonical query tiles，并在 Indexer projection、top-k、forward KL 和 backward KL
-recompute 中一致复用。dispatch ownership 可以改变通信和负载均衡，但不能改变同一
-logical query 的 GEMM row shape 或扰动 top-k 边界。
+ratio 4 的每个 owner-local dispatch fragment 直接作为一个 query tile，并在
+Indexer projection、top-k、forward KL 和 backward KL recompute 中一致复用。
+tile 不跨 sample 或 ownership 边界，也不再细分成 128-row launches，从而消除小
+GEMM 和 Indexer kernel 的 launch storm。不同 dispatch policy 可能改变 BF16 GEMM
+的 row grouping，因此跨 policy/CP parity 按冻结数值容差验收，不要求 bitwise 等价。
 
 cuDNN top-k launch 对短 sample 仍保持固定配置宽度 K=512，超过实际
 compressed-key 数的槽位填 `-1`。不得把 launch K 特化为 473 等奇数短宽度，
 否则会违反冻结 CuTe 内核两元素 vector-store 分支的整除要求。
+
+ratio-4 kernel 路径把这 512 个 compressed slots 放在 128 个 window slots
+之前，并以 `indexer_topk=512` 调用 FlashMLA。返回的 `lse_indexer` 供整 rank
+合批的 cuDNN KL-target recompute 使用，不再 gather selected KV。API 测试用
+8-valid/504-invalid 与 512-valid 两种 prefix 对拍显式 selected-QK target，并覆盖
+全 invalid rows；CP8 full-backward 测试同时验证 sparse backward 使用同一顺序。
 
 ## 性能验收
 

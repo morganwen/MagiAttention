@@ -69,6 +69,18 @@ V1 固定配置为：Hq=64、Hkv=1、D=512、rope dim=64、window=128、Hidx=64�
 - reference backend 只用于数值对拍；正式 kernel backend 的输入为 CUDA BF16，top-k 保持 device resident。
 - 唯一计划内新增的计算辅助 kernel 是 `kernel/cutedsl/dsa_pack.py`，用于 packing、remap 与 FP32 CSR reduction。public frontend 和 device mapping schema 不绑定具体 minor arch，编译 cache key 包含设备的 `(major, minor)`、dtype、feature width 和 operation；因此 B300 使用独立 SM103 cache entry。kernel 仅使用 SM100-family 可用的通用 global copy、寄存器 FP32 累加和 128-bit vector copy。
 
+ratio=4 的 kernel 路径采用与 Megatron Path C 相同的 fused pipeline
+边界，而不是新增一个包含 radix top-k 的单体 CUDA kernel。Indexer 仍先用 raw BF16
+weights 做冻结的 exact top-k/tie-break；随后 attention indices 按
+`[compressed-prefix, window]` 排列，并以 `indexer_topk=512` 调用 FlashMLA，使同一次
+sparse forward 返回 compressed prefix 的 `lse_indexer`。训练时 cuDNN
+`sparse_attn_score_recompute_wrapper` 直接从该 LSE 生成 KL target，predict 则继续使用
+BF16 缩放后的 sparse Indexer score recompute，以保持既有数值语义。一个 rank 上所有
+owner fragments 的投影和 global logical block ids 合并为一次 KL 调用，且不再构造
+`[local_rows, topk, kv_dim]` selected-KV 临时张量。sparse backward 使用相同的
+compressed-first 索引顺序；KL backward 仍按保存的 exact top-k 重计算，因此 9-tensor
+saved-state ABI 不变。
+
 ## CP plan 与通信
 
 - dispatch/transfer plan 以 sample-relative logical positions 和可非连续 fragments 表示；128 对齐只约束可切分边界，不假设 fragment owner 相邻。
@@ -86,11 +98,12 @@ ratio=4 最慢 rank 的 Indexer scan cost，再在允许 slack 内按 token、�
 fragment overhead 和显存预测选择完整 E2E 最小的候选。rank 0 确定性求解后
 广播 plan，runtime 按 packed layout 与 policy 缓存。
 
-ratio=4 的 merged dispatch fragment 必须进一步按 sample-relative 坐标切成
-128-row canonical query tiles；同一组 tiles 一致用于 Indexer projection、top-k、
-forward KL 和 backward KL recompute。该边界不依赖 dispatch policy：ownership
-可以改变通信和负载均衡，但同一 logical query 的 GEMM row shape 不得改变，否则
-1 ULP projection 扰动可能越过 top-k 边界，破坏 sequential/balanced 结果等价性。
+ratio=4 的每个 owner-local dispatch fragment 直接作为一个 query tile；同一组
+fragment tiles 一致用于 Indexer projection、top-k、forward KL 和 backward KL
+recompute。tile 不跨 sample 或 ownership 边界，但不再在 fragment 内按 128 rows
+二次切分，从而避免小 GEMM 和 Indexer kernel 的 launch storm。不同 dispatch policy
+可能改变 BF16 GEMM 的 row grouping，因此跨 policy/CP 的结果按冻结精度容差验收，
+不要求 bitwise 等价。
 cuDNN top-k launch 同样保持固定配置宽度 K=512；短 sample 的不足项由内核写成
 `-1`，语义处理前再裁到实际 compressed-key 数。不得把 launch K 特化为 473 等
 大于单 CTA 且为奇数的 key 数，否则冻结 CuTe 内核的两元素 vector-store 编译分支

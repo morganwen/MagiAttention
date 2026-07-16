@@ -82,6 +82,7 @@ class _KernelSparseAttn(torch.autograd.Function):
         attn_sink: torch.Tensor,  # (H,) f32
         topk_idxs: torch.Tensor,  # (rows, K) int32, -1 invalid
         softmax_scale: float,
+        indexer_prefix: int,
     ) -> torch.Tensor:
         fwd = _ensure_flash_mla()
 
@@ -94,14 +95,27 @@ class _KernelSparseAttn(torch.autograd.Function):
             )
         topk_idxs = topk_idxs.contiguous()
 
-        out, _max_logits, lse = fwd(
-            q,
-            kv.unsqueeze(1),  # (n_kv, h_kv=1, D)
-            topk_idxs.unsqueeze(1),  # (rows, h_kv=1, K_padded)
-            softmax_scale,
-            d_v=q.shape[-1],
-            attn_sink=attn_sink,
-        )
+        kwargs = {
+            "d_v": q.shape[-1],
+            "attn_sink": attn_sink,
+        }
+        if indexer_prefix:
+            out, _max_logits, lse, _lse_indexer = fwd(
+                q,
+                kv.unsqueeze(1),  # (n_kv, h_kv=1, D)
+                topk_idxs.unsqueeze(1),  # (rows, h_kv=1, K_padded)
+                softmax_scale,
+                **kwargs,
+                indexer_topk=indexer_prefix,
+            )
+        else:
+            out, _max_logits, lse = fwd(
+                q,
+                kv.unsqueeze(1),
+                topk_idxs.unsqueeze(1),
+                softmax_scale,
+                **kwargs,
+            )
 
         ctx.save_for_backward(q, kv, attn_sink, topk_idxs, out, lse)
         ctx.softmax_scale = softmax_scale
@@ -122,7 +136,7 @@ class _KernelSparseAttn(torch.autograd.Function):
             softmax_scale=ctx.softmax_scale,
             topk_length=None,
         )
-        return result["dq"], result["dkv"], result["d_sink"], None, None
+        return result["dq"], result["dkv"], result["d_sink"], None, None, None
 
 
 def indexer_select_kernel(
@@ -248,12 +262,124 @@ def indexer_select_kernel(
     return idx.view(b, sq, -1)
 
 
+def indexer_target_from_lse_kernel(
+    query: torch.Tensor,
+    compressed_kv: torch.Tensor,
+    lse_indexer: torch.Tensor,
+    topk_indices: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """Recompute the selected attention target from FlashMLA's prefix LSE.
+
+    All tensors use flat global compressed-block ids. ``query`` is
+    ``(rows, H, D)``, ``compressed_kv`` is ``(blocks, D)``, and both the
+    returned FP32 target and ``topk_indices`` are ``(rows, K)``.
+    """
+
+    if query.ndim != 3 or compressed_kv.ndim != 2:
+        raise ValueError("fused Indexer target expects flat query and compressed KV")
+    if lse_indexer.shape != query.shape[:2]:
+        raise ValueError(
+            "Indexer prefix LSE must have shape "
+            f"{tuple(query.shape[:2])}, got {tuple(lse_indexer.shape)}"
+        )
+    if topk_indices.ndim != 2 or topk_indices.size(0) != query.size(0):
+        raise ValueError("Indexer top-k must contain one row per query")
+
+    dsa = _ensure_dsa()
+    width = topk_indices.size(1)
+    padded_width = max(128, (width + 127) // 128 * 128)
+    indices = topk_indices.to(torch.int32)
+    if padded_width != width:
+        indices = torch.nn.functional.pad(indices, (0, padded_width - width), value=-1)
+    result = dsa.sparse_attn_score_recompute_wrapper(
+        query.contiguous().unsqueeze(0),
+        compressed_kv.contiguous().unsqueeze(0),
+        lse_indexer.float().contiguous().unsqueeze(0),
+        indices.contiguous().unsqueeze(0),
+        softmax_scale,
+        qhead_per_kv_head=query.size(1),
+        topk_indices_global=True,
+    )
+    target = result["target"].squeeze(0)[..., :width]
+    return target.masked_fill(topk_indices < 0, 0.0)
+
+
+def indexer_kl_from_lse_kernel(
+    topk_indices: torch.Tensor,
+    q_idx: torch.Tensor,
+    w_idx: torch.Tensor,
+    k_idx: torch.Tensor,
+    query: torch.Tensor,
+    compressed_kv: torch.Tensor,
+    lse_indexer: torch.Tensor,
+    softmax_scale: float,
+    indexer_scale: float,
+    loss_coeff: float,
+    total_global: int,
+) -> torch.Tensor:
+    """Compute rank-local sparse Indexer KL from FlashMLA prefix state.
+
+    Selection has already produced flat global compressed-block ids.  This
+    path keeps the frozen raw-weight top-k semantics, recomputes ``predict``
+    with the BF16-scaled cuDNN sparse kernel, and obtains ``target`` from the
+    ``lse_indexer`` snapshot emitted by the same sparse-attention forward.
+    Unlike the legacy value path it never materializes selected
+    ``(rows, topk, kv_dim)`` KV tiles.
+    """
+
+    if total_global <= 0:
+        raise ValueError("total_global must be positive")
+    rows = query.size(0)
+    if q_idx.shape[:2] != (rows, 1) or w_idx.shape[:2] != (rows, 1):
+        raise ValueError("packed Indexer Q/weights must contain one batch")
+    if k_idx.ndim != 2:
+        raise ValueError("packed Indexer K must have shape (blocks, dim)")
+    if compressed_kv.ndim != 2 or compressed_kv.size(0) != k_idx.size(0):
+        raise ValueError("compressed KV and Indexer K block counts must match")
+    if topk_indices.ndim != 2 or topk_indices.size(0) != rows:
+        raise ValueError("Indexer top-k must contain one row per query")
+
+    dsa = _ensure_dsa()
+    width = topk_indices.size(1)
+    padded_width = max(128, (width + 127) // 128 * 128)
+    indices = topk_indices.to(torch.int32)
+    if padded_width != width:
+        indices = torch.nn.functional.pad(indices, (0, padded_width - width), value=-1)
+    indices = indices.contiguous().unsqueeze(0)
+    valid = topk_indices >= 0
+
+    with torch.no_grad():
+        weights_scaled = (w_idx.float() * indexer_scale).to(w_idx.dtype)
+        predict = dsa.sparse_indexer_score_recompute_wrapper(
+            q_idx.permute(1, 0, 2, 3).contiguous(),
+            k_idx.contiguous().unsqueeze(0),
+            weights_scaled.permute(1, 0, 2).contiguous(),
+            indices,
+            qhead_per_kv_head=q_idx.size(2),
+            topk_indices_global=True,
+        )["predict"].squeeze(0)[..., :width]
+        target = indexer_target_from_lse_kernel(
+            query,
+            compressed_kv,
+            lse_indexer,
+            topk_indices,
+            softmax_scale,
+        )
+        kl = target * (
+            torch.log(target + 1e-10) - torch.log(predict.float().clamp(min=0) + 1e-10)
+        )
+        kl = torch.where(valid, kl, torch.zeros_like(kl))
+        return kl.sum() * (loss_coeff / total_global)
+
+
 def sparse_attn_with_sink_kernel(
     query: torch.Tensor,
     kv_full: torch.Tensor,
     attn_sink: torch.Tensor,
     topk_indices: torch.Tensor,
     softmax_scale: float,
+    indexer_prefix: int = 0,
 ) -> torch.Tensor:
     """Drop-in kernel replacement for ``reference.sparse_attn_with_sink``.
 
@@ -271,7 +397,12 @@ def sparse_attn_with_sink_kernel(
     idx_flat = topk_indices.squeeze(0).to(torch.int32).contiguous()
 
     out = _KernelSparseAttn.apply(
-        q_flat, kv_flat, attn_sink.float(), idx_flat, softmax_scale
+        q_flat,
+        kv_flat,
+        attn_sink.float(),
+        idx_flat,
+        softmax_scale,
+        indexer_prefix,
     )  # (sq, np, d_v)
     return out.reshape(sq, 1, -1)
 

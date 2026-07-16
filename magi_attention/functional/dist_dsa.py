@@ -67,18 +67,19 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class DsaCompressorRun:
-    """One owner-local compressed block within the gathered X slab."""
+    """One contiguous owner-local compressed-block run in the gathered X slab."""
 
     logical_block_id: int
     source_begin: int
     source_end: int
     block_offset: int
     result_index: int
+    block_count: int = 1
 
 
 @dataclass(frozen=True)
 class DsaIndexerProjection:
-    """Invocation-local Indexer Q/weight projection for one canonical tile."""
+    """Invocation-local Indexer Q/weight projection for one owner fragment."""
 
     fragment: DsaFragmentSpec
     local_begin: int
@@ -150,6 +151,29 @@ def _sample_block_offsets(plan: DsaDispatchPlan) -> tuple[int, ...]:
     return tuple(offsets)
 
 
+def _coalesced_compressor_block_ids(
+    plan: DsaDispatchPlan, rank: int
+) -> tuple[tuple[int, ...], ...]:
+    """Group owner blocks that one compressor invocation can process together."""
+
+    runs: list[list[int]] = []
+    for logical_block_id in plan.ranks[rank].compressed_block_ids:
+        block = plan.compressed_blocks[logical_block_id]
+        if runs:
+            previous = plan.compressed_blocks[runs[-1][-1]]
+            contiguous = (
+                block.logical_block_id == previous.logical_block_id + 1
+                and block.sample_id == previous.sample_id
+                and block.sample_block_id == previous.sample_block_id + 1
+            )
+        else:
+            contiguous = False
+        if not contiguous:
+            runs.append([])
+        runs[-1].append(logical_block_id)
+    return tuple(tuple(run) for run in runs)
+
+
 def build_dsa_forward_plan(
     dispatch_plan: DsaDispatchPlan,
     rank: int,
@@ -187,25 +211,28 @@ def build_dsa_forward_plan(
     compressor_source_rows: list[int] = []
     compressor_runs: list[DsaCompressorRun] = []
     ratio = dispatch_plan.compress_ratio
-    for logical_block_id in dispatch_plan.ranks[rank].compressed_block_ids:
-        block = dispatch_plan.compressed_blocks[logical_block_id]
-        prepend = int(ratio == 4 and block.sample_block_id > 0)
-        first_block = block.sample_block_id - prepend
+    for logical_block_ids in _coalesced_compressor_block_ids(dispatch_plan, rank):
+        first = dispatch_plan.compressed_blocks[logical_block_ids[0]]
+        last = dispatch_plan.compressed_blocks[logical_block_ids[-1]]
+        prepend = int(ratio == 4 and first.sample_block_id > 0)
+        first_block = first.sample_block_id - prepend
         begin = first_block * ratio
-        end = (block.sample_block_id + 1) * ratio
+        end = (last.sample_block_id + 1) * ratio
         source_begin = len(compressor_source_rows)
         for position in range(begin, end):
-            row_id = offsets[block.sample_id] + position
+            row_id = offsets[first.sample_id] + position
             try:
                 compressor_source_rows.append(overlap_lookup[row_id])
             except KeyError as exc:
                 raise RuntimeError(
-                    f"compressed block {logical_block_id} is missing overlap X row "
-                    f"{row_id} on rank {rank}"
+                    f"compressed block run {logical_block_ids[0]}.."
+                    f"{logical_block_ids[-1]} is missing overlap X row {row_id} "
+                    f"on rank {rank}"
                 ) from exc
         compressor_runs.append(
             DsaCompressorRun(
-                logical_block_id=logical_block_id,
+                logical_block_id=logical_block_ids[0],
+                block_count=len(logical_block_ids),
                 source_begin=source_begin,
                 source_end=len(compressor_source_rows),
                 block_offset=first_block,
@@ -329,11 +356,16 @@ def _run_owner_compressor(
     for run in forward_plan.compressor_runs:
         slab = source_rows[run.source_begin : run.source_end].unsqueeze(1)
         compressed = compressor(slab, block_offset=run.block_offset)
-        if compressed is None or compressed.size(0) <= run.result_index:
+        result_end = run.result_index + run.block_count
+        if compressed is None or compressed.size(0) < result_end:
             raise RuntimeError(
-                f"compressor did not produce logical block {run.logical_block_id}"
+                "compressor did not produce logical block run "
+                f"{run.logical_block_id}.."
+                f"{run.logical_block_id + run.block_count - 1}"
             )
-        pieces.append(compressed[run.result_index : run.result_index + 1].squeeze(1))
+        pieces.append(compressed[run.result_index : result_end].squeeze(1))
+    if len(pieces) == 1:
+        return pieces[0]
     if pieces:
         return torch.cat(pieces, dim=0)
     return source_rows.new_empty((0, compressor.head_dim))
@@ -343,27 +375,17 @@ def _canonical_query_tiles(
     forward_plan: DsaForwardPlan,
     runtime_mgr: "MagiDSARuntimeMgr",
 ) -> tuple[tuple[DsaFragmentSpec, int, int], ...]:
-    """Split policy-merged fragments into policy-invariant query tiles."""
+    """Return one query tile per owner fragment in local packed-row order."""
 
     dispatch_plan = forward_plan.dispatch_plan
-    alignment = dispatch_plan.alignment
     tiles: list[tuple[DsaFragmentSpec, int, int]] = []
-    fragment_local_begin = 0
+    local_begin = 0
     for fragment in dispatch_plan.ranks[runtime_mgr.plan.cp_rank].fragments:
-        for query_begin in range(fragment.q_begin, fragment.q_end, alignment):
-            query_end = min(query_begin + alignment, fragment.q_end)
-            local_begin = fragment_local_begin + query_begin - fragment.q_begin
-            local_end = local_begin + query_end - query_begin
-            tiles.append(
-                (
-                    DsaFragmentSpec(fragment.sample_id, query_begin, query_end),
-                    local_begin,
-                    local_end,
-                )
-            )
-        fragment_local_begin += fragment.token_count
-    if fragment_local_begin != forward_plan.local_token_count:
-        raise RuntimeError("canonical query tiles do not cover every local row")
+        local_end = local_begin + fragment.token_count
+        tiles.append((fragment, local_begin, local_end))
+        local_begin = local_end
+    if local_begin != forward_plan.local_token_count:
+        raise RuntimeError("owner-fragment query tiles do not cover every local row")
     return tuple(tiles)
 
 
@@ -429,7 +451,7 @@ def _ratio4_indices_and_kl(
         projections = _project_ratio4_queries(dsa_input, runtime_mgr, forward_plan)
     tiles = _canonical_query_tiles(forward_plan, runtime_mgr)
     if len(projections) != len(tiles):
-        raise RuntimeError("Indexer projection count does not match canonical tiles")
+        raise RuntimeError("Indexer projection count does not match query tiles")
     ratio = cfg.compress_ratio
     total_global = max(forward_plan.dispatch_plan.total_tokens, 1)
 
@@ -499,25 +521,13 @@ def _ratio4_indices_and_kl(
         valid = (local_ids >= 0) & (local_ids < visible)
         local_ids = torch.where(valid, local_ids, torch.full_like(local_ids, -1))
 
-        if runtime_mgr.training and (torch.is_grad_enabled() or force_kl):
-            if cfg.backend == "kernel":
-                from magi_attention.dsa.kernels import (
-                    indexer_kl_loss_kernel,
-                )
-
-                with dsa_phase("indexer_score_recompute"):
-                    kl_loss = kl_loss + indexer_kl_loss_kernel(
-                        local_ids,
-                        q_idx,
-                        w_idx,
-                        k_sample,
-                        dsa_input.q[local_begin:local_end].unsqueeze(1),
-                        comp_sample,
-                        cfg.softmax_scale,
-                        indexer.softmax_scale,
-                        cfg.indexer_loss_coeff,
-                        total_global=total_global,
-                    )
+        if (
+            cfg.backend != "kernel"
+            and runtime_mgr.training
+            and (torch.is_grad_enabled() or force_kl)
+        ):
+            if cfg.backend != "reference":
+                raise RuntimeError(f"unsupported DSA backend {cfg.backend!r}")
             else:
                 from magi_attention.dsa.reference import (
                     indexer_kl_loss_selected,
@@ -553,14 +563,17 @@ def _run_attention_forward_state(
     sink: torch.Tensor,
     topk_indices: torch.Tensor,
     runtime_mgr: "MagiDSARuntimeMgr",
-) -> tuple[torch.Tensor, torch.Tensor]:
+    *,
+    indexer_prefix: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run sparse attention while retaining only its backward ABI state."""
 
     cfg = runtime_mgr.config
     if q.size(0) == 0:
-        return q.new_empty(q.shape), torch.empty(
+        empty_lse = torch.empty(
             (0, cfg.num_heads), dtype=torch.float32, device=q.device
         )
+        return q.new_empty(q.shape), empty_lse, empty_lse.clone()
     if cfg.backend == "kernel":
         from magi_attention.dsa.kernels import (
             _ensure_flash_mla,
@@ -576,15 +589,29 @@ def _run_attention_forward_state(
                 (0, padded_width - topk_indices.size(1)),
                 value=-1,
             )
-        output, _max_logits, lse = _ensure_flash_mla()(
+        attention_args = (
             q.contiguous(),
             kv_full.unsqueeze(1),
             kernel_indices.contiguous().unsqueeze(1),
             cfg.softmax_scale,
-            d_v=q.size(-1),
-            attn_sink=sink.float(),
         )
-        return output, lse.float()
+        attention_kwargs = {
+            "d_v": q.size(-1),
+            "attn_sink": sink.float(),
+        }
+        if indexer_prefix:
+            result = _ensure_flash_mla()(
+                *attention_args,
+                **attention_kwargs,
+                indexer_topk=indexer_prefix,
+            )
+            output, _max_logits, lse, lse_indexer = result
+            return output, lse.float(), lse_indexer.float()
+        output, _max_logits, lse = _ensure_flash_mla()(
+            *attention_args,
+            **attention_kwargs,
+        )
+        return output, lse.float(), torch.empty(0, dtype=torch.float32, device=q.device)
 
     output_flat = runtime_mgr.dsa_module._run_attention(
         q.unsqueeze(1),
@@ -596,7 +623,8 @@ def _run_attention_forward_state(
     output = output_flat.reshape(q.size(0), cfg.num_heads, cfg.kv_dim)
     # The reference backward is an explicit testing seam and recomputes the
     # reference attention.  Production kernel backward consumes real FP32 LSE.
-    return output, torch.empty(0, dtype=torch.float32, device=q.device)
+    empty = torch.empty(0, dtype=torch.float32, device=q.device)
+    return output, empty, empty
 
 
 def _dist_dsa_forward_state(
@@ -704,6 +732,7 @@ def _dist_dsa_forward_state(
         )
 
         kl_loss = torch.zeros((), dtype=torch.float32, device=dsa_input.q.device)
+        fused_indexer_pipeline = False
         if dispatch_plan.compress_ratio == 4 and compressed_global.size(0):
             compressed_ki_available = torch.cat(
                 [compressed_ki_local, remote_compressed_ki], dim=0
@@ -712,6 +741,10 @@ def _dist_dsa_forward_state(
                 compressed_ki_available,
                 forward_plan.compressed_global_map,
             )
+            if projections is None:
+                projections = _project_ratio4_queries(
+                    dsa_input, runtime_mgr, forward_plan
+                )
             indexer_topk, kl_loss = _ratio4_indices_and_kl(
                 dsa_input,
                 runtime_mgr,
@@ -721,11 +754,21 @@ def _dist_dsa_forward_state(
                 force_kl=True,
                 projections=projections,
             )
+            fused_indexer_pipeline = runtime_mgr.config.backend == "kernel"
             compressed_indices = torch.where(
                 indexer_topk >= 0,
                 indexer_topk + forward_plan.available_token_count,
                 torch.full_like(indexer_topk, -1),
             )
+        elif dispatch_plan.compress_ratio == 4:
+            indexer_topk = torch.full(
+                (forward_plan.local_token_count, runtime_mgr.config.topk),
+                -1,
+                dtype=torch.int32,
+                device=dsa_input.q.device,
+            )
+            compressed_indices = indexer_topk
+            fused_indexer_pipeline = runtime_mgr.config.backend == "kernel"
         elif dispatch_plan.compress_ratio == 128 and compressed_global.size(0):
             compressed_indices = forward_plan.dense_compressed_indices
             indexer_topk = forward_plan.window_indices.new_empty(
@@ -738,16 +781,64 @@ def _dist_dsa_forward_state(
             indexer_topk = compressed_indices
 
         kv_full = torch.cat([token_available, compressed_global], dim=0)
-        topk_indices = torch.cat(
-            [forward_plan.window_indices, compressed_indices], dim=-1
-        ).contiguous()
-        output, lse = _run_attention_forward_state(
+        if fused_indexer_pipeline:
+            # FlashMLA snapshots the LSE after the first ``indexer_topk``
+            # columns.  Keep compressed ids in that prefix; alignment padding
+            # is appended by the wrapper after the window suffix.
+            topk_indices = torch.cat(
+                [compressed_indices, forward_plan.window_indices], dim=-1
+            ).contiguous()
+        else:
+            topk_indices = torch.cat(
+                [forward_plan.window_indices, compressed_indices], dim=-1
+            ).contiguous()
+        output, lse, lse_indexer = _run_attention_forward_state(
             dsa_input.q,
             kv_full,
             dsa_input.sink,
             topk_indices,
             runtime_mgr,
+            indexer_prefix=runtime_mgr.config.topk if fused_indexer_pipeline else 0,
         )
+        if (
+            fused_indexer_pipeline
+            and runtime_mgr.training
+            and forward_plan.local_token_count
+            and compressed_global.size(0)
+        ):
+            from magi_attention.dsa.kernels import indexer_kl_from_lse_kernel
+
+            if projections is None:
+                raise RuntimeError("fused Indexer KL requires projected queries")
+            if len(projections) == 1:
+                q_idx_packed = projections[0].query
+                w_idx_packed = projections[0].weights
+            else:
+                q_idx_packed = torch.cat(
+                    [projection.query for projection in projections], dim=0
+                )
+                w_idx_packed = torch.cat(
+                    [projection.weights for projection in projections], dim=0
+                )
+            if q_idx_packed.size(0) != forward_plan.local_token_count:
+                raise RuntimeError("fused Indexer projections do not cover local rows")
+            indexer = runtime_mgr.dsa_module.indexer
+            if indexer is None:
+                raise RuntimeError("ratio=4 fused KL requires an Indexer")
+            with dsa_phase("fused_indexer_kl"):
+                kl_loss = indexer_kl_from_lse_kernel(
+                    indexer_topk,
+                    q_idx_packed,
+                    w_idx_packed,
+                    compressed_ki_global,
+                    dsa_input.q,
+                    compressed_global,
+                    lse_indexer,
+                    runtime_mgr.config.softmax_scale,
+                    indexer.softmax_scale,
+                    runtime_mgr.config.indexer_loss_coeff,
+                    max(dispatch_plan.total_tokens, 1),
+                )
         return output, kl_loss, lse, indexer_topk.contiguous()
 
 
@@ -964,6 +1055,10 @@ class _DistDsa(torch.autograd.Function):
         ctx.forward_plan = forward_plan
         ctx.parameter_count = len(parameters)
         ctx.compute_kl = runtime_mgr.training
+        ctx.fused_indexer_pipeline = (
+            runtime_mgr.config.backend == "kernel"
+            and runtime_mgr.config.compress_ratio == 4
+        )
         ctx.save_for_backward(
             x,
             qr,
@@ -1019,9 +1114,14 @@ class _DistDsa(torch.autograd.Function):
             compressed_sparse_indices = forward_plan.window_indices.new_empty(
                 (forward_plan.local_token_count, 0)
             )
-        sparse_indices = torch.cat(
-            [forward_plan.window_indices, compressed_sparse_indices], dim=-1
-        ).contiguous()
+        if ctx.fused_indexer_pipeline:
+            sparse_indices = torch.cat(
+                [compressed_sparse_indices, forward_plan.window_indices], dim=-1
+            ).contiguous()
+        else:
+            sparse_indices = torch.cat(
+                [forward_plan.window_indices, compressed_sparse_indices], dim=-1
+            ).contiguous()
         parameters = tuple(module.parameters())
         if len(parameters) != ctx.parameter_count:
             raise RuntimeError("DSA parameter set changed between forward and backward")
@@ -1371,6 +1471,9 @@ def _single_forward_state(
             dtype=torch.int32,
             device=x.device,
         )
+        indexer_prefix = (
+            cfg.topk if cfg.backend == "kernel" and cfg.compress_ratio == 4 else 0
+        )
         compressed = None
         if module.compressor is not None:
             compressed = module.compressor(x_sample)
@@ -1384,7 +1487,14 @@ def _single_forward_state(
                     dtype=window.dtype,
                     device=window.device,
                 )
-                indices = torch.cat([window, compressed_indices], dim=-1)
+                indices = torch.cat(
+                    (
+                        [compressed_indices, window]
+                        if indexer_prefix
+                        else [window, compressed_indices]
+                    ),
+                    dim=-1,
+                )
             else:
                 indices = window
         else:
@@ -1481,15 +1591,23 @@ def _single_forward_state(
                     sq,
                     x.device,
                 )
-            indices = torch.cat([window, compressed_indices], dim=-1)
+            indices = torch.cat(
+                (
+                    [compressed_indices, window]
+                    if indexer_prefix
+                    else [window, compressed_indices]
+                ),
+                dim=-1,
+            )
 
         indices_flat = indices.squeeze(0).to(torch.int32).contiguous()
-        output_sample, lse_sample = _run_attention_forward_state(
+        output_sample, lse_sample, _lse_indexer_sample = _run_attention_forward_state(
             q_sample,
             kv_full,
             sink,
             indices_flat,
             runtime_mgr,
+            indexer_prefix=indexer_prefix,
         )
         outputs.append(output_sample)
         indexer_topk_pieces.append(sample_indexer_topk)
@@ -1631,8 +1749,16 @@ class _SingleDsa(torch.autograd.Function):
             else:
                 compressed_indices = window_indices.new_empty((sq, 0))
                 local_ids = sample_indexer_topk
+            indexer_prefix = cfg.backend == "kernel" and cfg.compress_ratio == 4
             sample_indices = (
-                torch.cat([window_indices, compressed_indices], dim=-1)
+                torch.cat(
+                    (
+                        [compressed_indices, window_indices]
+                        if indexer_prefix
+                        else [window_indices, compressed_indices]
+                    ),
+                    dim=-1,
+                )
                 .to(torch.int32)
                 .contiguous()
             )

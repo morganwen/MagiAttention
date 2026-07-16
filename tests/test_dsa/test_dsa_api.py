@@ -17,6 +17,7 @@
 import copy
 import io
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -30,6 +31,7 @@ from magi_attention.api import (
     calc_dsa,
 )
 from magi_attention.dsa import DSAv4Compressor
+from magi_attention.functional.dist_dsa import DsaCompressorRun, _run_owner_compressor
 from magi_attention.testing.precision import assert_close as assert_precision_close
 
 
@@ -257,6 +259,54 @@ class TestCompressor:
         previous_block_changed = x.clone()
         previous_block_changed[0] += 1
         assert not torch.equal(base[1], compressor(previous_block_changed)[1])
+
+    def test_ratio4_coalesced_run_matches_per_block_forward_and_gradients(self):
+        cfg = _make_config(4)
+        coalesced_compressor = DSAv4Compressor(cfg, head_dim=cfg.kv_dim).cuda().float()
+        per_block_compressor = copy.deepcopy(coalesced_compressor)
+        coalesced_source = torch.randn(
+            20,
+            cfg.hidden_size,
+            device="cuda",
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        per_block_source = coalesced_source.detach().clone().requires_grad_(True)
+        plan = SimpleNamespace(
+            compressor_runs=(DsaCompressorRun(2, 0, 20, 1, 1, block_count=4),)
+        )
+
+        coalesced = _run_owner_compressor(coalesced_compressor, coalesced_source, plan)
+        per_block = torch.cat(
+            [
+                per_block_compressor(
+                    per_block_source[offset : offset + 8].unsqueeze(1),
+                    block_offset=offset // 4 + 1,
+                )[1:2].squeeze(1)
+                for offset in range(0, 16, 4)
+            ],
+            dim=0,
+        )
+        torch.testing.assert_close(coalesced, per_block, rtol=2e-5, atol=2e-5)
+
+        output_grad = torch.randn_like(coalesced)
+        (coalesced * output_grad).sum().backward()
+        (per_block * output_grad).sum().backward()
+        torch.testing.assert_close(
+            coalesced_source.grad,
+            per_block_source.grad,
+            rtol=2e-5,
+            atol=2e-5,
+        )
+        for coalesced_param, per_block_param in zip(
+            coalesced_compressor.parameters(), per_block_compressor.parameters()
+        ):
+            torch.testing.assert_close(
+                coalesced_param.grad,
+                per_block_param.grad,
+                rtol=2e-5,
+                atol=2e-5,
+            )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -670,3 +720,125 @@ def test_kernel_indexer_topk_supports_odd_short_sample_width():
             atol=0,
         )
         assert torch.all(selected[0, position, valid:] == -1)
+
+
+@pytest.mark.dsa_kernel
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(
+    not _kernel_dependencies_available(),
+    reason="frozen FlashMLA and cudnn-frontend DSA packages required",
+)
+@pytest.mark.parametrize("visible_width", [8, 512])
+def test_kernel_indexer_target_from_flashmla_prefix_lse_matches_explicit(
+    visible_width,
+):
+    """FlashMLA's compressed-prefix LSE reproduces the selected-QK target."""
+
+    from magi_attention.dsa.kernels import (
+        _ensure_flash_mla,
+        indexer_target_from_lse_kernel,
+    )
+
+    torch.manual_seed(20260716 + visible_width)
+    rows, heads, dim = 128, 64, 512
+    compressed_width, window_width = 512, 128
+    softmax_scale = dim**-0.5
+
+    query = torch.randn(rows, heads, dim, dtype=torch.bfloat16, device="cuda")
+    compressed_kv = torch.randn(
+        compressed_width, dim, dtype=torch.bfloat16, device="cuda"
+    )
+    window_kv = torch.randn(window_width, dim, dtype=torch.bfloat16, device="cuda")
+    kv_full = torch.cat([compressed_kv, window_kv], dim=0).contiguous()
+    sink = torch.linspace(-10.0, 10.0, heads, dtype=torch.float32, device="cuda")
+
+    # FlashMLA snapshots lse_indexer after the first configured 512 slots.
+    # Keep those slots compressed-only, followed by the ordinary window rows.
+    compressed_prefix = torch.full(
+        (rows, compressed_width), -1, dtype=torch.int32, device="cuda"
+    )
+    compressed_prefix[:, :visible_width] = torch.arange(
+        visible_width, dtype=torch.int32, device="cuda"
+    )
+    compressed_prefix[:3] = -1  # exercise rows with no selected block
+    window_indices = (
+        torch.arange(window_width, dtype=torch.int32, device="cuda")
+        .add(compressed_width)
+        .expand(rows, -1)
+    )
+    attention_indices = torch.cat(
+        [compressed_prefix, window_indices], dim=-1
+    ).contiguous()
+
+    flash_mla = _ensure_flash_mla()
+    baseline_output, _baseline_max, baseline_lse = flash_mla(
+        query,
+        kv_full.unsqueeze(1),
+        attention_indices.unsqueeze(1),
+        softmax_scale,
+        d_v=dim,
+        attn_sink=sink,
+        indexer_topk=0,
+    )
+    fused_result = flash_mla(
+        query,
+        kv_full.unsqueeze(1),
+        attention_indices.unsqueeze(1),
+        softmax_scale,
+        d_v=dim,
+        attn_sink=sink,
+        indexer_topk=compressed_width,
+    )
+    assert len(fused_result) == 4
+    fused_output, _fused_max, fused_lse, lse_indexer = fused_result
+    assert lse_indexer.shape == query.shape[:2]
+    # FlashMLA leaves the prefix snapshot at +inf when that prefix contains
+    # no valid row; the target helper must still zero those fully-invalid rows.
+    assert torch.isfinite(lse_indexer[3:]).all()
+
+    # Asking FlashMLA for the prefix snapshot must not change the full
+    # attention result. Keep BF16-friendly tolerances across supported GPUs.
+    torch.testing.assert_close(fused_output, baseline_output, rtol=2e-2, atol=2e-3)
+    torch.testing.assert_close(fused_lse, baseline_lse, rtol=2e-5, atol=2e-5)
+
+    actual = indexer_target_from_lse_kernel(
+        query,
+        compressed_kv,
+        lse_indexer,
+        compressed_prefix,
+        softmax_scale,
+    )
+
+    valid = compressed_prefix >= 0
+    safe_indices = compressed_prefix.clamp(min=0).long()
+    selected_kv = compressed_kv[safe_indices]
+    target_logits = (
+        torch.einsum("qhd,qkd->qhk", query.float(), selected_kv.float()) * softmax_scale
+    )
+    row_has_selection = valid.any(dim=-1, keepdim=True)
+    target_logits = target_logits.masked_fill(~valid.unsqueeze(1), float("-inf"))
+    target_logits = target_logits.masked_fill(~row_has_selection.unsqueeze(1), 0.0)
+    expected = (
+        torch.softmax(target_logits, dim=-1, dtype=torch.float32)
+        * row_has_selection.unsqueeze(1).float()
+    ).sum(dim=1)
+    expected = expected / expected.sum(dim=-1, keepdim=True).clamp(min=1e-10)
+
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+    assert torch.all(actual.masked_select(~valid) == 0)
+    assert torch.all(actual[:3] == 0)
+
+    if visible_width < compressed_width:
+        # Also exercise the helper's pad-to-128 path. The same prefix LSE is
+        # valid because the omitted 504 physical slots are all -1 sentinels.
+        compact_indices = compressed_prefix[:, :visible_width].contiguous()
+        compact = indexer_target_from_lse_kernel(
+            query,
+            compressed_kv,
+            lse_indexer,
+            compact_indices,
+            softmax_scale,
+        )
+        torch.testing.assert_close(
+            compact, expected[:, :visible_width], rtol=1e-5, atol=1e-6
+        )

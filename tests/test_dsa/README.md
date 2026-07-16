@@ -196,16 +196,24 @@ development matrix. The formal step 8/9 exit accepts only the actual
 `GrpCollIntraHandle` native path; A2AV and hierarchical fallback are hard
 failures.
 
-For ratio 4, every merged dispatch fragment is subdivided into
-sample-relative, 128-row canonical query tiles for Indexer projection, top-k,
-forward KL, and backward KL recompute. Dispatch ownership may change
-communication and load balance, but it must not change the GEMM row shape for
-the same logical query or perturb the top-k boundary.
+For ratio 4, every owner-local dispatch fragment is one query tile shared by
+Indexer projection, top-k, forward KL, and backward KL recompute. Tiles never
+cross sample or ownership boundaries and are not subdivided into 128-row
+launches. Dispatch policies may therefore change BF16 GEMM row grouping;
+cross-policy and CP parity use the frozen numerical tolerances rather than
+requiring bitwise equality.
 
 The cuDNN top-k launch retains the configured K=512 for short samples and
 fills entries beyond the actual compressed-key count with `-1`. It must not
 specialize launch K to an odd short-sample width such as 473, which violates
 the frozen CuTe kernel's two-element vector-store divisibility requirement.
+
+The ratio-4 kernel path places those 512 compressed slots before the 128
+window slots and passes `indexer_topk=512` to FlashMLA. The resulting
+`lse_indexer` drives one rank-batched cuDNN KL-target recompute without a
+selected-KV gather. API coverage checks the 8-valid/504-invalid and 512-valid
+prefixes against the explicit selected-QK target, including fully invalid
+rows; CP8 full-backward coverage checks the same ordering in sparse backward.
 
 ## Performance acceptance
 

@@ -19,8 +19,14 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
+import torch
 
-from magi_attention.functional.dist_dsa import _canonical_query_tiles
+from magi_attention.functional.dist_dsa import (
+    DsaCompressorRun,
+    _canonical_query_tiles,
+    _coalesced_compressor_block_ids,
+    _run_owner_compressor,
+)
 from magi_attention.meta.collection.dsa_meta import (
     DsaCompressedBlockSpec,
     DsaFragmentSpec,
@@ -72,7 +78,7 @@ class TestDsaFragmentPlan:
         ]
         assert owners == sorted(owners)
 
-    def test_canonical_query_tiles_split_merged_fragment_and_tail(self):
+    def test_query_tiles_keep_owner_fragment_and_tail_intact(self):
         plan = build_dsa_dispatch_plan(
             [500],
             [[DsaFragmentSpec(0, 0, 500)]],
@@ -86,14 +92,9 @@ class TestDsaFragmentPlan:
         runtime = SimpleNamespace(plan=SimpleNamespace(cp_rank=0))
         tiles = _canonical_query_tiles(forward_plan, runtime)
 
-        assert tiles == (
-            (DsaFragmentSpec(0, 0, 128), 0, 128),
-            (DsaFragmentSpec(0, 128, 256), 128, 256),
-            (DsaFragmentSpec(0, 256, 384), 256, 384),
-            (DsaFragmentSpec(0, 384, 500), 384, 500),
-        )
+        assert tiles == ((DsaFragmentSpec(0, 0, 500), 0, 500),)
 
-    def test_canonical_query_tiles_are_policy_invariant(self):
+    def test_query_tiles_follow_each_policy_owner_fragments(self):
         sequential = make_sequential_plan([500], 2, 4)
         balanced = build_dsa_dispatch_plan(
             [500],
@@ -105,30 +106,70 @@ class TestDsaFragmentPlan:
             policy="balanced",
         )
 
-        def global_tiles(plan):
-            result = []
+        for plan in (sequential, balanced):
             for rank in range(plan.cp_size):
                 forward_plan = SimpleNamespace(
                     dispatch_plan=plan,
                     local_token_count=plan.ranks[rank].token_count,
                 )
                 runtime = SimpleNamespace(plan=SimpleNamespace(cp_rank=rank))
-                result.extend(
-                    tile
-                    for tile, _local_begin, _local_end in _canonical_query_tiles(
-                        forward_plan, runtime
-                    )
-                )
-            return tuple(sorted(result))
+                expected = []
+                local_begin = 0
+                for fragment in plan.ranks[rank].fragments:
+                    local_end = local_begin + fragment.token_count
+                    expected.append((fragment, local_begin, local_end))
+                    local_begin = local_end
+                assert _canonical_query_tiles(forward_plan, runtime) == tuple(expected)
+                assert local_begin == plan.ranks[rank].token_count
 
-        expected = (
-            DsaFragmentSpec(0, 0, 128),
-            DsaFragmentSpec(0, 128, 256),
-            DsaFragmentSpec(0, 256, 384),
-            DsaFragmentSpec(0, 384, 500),
+    def test_compressor_runs_coalesce_only_contiguous_blocks_in_one_sample(self):
+        plan = build_dsa_dispatch_plan(
+            [32, 16],
+            [
+                [
+                    DsaFragmentSpec(0, 0, 8),
+                    DsaFragmentSpec(0, 16, 24),
+                    DsaFragmentSpec(1, 0, 16),
+                ],
+                [DsaFragmentSpec(0, 8, 16), DsaFragmentSpec(0, 24, 32)],
+            ],
+            compress_ratio=4,
+            policy="balanced",
+            alignment=4,
         )
-        assert global_tiles(sequential) == expected
-        assert global_tiles(balanced) == expected
+
+        assert _coalesced_compressor_block_ids(plan, 0) == (
+            (0, 1),
+            (4, 5),
+            (8, 9, 10, 11),
+        )
+        assert _coalesced_compressor_block_ids(plan, 1) == ((2, 3), (6, 7))
+
+    def test_owner_compressor_extracts_all_rows_from_each_coalesced_run(self):
+        class FakeCompressor:
+            head_dim = 1
+
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, slab, *, block_offset):
+                self.calls.append((slab.size(0), block_offset))
+                values = torch.arange(slab.size(0) // 4, dtype=slab.dtype)
+                return (values + block_offset * 10).view(-1, 1, 1)
+
+        compressor = FakeCompressor()
+        source_rows = torch.zeros(24, 2)
+        forward_plan = SimpleNamespace(
+            compressor_runs=(
+                DsaCompressorRun(0, 0, 12, 0, 0, block_count=3),
+                DsaCompressorRun(7, 12, 24, 5, 1, block_count=2),
+            )
+        )
+
+        result = _run_owner_compressor(compressor, source_rows, forward_plan)
+
+        assert compressor.calls == [(12, 0), (12, 5)]
+        assert result[:, 0].tolist() == [0.0, 1.0, 2.0, 51.0, 52.0]
 
     def test_noncontiguous_plan_restore_map_and_transfers(self):
         plan = build_dsa_dispatch_plan(
