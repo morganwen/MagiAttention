@@ -102,16 +102,51 @@ def _validate_manifest(artifact: Path) -> str:
     )
 
 
+def _validate_correctness_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    if (
+        summary.get("case") != "cp8-natural-backward"
+        or summary.get("world_size") != 8
+        or summary.get("result_count") != 8
+        or summary.get("model_parameter_value_check_ranks") != [0]
+    ):
+        raise ValueError("installed-wheel CP8 summary is incomplete")
+    execution = summary.get("execution_seconds")
+    if not isinstance(execution, dict):
+        raise ValueError("installed-wheel CP8 summary is missing execution timings")
+    minimum = execution.get("min")
+    maximum = execution.get("max")
+    if not isinstance(minimum, (int, float)) or isinstance(minimum, bool):
+        raise ValueError("installed-wheel CP8 min timing is not numeric")
+    if not isinstance(maximum, (int, float)) or isinstance(maximum, bool):
+        raise ValueError("installed-wheel CP8 max timing is not numeric")
+    if minimum < 0.0 or maximum < minimum or maximum >= 60.0:
+        raise ValueError("installed-wheel CP8 execution timings violate the deadline")
+    results = summary.get("results")
+    if not isinstance(results, list) or len(results) != 8:
+        raise ValueError("installed-wheel CP8 summary does not contain eight results")
+    validated = dict(summary)
+    validated["result"] = "PASS"
+    return validated
+
+
 def _validate_correctness(path: Path, revision: str) -> dict[str, Any]:
-    summary = _read_json(path / "SUMMARY.json")
-    if summary.get("result") != "PASS":
-        raise ValueError("installed-wheel CP8 summary did not pass")
+    summary = _validate_correctness_summary(_read_json(path / "SUMMARY.json"))
     reports = sorted(path.glob("result_rank*.json"))
     if len(reports) != 8:
         raise ValueError(f"installed-wheel CP8 produced {len(reports)} rank reports")
     expected_version = f"1.1.1+g{revision}"
     for rank, report_path in enumerate(reports):
         report = _read_json(report_path)
+        execution_seconds = report.get("execution_seconds")
+        if (
+            report.get("case") != "cp8-natural-backward"
+            or report.get("rank") != rank
+            or not isinstance(execution_seconds, (int, float))
+            or isinstance(execution_seconds, bool)
+            or execution_seconds < 0.0
+            or execution_seconds >= 60.0
+        ):
+            raise ValueError(f"rank {rank} CP8 result violates the execution contract")
         installed = report.get("installed_wheel")
         if not isinstance(installed, dict):
             raise ValueError(f"rank {rank} did not report installed-wheel provenance")

@@ -23,6 +23,7 @@ import torch
 
 from benchmarks.dsa_v4.profile_5step import _topk_diagnostics
 from magi_attention.dsa_types import MagiDSAForwardResult
+from scripts.image.finalize_release import _validate_correctness_summary
 from scripts.profile.extract_nsys import extract_profile_records
 from scripts.profile.summarize_5step import compute_rank_ranges, validate_phase_records
 
@@ -92,6 +93,21 @@ def test_balanced_threshold_is_per_step_and_phase() -> None:
     assert [(record["step"], record["phase"]) for record in failures] == [
         (1, "indexer_topk")
     ]
+
+
+def test_release_finalizer_derives_pass_from_distributed_summary_contract() -> None:
+    summary = {
+        "case": "cp8-natural-backward",
+        "execution_seconds": {"max": 0.08, "min": 0.07},
+        "model_parameter_value_check_ranks": [0],
+        "result_count": 8,
+        "results": [{"rank": rank} for rank in range(8)],
+        "world_size": 8,
+    }
+    assert _validate_correctness_summary(summary)["result"] == "PASS"
+    summary["execution_seconds"] = {"max": 60.0, "min": 0.07}
+    with pytest.raises(ValueError, match="deadline"):
+        _validate_correctness_summary(summary)
 
 
 def _topk_result(ids: list[list[int]], lengths: list[int]) -> MagiDSAForwardResult:

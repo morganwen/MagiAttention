@@ -566,6 +566,10 @@ Release image 从 clean 40 字符 revision 构建，固定 runtime/backend 依�
 4. release artifact 引用已通过的正式 profile，保存 build/CP8 命令和日志、image ID、环境、硬件、
    submodules、最终报告与 SHA-256 manifest。
 
+多卡 summarizer 的 `SUMMARY.json` 不要求重复写顶层 `result` 字段；release finalizer 必须用既有
+schema 的 `case/world_size/result_count`、8 条 rank result、执行时间 `<60s`、rank 0 参数值检查、
+phase audit 和 SHA-256 manifest 联合判定通过，再在 release 自身的 `SUMMARY.json` 写 `result=PASS`。
+
 ## 9. 主要风险与缓解方向
 
 | 风险 | 影响 | 设计期缓解 |
