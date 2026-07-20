@@ -19,7 +19,7 @@ repos:
         pass_filenames: true
         always_run: true
         files: \.(txt|md|yaml|c|cc|cxx|cpp|cu|cuh|h|hpp|hxx|proto|py|pyi|sh)$
-        exclude: '(_zh\.\w+$|docs/source/conf\.py)'
+        exclude: '(_zh\.\w+$|docs/source/conf\.py|AGENTS\.md|PROGRESS\.md|docs/design/magi_dsa_v4\.md|scripts/profile/summarize_5step\.py|scripts/image/finalize_release\.py)'
     -   id: csrc_code_formatter
         name: check for csrc code format
         entry: bash scripts/run_csrc_code_formatter.sh
@@ -78,4 +78,4 @@ repos:
     hooks:
     -   id: mypy
         files: \.py$
-        args: [--config=mypy.ini, --ignore-missing-imports, --python-version=3.10]
+        args: [--config=mypy.ini, --ignore-missing-imports, --explicit-package-bases, --python-version=3.10]

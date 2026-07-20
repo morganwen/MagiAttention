@@ -1,0 +1,114 @@
+# Copyright (c) 2026 SandAI. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# syntax=docker/dockerfile:1.7
+
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch@sha256:192d749b4d773610ec9e01c0443a9df545d196c412b7b8fd33bfa3da362a49e7
+
+FROM ${BASE_IMAGE} AS flashmla-builder
+
+ARG FLASHMLA_REPOSITORY=https://github.com/deepseek-ai/FlashMLA.git
+ARG FLASHMLA_REVISION=9241ae3ef9bac614dd25e45e507e089f888280e0
+
+ENV CPATH=/usr/local/cuda/include/cccl \
+    FLASH_MLA_DISABLE_SM90=1 \
+    MAX_JOBS=8 \
+    NVCC_THREADS=4
+
+RUN git clone --filter=blob:none --no-checkout "${FLASHMLA_REPOSITORY}" /opt/FlashMLA && \
+    cd /opt/FlashMLA && \
+    git checkout --detach "${FLASHMLA_REVISION}" && \
+    test "$(git rev-parse HEAD)" = "${FLASHMLA_REVISION}" && \
+    git submodule update --init --recursive csrc/cutlass
+
+WORKDIR /opt/FlashMLA
+
+RUN python3 -m pip wheel --no-build-isolation --no-deps --wheel-dir /opt/wheels .
+
+FROM ${BASE_IMAGE} AS magi-builder
+
+ARG MAGI_ATTENTION_REVISION
+ARG VERSIONINGIT_VERSION=3.3.0
+
+ENV MAGI_ATTENTION_PREBUILD_FFA=0 \
+    MAGI_ATTENTION_SKIP_CUDA_BUILD=1
+
+RUN test "$(printf '%s' "${MAGI_ATTENTION_REVISION}" | wc -c)" -eq 40 && \
+    python3 -m pip install --no-cache-dir --no-deps \
+        "versioningit==${VERSIONINGIT_VERSION}"
+
+COPY . /workspace/Magi-DSA
+
+WORKDIR /tmp/Magi-DSA-build
+
+RUN cp -a /workspace/Magi-DSA/. . && \
+    sed -i \
+        "s/default-version = \"1.1.1\"/default-version = \"1.1.1+g${MAGI_ATTENTION_REVISION}\"/" \
+        pyproject.toml && \
+    grep -Fqx \
+        "default-version = \"1.1.1+g${MAGI_ATTENTION_REVISION}\"" \
+        pyproject.toml && \
+    python3 -m pip wheel --no-build-isolation --no-deps \
+        --wheel-dir /opt/magi-wheels . && \
+    sha256sum /opt/magi-wheels/magi_attention-*.whl \
+        > /opt/magi-wheels/SHA256SUMS
+
+FROM ${BASE_IMAGE}
+
+ARG CUDNN_BACKEND_VERSION=9.24.0.43
+ARG CUDNN_FRONTEND_VERSION=1.26.0
+ARG CUDNN_FRONTEND_REVISION=35fd7b0d0e1d4952b904c79341c5e84e3af0a328
+ARG CUTLASS_DSL_VERSION=4.5.0
+ARG FLASHMLA_REVISION=9241ae3ef9bac614dd25e45e507e089f888280e0
+ARG MAGI_ATTENTION_REVISION=unknown
+ARG QUACK_VERSION=0.4.1
+ARG TVM_FFI_VERSION=0.1.8.post0
+
+# The base digest supplies CUDA 13.2, cuBLAS, cuda-python, torch, and torch-c-dlpack-ext.
+# Every dependency that changes the frozen DSA ABI is installed explicitly.
+RUN python3 -m pip install --no-cache-dir --no-deps --upgrade \
+        "nvidia-cudnn-cu13==${CUDNN_BACKEND_VERSION}" \
+        "nvidia-cudnn-frontend==${CUDNN_FRONTEND_VERSION}" \
+        "nvidia-cutlass-dsl==${CUTLASS_DSL_VERSION}" \
+        "nvidia-cutlass-dsl-libs-base==${CUTLASS_DSL_VERSION}" \
+        "nvidia-cutlass-dsl-libs-cu13==${CUTLASS_DSL_VERSION}" \
+        "apache-tvm-ffi==${TVM_FFI_VERSION}" \
+        "quack-kernels==${QUACK_VERSION}"
+
+COPY --from=flashmla-builder /opt/wheels /opt/flashmla-wheels
+COPY --from=magi-builder /opt/magi-wheels /opt/magi-wheels
+COPY --from=magi-builder /workspace/Magi-DSA /workspace/Magi-DSA
+
+RUN python3 -m pip install --no-cache-dir --no-deps \
+        /opt/flashmla-wheels/flash_mla-*.whl \
+        /opt/magi-wheels/magi_attention-*.whl
+
+ENV LD_LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH} \
+    MAGI_DSA_SOURCE_REVISION=${MAGI_ATTENTION_REVISION}
+
+WORKDIR /tmp
+
+RUN python3 -c "import os; from importlib import metadata; import cudnn; import flash_mla; import magi_attention; from cudnn import DSA; from magi_attention.dsa_layer import MagiDSALayer; from magi_attention.dsa_runtime_mgr import MagiDSARuntimeMgr; assert cudnn.__version__ == '1.26.0'; assert cudnn.backend_version() == 92400; assert metadata.version('nvidia-cudnn-cu13') == '9.24.0.43'; assert metadata.version('nvidia-cutlass-dsl') == '4.5.0'; assert metadata.version('apache-tvm-ffi') == '0.1.8.post0'; assert metadata.version('quack-kernels') == '0.4.1'; assert metadata.version('flash-mla').endswith('+9241ae3'); assert metadata.version('magi-attention') == '1.1.1+g' + os.environ['MAGI_DSA_SOURCE_REVISION']; assert '/site-packages/' in magi_attention.__file__; assert DSA.indexer_forward_wrapper; assert DSA.indexer_top_k_wrapper; assert DSA.sparse_attention_backward_wrapper; assert flash_mla.flash_mla_sparse_fwd; assert MagiDSALayer; assert MagiDSARuntimeMgr"
+
+LABEL org.opencontainers.image.base.digest="sha256:192d749b4d773610ec9e01c0443a9df545d196c412b7b8fd33bfa3da362a49e7" \
+      org.magi-dsa.cudnn-backend="9.24.0.43" \
+      org.magi-dsa.cudnn-frontend="1.26.0" \
+      org.magi-dsa.cudnn-frontend-revision="${CUDNN_FRONTEND_REVISION}" \
+      org.magi-dsa.cutlass-dsl="4.5.0" \
+      org.magi-dsa.flashmla-revision="${FLASHMLA_REVISION}" \
+      org.magi-dsa.install-mode="python-wheel" \
+      org.magi-dsa.magi-attention-revision="${MAGI_ATTENTION_REVISION}" \
+      org.magi-dsa.magi-attention-wheel-scope="dsa-python-runtime" \
+      org.magi-dsa.quack-kernels="0.4.1" \
+      org.magi-dsa.tvm-ffi="0.1.8.post0"

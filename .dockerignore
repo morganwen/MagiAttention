@@ -1,0 +1,12 @@
+.cache
+.git
+artifacts
+PROGRESS.md
+build
+dist
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.nsys-rep
+**/*.ncu-rep
+**/*.sqlite
