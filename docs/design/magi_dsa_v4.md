@@ -558,7 +558,8 @@ Release image 从 clean 40 字符 revision 构建，固定 runtime/backend 依�
 `versioningit==3.3.0` 生成只包含 DSA 所需 Python runtime 的 `magi_attention` wheel，镜像内同时
 保存 clean source snapshot；legacy Magi CUDA extensions 不属于 DSA wheel。镜像必须满足：
 
-1. wheel 版本为 `1.1.1+g<40-char-revision>`，且 import path 位于 `site-packages`；
+1. wheel 版本为 `1.1.1+g<40-char-revision>`，且 import path 位于 Python 安装目录
+   （`site-packages` 或 Debian/NVIDIA 等价的 `dist-packages`），不得来自 source mount；
 2. OCI label、环境变量、wheel SHA-256 与 source revision 相互一致；
 3. 8-rank CP8 natural forward/backward 在 installed-wheel 模式通过，每个 rank 报告相同 revision、
    version 与 package path；

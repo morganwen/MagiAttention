@@ -37,7 +37,8 @@ seed、输入、配置和软件镜像，各运行 5 个 captured forward steps�
 Release 镜像必须从 clean revision 构建并安装该 revision 的 `magi_attention` wheel，而不是只依赖
 source bind mount。Wheel 为已批准 DSA Python runtime 范围，构建时固定
 `versioningit==3.3.0` 且跳过与 DSA 路径无关的 legacy Magi CUDA extensions；镜像内版本必须包含
-完整 40 字符 source revision，CP8 release 验证必须证明 8 ranks 都从 `site-packages` 导入该 wheel。
+完整 40 字符 source revision，CP8 release 验证必须证明 8 ranks 都从 Python 安装目录
+（`site-packages` 或 Debian/NVIDIA 等价的 `dist-packages`）导入该 wheel，而不是从 source mount 导入。
 
 Q4–Q10 的冻结合同记录在设计文档第 1、10 节：production 使用 contiguous owner-local CP shard，
 CP1/CP2/CP8 分别承担 reference、最低多卡回归和 release 验收；每 rank/step 只有一次 grouped logical

@@ -119,8 +119,11 @@ def _validate_correctness(path: Path, revision: str) -> dict[str, Any]:
             raise ValueError(f"rank {rank} installed-wheel revision mismatch")
         if installed.get("package_version") != expected_version:
             raise ValueError(f"rank {rank} installed-wheel version mismatch")
-        if "/site-packages/" not in str(installed.get("package_path")):
-            raise ValueError(f"rank {rank} did not import Magi-DSA from site-packages")
+        package_parts = set(Path(str(installed.get("package_path"))).parts)
+        if not package_parts.intersection({"site-packages", "dist-packages"}):
+            raise ValueError(
+                f"rank {rank} did not import Magi-DSA from a Python installation directory"
+            )
     _validate_manifest(path)
     return summary
 

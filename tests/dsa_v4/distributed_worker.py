@@ -72,9 +72,11 @@ def _installed_wheel_metadata() -> dict[str, str] | None:
     package_path = str(Path(magi_attention.__file__).resolve())
     package_version = package_metadata.version("magi-attention")
     expected_version = f"1.1.1+g{expected_revision}"
-    if "/site-packages/" not in package_path:
+    installation_parts = set(Path(package_path).parts)
+    if not installation_parts.intersection({"site-packages", "dist-packages"}):
         raise RuntimeError(
-            f"Magi-DSA was not imported from site-packages: {package_path}"
+            "Magi-DSA was not imported from a Python installation directory: "
+            f"{package_path}"
         )
     if package_version != expected_version:
         raise RuntimeError(
