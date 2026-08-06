@@ -217,6 +217,19 @@ def _validate_plan_artifacts(
             or int(audit.get("logical_phase_records", 0)) != 80
         ):
             raise ValueError(f"Nsight audit did not pass for {plan}")
+        attribution_audit = _read_json(plan_dir / "NSYS_ATTRIBUTION.json")
+        if (
+            attribution_audit.get("result") != "PASS"
+            or int(attribution_audit.get("unattributed_kernel_count", -1)) != 0
+            or float(attribution_audit.get("attribution_coverage", 0.0)) != 1.0
+            or int(attribution_audit.get("kernel_records", 0)) <= 0
+        ):
+            raise ValueError(f"Nsight kernel attribution did not pass for {plan}")
+        attribution_records = _read_jsonl(plan_dir / "nsys_kernel_attribution.jsonl")
+        if len(attribution_records) != int(attribution_audit["kernel_records"]):
+            raise ValueError(
+                f"Nsight kernel attribution record count differs for {plan}"
+            )
         metadata[plan] = []
         results[plan] = []
         for rank in range(world_size):
@@ -224,6 +237,17 @@ def _validate_plan_artifacts(
             if len(_read_jsonl(raw_path)) != 10:
                 raise ValueError(
                     f"per-rank Nsight raw record count mismatch: {raw_path}"
+                )
+            rank_attribution_path = (
+                plan_dir / f"rank{rank}_nsys_kernel_attribution.jsonl"
+            )
+            rank_attribution = _read_jsonl(rank_attribution_path)
+            if not rank_attribution or any(
+                int(record.get("rank", -1)) != rank for record in rank_attribution
+            ):
+                raise ValueError(
+                    "per-rank kernel attribution record set is empty or misrouted: "
+                    f"{rank_attribution_path}"
                 )
             rank_metadata = _read_json(plan_dir / f"metadata_rank{rank}.json")
             rank_result = _read_json(plan_dir / f"result_rank{rank}.json")
@@ -247,13 +271,24 @@ def _validate_plan_artifacts(
                     f"warm-path counter delta mismatch: plan={plan}, rank={rank}"
                 )
             metrics = rank_result.get("metrics")
-            if not isinstance(metrics, dict) or not all(
-                metrics.get(name) is True
-                for name in (
-                    "ordered_topk_exact",
-                    "output_finite",
-                    "topk_length_exact",
-                    "topk_unique",
+            backend_native_valid = (
+                metrics.get(
+                    "topk_backend_native_valid",
+                    metrics.get("ordered_topk_exact"),
+                )
+                if isinstance(metrics, dict)
+                else False
+            )
+            if (
+                not isinstance(metrics, dict)
+                or backend_native_valid is not True
+                or not all(
+                    metrics.get(name) is True
+                    for name in (
+                        "output_finite",
+                        "topk_length_exact",
+                        "topk_unique",
+                    )
                 )
             ):
                 raise ValueError(
@@ -284,15 +319,27 @@ def _validate_plan_artifacts(
     }
     if len(parameter_hashes) != 1:
         raise ValueError("model parameters differ across profile ranks or plans")
+    all_metrics = [
+        rank_result["metrics"]
+        for plan_results in results.values()
+        for rank_result in plan_results
+    ]
     return {
+        "canonical_topk_exact": all(
+            bool(metrics.get("canonical_topk_exact", metrics["ordered_topk_exact"]))
+            for metrics in all_metrics
+        ),
         "input_hashes_by_rank": [
             metadata["sequential"][rank]["input_sha256"] for rank in range(world_size)
         ],
-        "ordered_topk_exact": True,
+        "ordered_topk_exact": all(
+            bool(metrics["ordered_topk_exact"]) for metrics in all_metrics
+        ),
         "output_close": True,
         "output_finite": True,
         "parameter_sha256": next(iter(parameter_hashes)),
         "result": "PASS",
+        "topk_backend_native_valid": True,
         "topk_length_exact": True,
         "topk_unique": True,
     }
@@ -330,7 +377,8 @@ def _format_report(
         "- Workload：seed=0，BF16，ratio=4，CP8，`cu_seqlens=[0,131072]`。",
         "- 捕获：每个 plan 恰好 5 个 forward step；JIT/prewarm 位于捕获区间外。",
         "- 时间口径：logical NVTX 内 CUDA runtime launch 关联的 CUPTI kernel GPU duration 之和。",
-        "- Correctness：sequential/balanced ordered Top-K 与 length exact，output tolerance 通过，ID 唯一。",
+        "- Correctness：Top-K 长度/有效 ID 结构满足 backend-native 合同；集合与位序仅作诊断；"
+        "output/KL 数值门槛通过。",
         "",
         "## 逐 step rank balance",
         "",

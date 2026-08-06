@@ -15,20 +15,21 @@
 from __future__ import annotations
 
 import copy
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import torch
 
-from magi_attention.dsa_config import DsaRatio, MagiDSAConfig
+from magi_attention.dsa_config import DsaRatio, DsaStructuralLayoutConfig, MagiDSAConfig
 from magi_attention.dsa_layer import MagiDSALayer
 from magi_attention.dsa_runtime_mgr import MagiDSARuntimeMgr
 from magi_attention.dsa_types import MagiDSAInput, MagiDSAPackedMeta
+from magi_attention.functional.dsa_backend import run_grouped_dsa_indexer
+from magi_attention.functional.dsa_packing import copy_dsa_device_map
 from magi_attention.functional.dsa_reference import (
     _compress_global,
-    dsa_position_ids,
+    assert_backend_native_topk_outputs_close,
     dsa_reference,
-    validate_canonical_topk,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -53,22 +54,12 @@ def test_cp1_csa_indexer_raw_scores_match_pure_pytorch_reference() -> None:
         device="cuda",
         dtype=torch.bfloat16,
     )
-    q = torch.randn(
-        tokens,
-        config.num_query_heads,
-        config.head_dim,
-        device="cuda",
-        dtype=torch.bfloat16,
-    ).contiguous()
-    latent_kv = torch.randn(
-        tokens,
-        config.head_dim,
-        device="cuda",
-        dtype=torch.bfloat16,
-    ).contiguous()
-    sink = torch.randn(config.num_query_heads, device="cuda", dtype=torch.float32)
     meta = MagiDSAPackedMeta((0, tokens), tokens)
-    runtime = MagiDSARuntimeMgr(config, policy="indexer_balanced")
+    runtime = MagiDSARuntimeMgr(
+        config,
+        policy="structural_balanced",
+        structural_layout_config=DsaStructuralLayoutConfig(),
+    )
     handle = runtime.prepare_execution(
         meta,
         torch.device("cuda"),
@@ -77,31 +68,35 @@ def test_cp1_csa_indexer_raw_scores_match_pure_pytorch_reference() -> None:
 
     from cudnn import DSA
 
-    captured: dict[str, torch.Tensor] = {}
+    captured: dict[str, object] = {}
     original_score = DSA.indexer_forward_wrapper
+    original_topk = DSA.indexer_top_k_wrapper
+
+    def assert_explicit_current_stream(kwargs: dict[str, Any]) -> None:
+        stream = kwargs["stream"]
+        assert int(stream) != 0
+        assert int(stream) == torch.cuda.current_stream().cuda_stream
 
     def capture_score(*args: Any, **kwargs: Any) -> Any:
+        assert_explicit_current_stream(kwargs)
         backend_result = original_score(*args, **kwargs)
-        captured["scores"] = backend_result["scores"].detach()
+        captured["scores"] = backend_result["scores"].detach().clone()
+        captured["sm_scale"] = kwargs["sm_scale"]
         return backend_result
 
-    DSA.indexer_forward_wrapper = capture_score
-    try:
-        with torch.no_grad():
-            runtime.calc_dsa(
-                layer,
-                MagiDSAInput(x, qr, q, latent_kv, sink, meta),
-                handle,
-            )
-    finally:
-        DSA.indexer_forward_wrapper = original_score
-    torch.cuda.synchronize()
-    if "scores" not in captured:
-        raise AssertionError("CP1 did not capture Indexer raw scores")
+    def capture_topk(*args: Any, **kwargs: Any) -> Any:
+        assert_explicit_current_stream(kwargs)
+        assert kwargs.get("return_val") is False
+        backend_result = original_topk(*args, **kwargs)
+        assert backend_result["values"] is None
+        captured["raw_topk_indices"] = backend_result["indices"].detach().clone()
+        return backend_result
 
     assert layer.indexer is not None
+    indexer_map = handle.device_plan.indexer
+    assert indexer_map is not None
     with torch.no_grad():
-        positions = dsa_position_ids(meta.cu_seqlens, device=x.device)
+        positions = handle.device_plan.local_q_positions
         q_indexer, weights = layer.indexer.project_queries(
             x,
             qr,
@@ -113,14 +108,47 @@ def test_cp1_csa_indexer_raw_scores_match_pure_pytorch_reference() -> None:
             x,
             meta.cu_seqlens,
         )
+        grouped_k = copy_dsa_device_map(compressed_ki, indexer_map.k_pack)
+        score_weights = weights
+        DSA.indexer_forward_wrapper = capture_score
+        DSA.indexer_top_k_wrapper = capture_topk
+        try:
+            caller_stream = torch.cuda.current_stream()
+            indexer_stream = torch.cuda.Stream()
+            indexer_stream.wait_stream(caller_stream)
+            with torch.cuda.stream(indexer_stream):
+                selection = run_grouped_dsa_indexer(
+                    q_indexer,
+                    grouped_k,
+                    score_weights,
+                    indexer_map,
+                    config,
+                )
+            caller_stream.wait_stream(indexer_stream)
+        finally:
+            DSA.indexer_forward_wrapper = original_score
+            DSA.indexer_top_k_wrapper = original_topk
+        assert selection.logical_score_calls == 1
+        assert selection.logical_topk_calls == 1
         dots = torch.einsum(
             "qhd,kd->qhk",
             q_indexer.float(),
             compressed_ki.float(),
         )
-        reference_scores = (dots.relu() * weights.float().unsqueeze(-1)).sum(dim=1)
+        score_weights = weights.float()
+        reference_scores = (
+            dots.relu() * config.indexer_head_dim**-0.5 * score_weights.unsqueeze(-1)
+        ).sum(dim=1)
 
+    torch.cuda.synchronize()
+    if "scores" not in captured:
+        raise AssertionError("CP1 did not capture Indexer raw scores")
+    if "raw_topk_indices" not in captured:
+        raise AssertionError("CP1 did not capture IDs-only Indexer Top-K output")
     backend_scores = captured["scores"]
+    if not isinstance(backend_scores, torch.Tensor):
+        raise AssertionError("CP1 captured an invalid Indexer score output")
+    assert captured["sm_scale"] == config.indexer_head_dim**-0.5
     for row in range(tokens):
         visible = (row + 1) // config.ratio
         torch.testing.assert_close(
@@ -154,7 +182,11 @@ def test_cp1_csa_release_forward_matches_reference() -> None:
     ).contiguous()
     sink = torch.randn(config.num_query_heads, device="cuda", dtype=torch.float32)
     meta = MagiDSAPackedMeta((0, tokens), tokens)
-    runtime = MagiDSARuntimeMgr(config, policy="indexer_balanced")
+    runtime = MagiDSARuntimeMgr(
+        config,
+        policy="structural_balanced",
+        structural_layout_config=DsaStructuralLayoutConfig(),
+    )
     handle = runtime.prepare_execution(
         meta, torch.device("cuda"), local_token_capacity=tokens
     )
@@ -165,15 +197,19 @@ def test_cp1_csa_release_forward_matches_reference() -> None:
         actual = runtime.calc_dsa(layer, dsa_input, handle)
     torch.cuda.synchronize()
 
-    validate_canonical_topk(
+    output_diagnostics = assert_backend_native_topk_outputs_close(
+        actual.output,
+        expected.output,
         actual.topk_ids,
         actual.topk_length,
         expected.topk_ids,
         expected.topk_length,
         label="CP1 forward production vs pure-PyTorch reference",
     )
-    torch.testing.assert_close(
-        actual.output.float(), expected.output.float(), atol=5e-3, rtol=5e-3
+    assert (
+        cast(int, output_diagnostics["output_compared_rows"])
+        + cast(int, output_diagnostics["output_tie_exempt_rows"])
+        == tokens
     )
     torch.testing.assert_close(
         actual.sparse_lse, expected.sparse_lse, atol=5e-3, rtol=5e-3
@@ -211,7 +247,11 @@ def test_cp1_csa_natural_backward_matches_all_input_and_parameter_gradients() ->
     actual_sink = sink_value.clone().requires_grad_(True)
     reference_sink = sink_value.clone().requires_grad_(True)
     meta = MagiDSAPackedMeta((0, tokens), tokens)
-    runtime = MagiDSARuntimeMgr(config, policy="indexer_balanced")
+    runtime = MagiDSARuntimeMgr(
+        config,
+        policy="structural_balanced",
+        structural_layout_config=DsaStructuralLayoutConfig(),
+    )
     handle = runtime.prepare_execution(
         meta, torch.device("cuda"), local_token_capacity=tokens
     )
@@ -243,7 +283,9 @@ def test_cp1_csa_natural_backward_matches_all_input_and_parameter_gradients() ->
     expected_loss.backward()
     torch.cuda.synchronize()
 
-    validate_canonical_topk(
+    output_diagnostics = assert_backend_native_topk_outputs_close(
+        actual.output,
+        expected.output,
         actual.topk_ids,
         actual.topk_length,
         expected.topk_ids,
@@ -254,9 +296,14 @@ def test_cp1_csa_natural_backward_matches_all_input_and_parameter_gradients() ->
         actual.indexer_lse, expected.indexer_lse, atol=5e-3, rtol=5e-3
     )
     torch.testing.assert_close(
-        actual.output.float(), expected.output.float(), atol=5e-3, rtol=5e-3
+        actual.sparse_lse, expected.sparse_lse, atol=5e-3, rtol=5e-3
     )
     torch.testing.assert_close(actual.kl, expected.kl, atol=2e-2, rtol=2e-2)
+    assert (
+        cast(int, output_diagnostics["output_compared_rows"])
+        + cast(int, output_diagnostics["output_tie_exempt_rows"])
+        == tokens
+    )
     for actual_tensor, expected_tensor in (
         (actual_x, reference_x),
         (actual_qr, reference_qr),
@@ -281,6 +328,76 @@ def test_cp1_csa_natural_backward_matches_all_input_and_parameter_gradients() ->
         assert expected_gradient is not None, name
         torch.testing.assert_close(
             actual_gradient, expected_gradient, atol=2e-2, rtol=2e-2, msg=name
+        )
+
+
+def test_cp1_csa_overlap_backward_supports_retain_graph() -> None:
+    torch.manual_seed(23)
+    config = MagiDSAConfig(ratio=4)
+    tokens = 128
+    layer = MagiDSALayer(config).cuda()
+
+    def make_input(shape: tuple[int, ...], *, scale: float = 1.0) -> torch.Tensor:
+        return (
+            (torch.randn(*shape, device="cuda", dtype=torch.bfloat16) * scale)
+            .contiguous()
+            .requires_grad_(True)
+        )
+
+    x = make_input((tokens, config.hidden_size))
+    qr = make_input((tokens, config.q_lora_rank))
+    q = make_input(
+        (tokens, config.num_query_heads, config.head_dim),
+        scale=0.25,
+    )
+    latent_kv = make_input((tokens, config.head_dim), scale=0.25)
+    sink = torch.randn(
+        config.num_query_heads,
+        device="cuda",
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    meta = MagiDSAPackedMeta((0, tokens), tokens)
+    runtime = MagiDSARuntimeMgr(
+        config,
+        policy="structural_balanced",
+        structural_layout_config=DsaStructuralLayoutConfig(),
+    )
+    handle = runtime.prepare_execution(
+        meta,
+        torch.device("cuda"),
+        local_token_capacity=tokens,
+    )
+    result = runtime.calc_dsa(
+        layer,
+        MagiDSAInput(x, qr, q, latent_kv, sink, meta),
+        handle,
+    )
+    targets = (x, qr, q, latent_kv, sink, *tuple(layer.parameters()))
+    grad_outputs = (
+        torch.randn_like(result.output),
+        torch.ones_like(result.kl),
+    )
+    first = torch.autograd.grad(
+        (result.output, result.kl),
+        targets,
+        grad_outputs,
+        retain_graph=True,
+    )
+    second = torch.autograd.grad(
+        (result.output, result.kl),
+        targets,
+        grad_outputs,
+    )
+    torch.cuda.synchronize()
+
+    for first_gradient, second_gradient in zip(first, second):
+        assert torch.isfinite(first_gradient.float()).all()
+        torch.testing.assert_close(
+            first_gradient.float(),
+            second_gradient.float(),
+            atol=5e-2,
+            rtol=5e-2,
         )
 
 

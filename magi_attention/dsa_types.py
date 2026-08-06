@@ -21,7 +21,12 @@ import torch
 
 @dataclass(frozen=True)
 class MagiDSAPackedMeta:
-    """Global packed sequence metadata plus this rank's valid owner-row count."""
+    """Global packed metadata plus this rank's pre-layout source-row count.
+
+    ``local_token_count`` describes the contiguous source-owner input passed to
+    ``MagiDSARuntimeMgr.layout_hidden``.  It can differ from the final Query-row
+    count carried by an execution handle after ``TOKEN_LAYOUT``.
+    """
 
     cu_seqlens: tuple[int, ...]
     local_token_count: int
@@ -57,7 +62,13 @@ class MagiDSAPackedMeta:
 
 @dataclass(frozen=True)
 class MagiDSAInput:
-    """Parameter-free owner-local tensor boundary consumed by MagiDSALayer."""
+    """Parameter-free final-Query-local boundary consumed by MagiDSALayer.
+
+    All four token activations are produced from the same hidden state *after*
+    the model-boundary ``TOKEN_LAYOUT``.  ``packed_meta.local_token_count``
+    intentionally remains the pre-layout source-row count used to identify the
+    frozen execution plan.
+    """
 
     x: torch.Tensor
     qr: torch.Tensor

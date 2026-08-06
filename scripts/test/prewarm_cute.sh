@@ -23,10 +23,14 @@ run_id="$(date -u +%Y%m%dT%H%M%SZ)-cute-jit"
 artifact_dir="$repo_root/artifacts/release/$run_id"
 container_name="magi-dsa-cute-jit-$$"
 validate_container_name="$container_name-validate"
-mkdir -p "$artifact_dir" "$aot_dir"
+mkdir -p "$artifact_dir" "$aot_dir" "$aot_dir/tmp" "$aot_dir/cuda" \
+    "$aot_dir/cute-dsl" "$aot_dir/xdg-cache" "$aot_dir/torch" \
+    "$aot_dir/triton"
 # Docker root is intentionally mapped to nobody on this host. The ignored,
 # content-addressed compiler cache must therefore be writable by that mapping.
-chmod 0777 "$aot_dir"
+chmod 0777 "$aot_dir" "$aot_dir/tmp" "$aot_dir/cuda" \
+    "$aot_dir/cute-dsl" "$aot_dir/xdg-cache" "$aot_dir/torch" \
+    "$aot_dir/triton"
 
 cleanup() {
     if docker container inspect "$container_name" >/dev/null 2>&1; then
@@ -47,9 +51,14 @@ trap cleanup EXIT INT TERM
     echo "python3 scripts/test/prewarm_dsa_pack.py"
 } | tee "$artifact_dir/COMMAND.txt"
 
-expected_objects=11
-existing_objects="$(find "$aot_dir" -maxdepth 1 -type f -name '*.o' | wc -l)"
-if ((existing_objects != expected_objects)); then
+mapfile -t required_objects < <(python3 "$repo_root/scripts/test/dsa_pack_aot_manifest.py")
+missing_objects=()
+for object_name in "${required_objects[@]}"; do
+    if [[ ! -f "$aot_dir/$object_name" ]]; then
+        missing_objects+=("$object_name")
+    fi
+done
+if ((${#missing_objects[@]} > 0)); then
     timeout --signal=TERM --kill-after=5s 1500s docker run \
         --rm \
         --name "$container_name" \
@@ -60,20 +69,31 @@ if ((existing_objects != expected_objects)); then
         --ulimit memlock=-1 \
         --ulimit stack=67108864 \
         --env MAGI_DSA_CUTE_AOT_OUTPUT_DIR=/dsa-pack-aot \
+        --env TMPDIR=/dsa-pack-aot/tmp \
+        --env TEMP=/dsa-pack-aot/tmp \
+        --env TMP=/dsa-pack-aot/tmp \
+        --env CUDA_CACHE_PATH=/dsa-pack-aot/cuda \
+        --env CUTE_DSL_CACHE_DIR=/dsa-pack-aot/cute-dsl \
+        --env XDG_CACHE_HOME=/dsa-pack-aot/xdg-cache \
+        --env TORCH_HOME=/dsa-pack-aot/torch \
+        --env TRITON_CACHE_DIR=/dsa-pack-aot/triton \
         --env PYTHONPATH=/workspace/Magi-DSA \
+        --env PYTHONDONTWRITEBYTECODE=1 \
         --volume "$aot_dir:/dsa-pack-aot" \
         --volume "$repo_root:/workspace/Magi-DSA:ro" \
-        --workdir /workspace/Magi-DSA \
+        --workdir /dsa-pack-aot \
         "$image" \
-        scripts/test/prewarm_dsa_pack.py \
+        /workspace/Magi-DSA/scripts/test/prewarm_dsa_pack.py \
         2>&1 | tee "$artifact_dir/compile.log"
 fi
 
+for object_name in "${required_objects[@]}"; do
+    if [[ ! -f "$aot_dir/$object_name" ]]; then
+        echo "CuTe AOT export is missing required object: $object_name" >&2
+        exit 1
+    fi
+done
 object_count="$(find "$aot_dir" -maxdepth 1 -type f -name '*.o' | wc -l)"
-if ((object_count != expected_objects)); then
-    echo "CuTe AOT export produced $object_count objects, expected $expected_objects" >&2
-    exit 1
-fi
 timeout --signal=TERM --kill-after=5s 300s docker run \
     --rm \
     --name "$validate_container_name" \
@@ -85,14 +105,26 @@ timeout --signal=TERM --kill-after=5s 300s docker run \
     --ulimit stack=67108864 \
     --env MAGI_DSA_CUTE_AOT_DIR=/dsa-pack-aot \
     --env MAGI_DSA_CUTE_AOT_REQUIRED=1 \
+    --env TMPDIR=/dsa-pack-aot/tmp \
+    --env TEMP=/dsa-pack-aot/tmp \
+    --env TMP=/dsa-pack-aot/tmp \
+    --env CUDA_CACHE_PATH=/dsa-pack-aot/cuda \
+    --env CUTE_DSL_CACHE_DIR=/dsa-pack-aot/cute-dsl \
+    --env XDG_CACHE_HOME=/dsa-pack-aot/xdg-cache \
+    --env TORCH_HOME=/dsa-pack-aot/torch \
+    --env TRITON_CACHE_DIR=/dsa-pack-aot/triton \
     --env PYTHONPATH=/workspace/Magi-DSA \
-    --volume "$aot_dir:/dsa-pack-aot:ro" \
+    --env PYTHONDONTWRITEBYTECODE=1 \
+    --volume "$aot_dir:/dsa-pack-aot" \
     --volume "$repo_root:/workspace/Magi-DSA:ro" \
-    --workdir /workspace/Magi-DSA \
+    --workdir /dsa-pack-aot \
     "$image" \
-    scripts/test/prewarm_dsa_pack.py \
+    /workspace/Magi-DSA/scripts/test/prewarm_dsa_pack.py \
     2>&1 | tee "$artifact_dir/validate.log"
 
-echo "aot_object_count=$object_count" | tee "$artifact_dir/SUMMARY.txt"
+{
+    echo "required_aot_object_count=${#required_objects[@]}"
+    echo "total_aot_object_count=$object_count"
+} | tee "$artifact_dir/SUMMARY.txt"
 find "$aot_dir" -maxdepth 1 -type f -print0 | sort -z | xargs -0 -r sha256sum \
     >"$artifact_dir/AOT_MANIFEST.sha256"

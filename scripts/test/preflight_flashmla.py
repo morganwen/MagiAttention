@@ -14,10 +14,19 @@
 
 import json
 import math
+import os
 from importlib import metadata
 
 import flash_mla
 import torch
+
+_FLASHMLA_BASE_REVISION = "9241ae3ef9bac614dd25e45e507e089f888280e0"
+_FLASHMLA_DUAL_LSE_PATCH_REVISION = "13d173ac48abd8ec88a4e742bcaaa59c5ccf4ece"
+_FLASHMLA_PRO_H128_PATCH_REVISION = "b7643bd54521f563b839b98289b5cd048c062ba2"
+_PRO_HEADS = 128
+_PRO_HEAD_DIM = 512
+_PRO_INDEXER_TOPK = 1024
+_PRO_WINDOW_TOPK = 128
 
 
 def main() -> None:
@@ -25,32 +34,53 @@ def main() -> None:
     assert torch.cuda.get_device_capability() == (10, 3)
     version = metadata.version("flash-mla")
     assert version.endswith("+9241ae3"), version
+    assert os.environ["MAGI_DSA_FLASHMLA_BASE_REVISION"] == _FLASHMLA_BASE_REVISION
+    assert (
+        os.environ["MAGI_DSA_FLASHMLA_DUAL_LSE_PATCH_REVISION"]
+        == _FLASHMLA_DUAL_LSE_PATCH_REVISION
+    )
+    assert (
+        os.environ["MAGI_DSA_FLASHMLA_PRO_H128_PATCH_REVISION"]
+        == _FLASHMLA_PRO_H128_PATCH_REVISION
+    )
 
-    seqlen_q, seqlen_k, heads, dim, top_k = 64, 1024, 64, 512, 512
+    seqlen_q, seqlen_k = 16, 2048
+    heads, dim = _PRO_HEADS, _PRO_HEAD_DIM
+    indexer_topk, window_topk = _PRO_INDEXER_TOPK, _PRO_WINDOW_TOPK
+    top_k = indexer_topk + window_topk
+    assert (heads, dim, indexer_topk, top_k) == (128, 512, 1024, 1152)
     q = torch.randn(seqlen_q, heads, dim, device="cuda", dtype=torch.bfloat16)
     kv = torch.randn(seqlen_k, 1, dim, device="cuda", dtype=torch.bfloat16)
     sink = torch.randn(heads, device="cuda", dtype=torch.float32)
     row = torch.arange(seqlen_q, device="cuda", dtype=torch.int32).view(-1, 1, 1)
     column = torch.arange(top_k, device="cuda", dtype=torch.int32).view(1, 1, -1)
     indices = (row * 7 + column).remainder(seqlen_k).contiguous()
-    topk_length = 256 + torch.arange(seqlen_q, device="cuda", dtype=torch.int32)
+    row_offset = torch.arange(seqlen_q, device="cuda", dtype=torch.int32)
+    indexer_length = indexer_topk - seqlen_q + 1 + row_offset
+    window_length = window_topk - seqlen_q + 1 + row_offset
+    position = torch.arange(top_k, device="cuda").view(1, -1)
+    valid = (position < indexer_length.view(-1, 1)) | (
+        (position >= indexer_topk)
+        & (position < (indexer_topk + window_length).view(-1, 1))
+    )
+    indices[:, 0].masked_fill_(~valid, -1)
     scale = 1.0 / math.sqrt(dim)
 
-    out, max_logits, lse = flash_mla.flash_mla_sparse_fwd(
+    out, max_logits, lse, compressed_lse = flash_mla.flash_mla_sparse_fwd(
         q,
         kv,
         indices,
         sm_scale=scale,
         d_v=512,
         attn_sink=sink,
-        topk_length=topk_length,
+        topk_length=None,
+        indexer_topk=indexer_topk,
     )
     torch.cuda.synchronize()
-    print("flashmla_sparse_fwd: executed", flush=True)
+    print("flashmla_sparse_fwd_pro_h128: executed", flush=True)
 
     flat_indices = indices[:, 0].clone()
-    position = torch.arange(top_k, device="cuda").view(1, -1)
-    invalid = position >= topk_length.view(-1, 1)
+    invalid = ~valid
     flat_indices[invalid] = 0
     selected_kv = kv[:, 0].index_select(0, flat_indices.flatten().long())
     selected_kv = selected_kv.view(seqlen_q, top_k, dim).float()
@@ -58,6 +88,10 @@ def main() -> None:
     score = score.masked_fill(invalid.unsqueeze(1), float("-inf"))
     reference_max = score.max(dim=-1).values
     reference_lse = torch.logsumexp(score, dim=-1)
+    reference_compressed_lse = torch.logsumexp(
+        score[:, :, :indexer_topk],
+        dim=-1,
+    )
     denominator = torch.logaddexp(reference_lse, sink.view(1, heads))
     probability = torch.exp(score - denominator.unsqueeze(-1))
     reference_out = torch.einsum("qhk,qkd->qhd", probability, selected_kv)
@@ -65,16 +99,35 @@ def main() -> None:
     torch.testing.assert_close(out.float(), reference_out, atol=5e-3, rtol=2e-2)
     torch.testing.assert_close(max_logits, reference_max, atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(lse, reference_lse, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(
+        compressed_lse,
+        reference_compressed_lse,
+        atol=1e-4,
+        rtol=1e-4,
+    )
+    assert out.shape == (seqlen_q, heads, dim)
+    assert lse.shape == compressed_lse.shape == (seqlen_q, heads)
+    assert indices.shape == (seqlen_q, 1, top_k)
+    assert not torch.any(indices[-1] < 0)
     assert torch.isfinite(out).all()
-    print("flashmla_sparse_fwd: reference matched", flush=True)
+    print("flashmla_sparse_fwd_pro_h128: reference matched", flush=True)
     report = {
         "device": torch.cuda.get_device_name(),
         "flashmla": version,
+        "flashmla_base_revision": _FLASHMLA_BASE_REVISION,
+        "flashmla_dual_lse_patch_revision": _FLASHMLA_DUAL_LSE_PATCH_REVISION,
+        "flashmla_pro_h128_patch_revision": _FLASHMLA_PRO_H128_PATCH_REVISION,
+        "heads": heads,
+        "head_dim": dim,
+        "indexer_topk": indexer_topk,
+        "window_topk": window_topk,
+        "total_topk": top_k,
+        "compressed_lse_shape": list(compressed_lse.shape),
         "lse_shape": list(lse.shape),
         "max_logits_shape": list(max_logits.shape),
         "out_shape": list(out.shape),
-        "topk_length_max": int(topk_length.max().item()),
-        "topk_length_min": int(topk_length.min().item()),
+        "indexer_length_max": int(indexer_length.max().item()),
+        "indexer_length_min": int(indexer_length.min().item()),
     }
     print(json.dumps(report, sort_keys=True), flush=True)
 

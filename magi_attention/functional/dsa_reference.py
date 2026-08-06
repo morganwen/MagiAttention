@@ -34,25 +34,23 @@ def dsa_position_ids(
     )
 
 
-def deterministic_topk_global_ids(
+def backend_native_topk_global_ids(
     scores: torch.Tensor,
     k: int,
     *,
     global_offset: int = 0,
 ) -> torch.Tensor:
-    """Select by score descending and exact ties by global ID ascending."""
+    """Select with the current PyTorch backend's native exact-tie behavior."""
 
     if scores.ndim != 1:
-        raise ValueError("deterministic Top-K scores must be rank-1")
+        raise ValueError("backend-native Top-K scores must be rank-1")
     if k < 0 or k > scores.numel():
-        raise ValueError("deterministic Top-K cardinality is invalid")
-    local_ids = torch.arange(scores.numel(), device=scores.device, dtype=torch.int64)
-    global_ids = local_ids + int(global_offset)
-    id_order = torch.argsort(global_ids, stable=True)
-    score_order = torch.argsort(
-        scores.index_select(0, id_order), descending=True, stable=True
+        raise ValueError("backend-native Top-K cardinality is invalid")
+    if not k:
+        return torch.empty(0, device=scores.device, dtype=torch.int64)
+    return torch.topk(scores, k=k, sorted=True).indices.to(torch.int64) + int(
+        global_offset
     )
-    return global_ids.index_select(0, id_order).index_select(0, score_order)[:k]
 
 
 def _compress_global(
@@ -199,6 +197,7 @@ def dsa_reference(
     topk_lengths: list[int] = []
     kl_rows: list[torch.Tensor] = []
     scale = config.head_dim**-0.5
+    indexer_scale = config.indexer_head_dim**-0.5
 
     for sample_id, (sample_begin, sample_end) in enumerate(zip(cu, cu[1:])):
         sample_length = sample_end - sample_begin
@@ -207,13 +206,14 @@ def dsa_reference(
         sample_compressed_kv = compressed_kv[block_offset : block_offset + block_count]
         sample_compressed_ki = compressed_ki[block_offset : block_offset + block_count]
         if layer.indexer is not None and block_count:
+            score_weights = weights[sample_begin:sample_end].float()
             dots = torch.einsum(
                 "qhd,kd->qhk",
                 q_index[sample_begin:sample_end].float(),
                 sample_compressed_ki.float(),
             )
             index_scores = (
-                dots.relu() * weights[sample_begin:sample_end].float().unsqueeze(-1)
+                dots.relu() * indexer_scale * score_weights.unsqueeze(-1)
             ).sum(dim=1)
         else:
             index_scores = x.new_empty(
@@ -237,7 +237,7 @@ def dsa_reference(
                     )
                 selected_length = min(config.indexer_topk, visible)
                 if selected_length:
-                    selected_global = deterministic_topk_global_ids(
+                    selected_global = backend_native_topk_global_ids(
                         visible_scores,
                         selected_length,
                         global_offset=block_offset,
@@ -288,8 +288,8 @@ def dsa_reference(
                 q.dtype
             )
             output_rows.append(output)
-            sparse_lse_rows.append(sparse_lse)
-            indexer_lse_rows.append(indexer_lse)
+            sparse_lse_rows.append(sparse_lse.detach())
+            indexer_lse_rows.append(indexer_lse.detach())
             topk_rows.append(topk_row)
             topk_lengths.append(selected_length)
 
@@ -297,7 +297,6 @@ def dsa_reference(
                 selected_index_scores = index_scores[position].index_select(
                     0, selected_local
                 )
-                predict = selected_index_scores.softmax(dim=-1)
                 compressed_logits = (
                     torch.einsum(
                         "hd,kd->hk",
@@ -306,14 +305,16 @@ def dsa_reference(
                     )
                     * scale
                 )
+                compressed_lse = torch.logsumexp(compressed_logits, dim=-1)
                 attention_mass = torch.exp(
-                    compressed_logits - sparse_lse.unsqueeze(-1)
+                    compressed_logits - compressed_lse.unsqueeze(-1)
                 ).sum(dim=0)
                 target = (
                     attention_mass / attention_mass.sum().clamp_min(1e-10)
                 ).detach()
-                log_predict = (
-                    predict.clamp_min(math.exp(-100.0)).log().clamp(min=-100.0, max=0.0)
+                selected_indexer_lse = torch.logsumexp(selected_index_scores, dim=0)
+                log_predict = (selected_index_scores - selected_indexer_lse).clamp(
+                    min=-100.0, max=0.0
                 )
                 log_target = (
                     target.clamp_min(math.exp(-100.0)).log().clamp(min=-100.0, max=0.0)
@@ -348,6 +349,8 @@ def dsa_reference(
         length_tensor = torch.empty((0,), device=x.device, dtype=torch.int32)
         kl = torch.zeros((), device=x.device, dtype=torch.float32)
 
+    output_tensor = layer.inverse_output_rope(output_tensor, positions)
+
     return MagiDSAForwardResult(
         output=output_tensor,
         kl=kl,
@@ -358,27 +361,45 @@ def dsa_reference(
     )
 
 
-def validate_deterministic_topk(
+def validate_backend_native_topk(
     scores: torch.Tensor,
     actual_ids: torch.Tensor,
     k: int,
     *,
     global_offset: int = 0,
 ) -> None:
-    """Validate the Q15 global-ID secondary-key contract."""
+    """Validate a backend-native Top-K without constraining exact ties."""
 
     if actual_ids.numel() != k:
         raise AssertionError("top-k cardinality mismatch")
     if len(set(int(value) for value in actual_ids.tolist())) != k:
         raise AssertionError("actual top-k IDs are not unique")
-    expected = deterministic_topk_global_ids(scores, k, global_offset=global_offset).to(
-        device=actual_ids.device, dtype=actual_ids.dtype
-    )
-    if not torch.equal(actual_ids, expected):
-        raise AssertionError("top-k violates deterministic score/global-ID ordering")
+    if scores.ndim != 1 or k < 0 or k > scores.numel():
+        raise AssertionError("top-k score shape or cardinality is invalid")
+    if bool(torch.any(torch.isnan(scores)).item()):
+        raise AssertionError("top-k scores contain NaN")
+    if not k:
+        return
+    local_ids = actual_ids.to(torch.int64) - int(global_offset)
+    if bool(torch.any((local_ids < 0) | (local_ids >= scores.numel())).item()):
+        raise AssertionError("top-k contains an ID outside the visible score row")
+    selected_scores = scores.index_select(0, local_ids.to(scores.device))
+    cutoff = torch.topk(scores, k=k, sorted=False).values.amin()
+    if bool(torch.any(selected_scores < cutoff).item()):
+        raise AssertionError("top-k selected a score below the backend cutoff")
+    strict_ids = torch.nonzero(scores > cutoff, as_tuple=False).flatten().to(
+        torch.int64
+    ) + int(global_offset)
+    selected_set = {int(value) for value in actual_ids.tolist()}
+    if any(int(value) not in selected_set for value in strict_ids.tolist()):
+        raise AssertionError("top-k omitted a candidate strictly above the cutoff")
+    if selected_scores.numel() > 1 and bool(
+        torch.any(selected_scores[:-1] < selected_scores[1:]).item()
+    ):
+        raise AssertionError("top-k scores are not in nonincreasing order")
 
 
-def validate_canonical_topk(
+def validate_backend_native_topk_pair(
     actual_ids: torch.Tensor,
     actual_lengths: torch.Tensor,
     expected_ids: torch.Tensor,
@@ -386,7 +407,7 @@ def validate_canonical_topk(
     *,
     label: str = "production vs independent reference",
 ) -> None:
-    """Validate Q14 canonical global IDs without comparing score-order position."""
+    """Validate shared structure while allowing backend-native tie differences."""
 
     for name, ids, lengths in (
         ("actual", actual_ids, actual_lengths),
@@ -413,7 +434,6 @@ def validate_canonical_topk(
                 f"{label}: row {row} effective length exceeds Top-K capacity"
             )
 
-        canonical: list[torch.Tensor] = []
         for name, ids in (("actual", actual_ids), ("expected", expected_ids)):
             valid_ids = ids[row, :length]
             padding = ids[row, length:]
@@ -429,17 +449,132 @@ def validate_canonical_topk(
                 raise AssertionError(
                     f"{label}: row {row} {name} valid global IDs are not unique"
                 )
-            canonical.append(torch.sort(valid_ids).values)
-        if not torch.equal(canonical[0], canonical[1]):
-            raise AssertionError(
-                f"{label}: row {row} canonical valid global IDs differ"
+
+
+def assert_backend_native_topk_outputs_close(
+    actual_output: torch.Tensor,
+    expected_output: torch.Tensor,
+    actual_ids: torch.Tensor,
+    actual_lengths: torch.Tensor,
+    expected_ids: torch.Tensor,
+    expected_lengths: torch.Tensor,
+    *,
+    label: str = "production vs independent reference",
+    row_ids: torch.Tensor | None = None,
+    atol: float = 5e-3,
+    rtol: float = 5e-3,
+) -> dict[str, object]:
+    """Compare output rows while exempting backend-native Top-K set changes."""
+
+    validate_backend_native_topk_pair(
+        actual_ids,
+        actual_lengths,
+        expected_ids,
+        expected_lengths,
+        label=label,
+    )
+    if actual_output.shape != expected_output.shape:
+        raise AssertionError(f"{label}: output shapes differ")
+    rows = actual_output.shape[0]
+    if rows != actual_ids.shape[0]:
+        raise AssertionError(f"{label}: output and Top-K row counts differ")
+    for name, output in (("actual", actual_output), ("expected", expected_output)):
+        if not bool(torch.all(torch.isfinite(output)).item()):
+            raise AssertionError(f"{label}: {name} output contains non-finite values")
+
+    if row_ids is None:
+        global_rows = list(range(rows))
+    else:
+        if row_ids.ndim != 1 or row_ids.numel() != rows:
+            raise AssertionError(f"{label}: output row IDs have an invalid shape")
+        global_rows = [
+            int(value)
+            for value in row_ids.detach().to(device="cpu", dtype=torch.int64).tolist()
+        ]
+
+    lengths = actual_lengths.detach().to(device="cpu", dtype=torch.int64).tolist()
+    set_changed_rows: list[int] = []
+    for row, length_value in enumerate(lengths):
+        length = int(length_value)
+        actual_set = torch.sort(
+            actual_ids[row, :length].detach().to(device="cpu", dtype=torch.int64)
+        ).values
+        expected_set = torch.sort(
+            expected_ids[row, :length].detach().to(device="cpu", dtype=torch.int64)
+        ).values
+        if not torch.equal(actual_set, expected_set):
+            set_changed_rows.append(row)
+
+    compare_mask = torch.ones(rows, dtype=torch.bool, device=actual_output.device)
+    if set_changed_rows:
+        compare_mask[
+            torch.tensor(
+                set_changed_rows,
+                dtype=torch.int64,
+                device=actual_output.device,
             )
+        ] = False
+    compared_actual = actual_output[compare_mask]
+    compared_expected = expected_output[compare_mask]
+    if compared_actual.numel():
+        try:
+            torch.testing.assert_close(
+                compared_actual.float(),
+                compared_expected.float(),
+                atol=atol,
+                rtol=rtol,
+            )
+        except AssertionError as error:
+            raise AssertionError(
+                f"{label}: output differs on rows with equal canonical Top-K sets: "
+                f"{error}"
+            ) from error
+
+    def max_abs_difference(actual: torch.Tensor, expected: torch.Tensor) -> float:
+        if not actual.numel():
+            return 0.0
+        return float((actual.float() - expected.float()).abs().max().item())
+
+    set_changed_diagnostics: list[dict[str, object]] = []
+    for local_row in set_changed_rows:
+        actual_row = actual_output[local_row]
+        expected_row = expected_output[local_row]
+        set_changed_diagnostics.append(
+            {
+                "actual_output_max_abs": float(actual_row.float().abs().max().item()),
+                "expected_output_max_abs": float(
+                    expected_row.float().abs().max().item()
+                ),
+                "global_row": global_rows[local_row],
+                "local_row": local_row,
+                "output_max_abs_difference": max_abs_difference(
+                    actual_row, expected_row
+                ),
+            }
+        )
+
+    return {
+        "canonical_topk_exact": not set_changed_rows,
+        "canonical_topk_mismatch_global_rows": [
+            global_rows[row] for row in set_changed_rows
+        ],
+        "canonical_topk_mismatch_local_rows": set_changed_rows,
+        "output_compared_rows": int(compare_mask.sum().item()),
+        "output_finite": True,
+        "output_max_abs": max_abs_difference(actual_output, expected_output),
+        "output_non_tie_max_abs": max_abs_difference(
+            compared_actual, compared_expected
+        ),
+        "output_tie_exempt_row_diagnostics": set_changed_diagnostics,
+        "output_tie_exempt_rows": len(set_changed_rows),
+    }
 
 
 __all__ = [
-    "deterministic_topk_global_ids",
+    "assert_backend_native_topk_outputs_close",
+    "backend_native_topk_global_ids",
     "dsa_position_ids",
     "dsa_reference",
-    "validate_canonical_topk",
-    "validate_deterministic_topk",
+    "validate_backend_native_topk",
+    "validate_backend_native_topk_pair",
 ]

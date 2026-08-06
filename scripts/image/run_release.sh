@@ -16,7 +16,7 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: $0 --revision COMMIT --profile-artifact DIR --cp1-artifact DIR --cp2-artifact DIR [--image TAG]" >&2
+    echo "Usage: $0 --revision COMMIT [--image TAG] [--profile-artifact DIR --cp1-artifact DIR --cp2-artifact DIR]" >&2
 }
 
 revision=""
@@ -57,9 +57,19 @@ if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]; then
     usage
     exit 2
 fi
-if [[ -z "$profile_artifact" || -z "$cp1_artifact" || -z "$cp2_artifact" ]]; then
+provided_artifacts=0
+for artifact in "$profile_artifact" "$cp1_artifact" "$cp2_artifact"; do
+    if [[ -n "$artifact" ]]; then
+        provided_artifacts=$((provided_artifacts + 1))
+    fi
+done
+if ((provided_artifacts != 0 && provided_artifacts != 3)); then
     usage
     exit 2
+fi
+generate_artifacts=0
+if ((provided_artifacts == 0)); then
+    generate_artifacts=1
 fi
 if [[ -z "$image" ]]; then
     image="magi-dsa-v4:release-${revision:0:12}"
@@ -92,10 +102,68 @@ release_failed() {
 }
 trap release_failed EXIT
 
+resolve_artifact_dir() {
+    local log_path="$1"
+    awk -F= '$1 == "artifact_dir" {print substr($0, length($1) + 2); exit}' \
+        "$log_path"
+}
+
+require_artifact_image_id() {
+    local artifact_kind="$1"
+    local artifact_path="$2"
+    local expected_image_id="$3"
+    python3 - "$artifact_kind" "$artifact_path" "$expected_image_id" <<'PY'
+import json
+import pathlib
+import sys
+
+kind = sys.argv[1]
+artifact = pathlib.Path(sys.argv[2]).resolve()
+expected = sys.argv[3]
+if not artifact.is_dir():
+    raise SystemExit(f"missing {kind} artifact directory: {artifact}")
+if kind == "cp1":
+    actual = json.loads((artifact / "SUMMARY.json").read_text(encoding="utf-8"))[
+        "image_id"
+    ]
+elif kind in {"cp2", "cp8"}:
+    first_field = (artifact / "IMAGE.txt").read_text(encoding="utf-8").split(maxsplit=1)[
+        0
+    ]
+    actual = json.loads(first_field)
+elif kind == "profile":
+    image_records = json.loads(
+        (artifact / "IMAGE.json").read_text(encoding="utf-8")
+    )
+    if not isinstance(image_records, list) or len(image_records) != 1:
+        raise SystemExit("profile IMAGE.json does not contain one image record")
+    actual = image_records[0]["Id"]
+else:
+    raise SystemExit(f"unsupported artifact kind: {kind}")
+if actual != expected:
+    raise SystemExit(
+        f"{kind} artifact image ID differs: expected {expected}, found {actual}"
+    )
+print(f"{kind}_image_id={actual}")
+PY
+}
+
 {
     echo "bash scripts/image/build.sh --revision $revision --tag $image"
+    echo "MAGI_DSA_IMAGE=$image bash scripts/test/prewarm_cute.sh"
+    if ((generate_artifacts == 1)); then
+        echo "bash scripts/test/run_cp1.sh --image $image"
+        echo "bash scripts/test/run_multigpu.sh --world-size 2 --case csa-natural-backward --image $image --installed-wheel"
+    else
+        echo "reuse_cp1_artifact=$cp1_artifact"
+        echo "reuse_cp2_artifact=$cp2_artifact"
+        echo "reuse_profile_artifact=$profile_artifact"
+    fi
     echo "bash scripts/test/run_multigpu.sh --world-size 8 --case cp8-natural-backward --image $image --installed-wheel"
-    echo "python3 scripts/image/finalize_release.py --artifact-dir $artifact_dir --revision $revision --image $image --correctness-artifact <generated> --profile-artifact $profile_artifact --cp1-artifact $cp1_artifact --cp2-artifact $cp2_artifact"
+    if ((generate_artifacts == 1)); then
+        echo "bash scripts/profile/run_5step.sh --world-size 8 --cp-size 8 --case dsv4-pro-128k --plans balanced --steps 5 --step-mode pro-pair --layout-policy structural-balanced --skip-smoke --image $image"
+    fi
+    echo "python3 scripts/image/finalize_release.py --artifact-dir $artifact_dir --revision $revision --image $image --correctness-artifact <generated> --profile-artifact <resolved> --cp1-artifact <resolved> --cp2-artifact <resolved>"
 } >"$artifact_dir/COMMAND.txt"
 
 echo "release stage=image-build revision=$revision image=$image"
@@ -103,6 +171,42 @@ bash "$repo_root/scripts/image/build.sh" \
     --revision "$revision" \
     --tag "$image" \
     2>&1 | tee "$artifact_dir/BUILD.log"
+
+release_image_id="$(docker image inspect "$image" --format '{{.Id}}')"
+if [[ ! "$release_image_id" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    echo "release image has an invalid ID: $release_image_id" >&2
+    exit 1
+fi
+printf '%s\n' "$release_image_id" >"$artifact_dir/IMAGE_ID.txt"
+
+echo "release stage=cute-aot image=$image image_id=$release_image_id"
+MAGI_DSA_IMAGE="$image" bash "$repo_root/scripts/test/prewarm_cute.sh" \
+    2>&1 | tee "$artifact_dir/CUTE_AOT.log"
+
+if ((generate_artifacts == 1)); then
+    echo "release stage=cp1 image=$image image_id=$release_image_id"
+    bash "$repo_root/scripts/test/run_cp1.sh" \
+        --image "$image" \
+        2>&1 | tee "$artifact_dir/CP1.log"
+    cp1_artifact="$(resolve_artifact_dir "$artifact_dir/CP1.log")"
+    if [[ -z "$cp1_artifact" || ! -d "$cp1_artifact" ]]; then
+        echo "could not resolve CP1 artifact from CP1.log" >&2
+        exit 1
+    fi
+
+    echo "release stage=installed-wheel-cp2 image=$image image_id=$release_image_id"
+    bash "$repo_root/scripts/test/run_multigpu.sh" \
+        --world-size 2 \
+        --case csa-natural-backward \
+        --image "$image" \
+        --installed-wheel \
+        2>&1 | tee "$artifact_dir/CP2.log"
+    cp2_artifact="$(resolve_artifact_dir "$artifact_dir/CP2.log")"
+    if [[ -z "$cp2_artifact" || ! -d "$cp2_artifact" ]]; then
+        echo "could not resolve installed-wheel CP2 artifact from CP2.log" >&2
+        exit 1
+    fi
+fi
 
 echo "release stage=installed-wheel-cp8 image=$image"
 bash "$repo_root/scripts/test/run_multigpu.sh" \
@@ -112,14 +216,52 @@ bash "$repo_root/scripts/test/run_multigpu.sh" \
     --installed-wheel \
     2>&1 | tee "$artifact_dir/CP8.log"
 
-correctness_artifact="$(
-    awk -F= '$1 == "artifact_dir" {print substr($0, length($1) + 2); exit}' \
-        "$artifact_dir/CP8.log"
-)"
+correctness_artifact="$(resolve_artifact_dir "$artifact_dir/CP8.log")"
 if [[ -z "$correctness_artifact" || ! -d "$correctness_artifact" ]]; then
     echo "could not resolve installed-wheel CP8 artifact from CP8.log" >&2
     exit 1
 fi
+
+if ((generate_artifacts == 1)); then
+    echo "release stage=pro-pair-profile image=$image image_id=$release_image_id"
+    bash "$repo_root/scripts/profile/run_5step.sh" \
+        --world-size 8 \
+        --cp-size 8 \
+        --case dsv4-pro-128k \
+        --plans balanced \
+        --steps 5 \
+        --step-mode pro-pair \
+        --layout-policy structural-balanced \
+        --skip-smoke \
+        --image "$image" \
+        2>&1 | tee "$artifact_dir/PROFILE.log"
+    profile_artifact="$(resolve_artifact_dir "$artifact_dir/PROFILE.log")"
+    if [[ -z "$profile_artifact" || ! -d "$profile_artifact" ]]; then
+        echo "could not resolve Pro-pair profile artifact from PROFILE.log" >&2
+        exit 1
+    fi
+fi
+
+current_image_id="$(docker image inspect "$image" --format '{{.Id}}')"
+if [[ "$current_image_id" != "$release_image_id" ]]; then
+    echo "release image tag changed during validation: $release_image_id -> $current_image_id" >&2
+    exit 1
+fi
+require_artifact_image_id cp1 "$cp1_artifact" "$release_image_id" \
+    | tee "$artifact_dir/CP1_IMAGE_ID.txt"
+require_artifact_image_id cp2 "$cp2_artifact" "$release_image_id" \
+    | tee "$artifact_dir/CP2_IMAGE_ID.txt"
+require_artifact_image_id cp8 "$correctness_artifact" "$release_image_id" \
+    | tee "$artifact_dir/CP8_IMAGE_ID.txt"
+require_artifact_image_id profile "$profile_artifact" "$release_image_id" \
+    | tee "$artifact_dir/PROFILE_IMAGE_ID.txt"
+{
+    echo "resolved_cp1_artifact=$cp1_artifact"
+    echo "resolved_cp2_artifact=$cp2_artifact"
+    echo "resolved_cp8_artifact=$correctness_artifact"
+    echo "resolved_profile_artifact=$profile_artifact"
+    echo "release_image_id=$release_image_id"
+} >>"$artifact_dir/COMMAND.txt"
 
 echo "release stage=finalize correctness_artifact=$correctness_artifact"
 python3 "$repo_root/scripts/image/finalize_release.py" \
@@ -129,8 +271,7 @@ python3 "$repo_root/scripts/image/finalize_release.py" \
     --correctness-artifact "$correctness_artifact" \
     --profile-artifact "$profile_artifact" \
     --cp1-artifact "$cp1_artifact" \
-    --cp2-artifact "$cp2_artifact" \
-    | tee "$artifact_dir/FINALIZE.stdout"
+    --cp2-artifact "$cp2_artifact"
 
 trap - EXIT
 echo "release complete: $artifact_dir"

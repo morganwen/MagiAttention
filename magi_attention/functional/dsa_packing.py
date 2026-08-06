@@ -19,6 +19,7 @@ from dataclasses import dataclass
 import torch
 
 from magi_attention.dsa_config import MagiDSAConfig
+from magi_attention.dsa_nvtx import dsa_nvtx_range
 from magi_attention.meta.collection.dsa_meta import (
     DsaExecutionPlan,
     DsaRankPlan,
@@ -56,6 +57,7 @@ class DsaDeviceCopyMap:
     """CUDA-resident destination-row to source-row map."""
 
     source_rows: torch.Tensor
+    is_identity: bool = False
 
 
 @dataclass(frozen=True)
@@ -64,6 +66,7 @@ class DsaDeviceReduceMap:
 
     row_offsets: torch.Tensor
     source_rows: torch.Tensor
+    is_identity: bool = False
 
 
 @dataclass(frozen=True)
@@ -118,7 +121,7 @@ class DsaDeviceAttentionMap:
 
 @dataclass(frozen=True)
 class DsaDeviceIndexerMap:
-    """Grouped Indexer metadata and duplicate-prefix packing maps."""
+    """Grouped Indexer metadata and its forward-only duplicate-prefix map."""
 
     q_cu_seqlens: torch.Tensor
     k_cu_seqlens: torch.Tensor
@@ -126,10 +129,10 @@ class DsaDeviceIndexerMap:
     q_sample_block_offsets: torch.Tensor
     seq_lens: torch.Tensor
     k_pack: DsaDeviceCopyMap
-    k_unpack: DsaDeviceReduceMap
     ki_global_to_consumer: torch.Tensor
     max_seqlen_q: int
-    max_seqlen_k: int
+    logical_max_seqlen_k: int
+    backend_max_seqlen_k: int
 
 
 @dataclass(frozen=True)
@@ -137,17 +140,18 @@ class DsaDeviceRankPlan:
     """All immutable CUDA metadata materialized during cold prepare."""
 
     rank: int
+    source_token_count: int
     local_token_count: int
     local_q_sample_ids: torch.Tensor
     local_q_positions: torch.Tensor
     compression: DsaDeviceCompressionMap | None
     attention: DsaDeviceAttentionMap
     indexer: DsaDeviceIndexerMap | None
+    token_layout_route: DsaDeviceRoutePlan | None
     window_route: DsaDeviceRoutePlan
     overlap_x_route: DsaDeviceRoutePlan | None
     compressed_kv_route: DsaDeviceRoutePlan | None
     compressed_ki_route: DsaDeviceRoutePlan | None
-    indexer_qw_route: DsaDeviceRoutePlan | None
 
 
 def make_dsa_copy_map(
@@ -285,8 +289,16 @@ def _to_int32(
     return torch.tensor(values, dtype=torch.int32, device=device)
 
 
-def _device_copy_map(mapping: DsaHostCopyMap, device: torch.device) -> DsaDeviceCopyMap:
-    return DsaDeviceCopyMap(_to_int32(mapping.source_rows, device))
+def _device_copy_map(
+    mapping: DsaHostCopyMap,
+    source_row_count: int,
+    device: torch.device,
+) -> DsaDeviceCopyMap:
+    return DsaDeviceCopyMap(
+        _to_int32(mapping.source_rows, device),
+        len(mapping.source_rows) == source_row_count
+        and mapping.source_rows == tuple(range(source_row_count)),
+    )
 
 
 def _device_reduce_map(
@@ -295,6 +307,10 @@ def _device_reduce_map(
     return DsaDeviceReduceMap(
         row_offsets=_to_int32(mapping.row_offsets, device),
         source_rows=_to_int32(mapping.source_rows, device),
+        is_identity=(
+            mapping.row_offsets == tuple(range(len(mapping.row_offsets)))
+            and mapping.source_rows == tuple(range(len(mapping.source_rows)))
+        ),
     )
 
 
@@ -314,7 +330,9 @@ def make_dsa_device_route_plan(
         )
     ):
         owner_restore = _device_copy_map(
-            DsaHostCopyMap(maps.owner_reduce.source_rows), device
+            DsaHostCopyMap(maps.owner_reduce.source_rows),
+            len(route.send_source_rows),
+            device,
         )
     return DsaDeviceRoutePlan(
         name=name,
@@ -322,9 +340,13 @@ def make_dsa_device_route_plan(
         producer_row_count=route.producer_row_count,
         send_counts=route.send_counts,
         recv_counts=route.recv_counts,
-        send_pack=_device_copy_map(maps.send_pack, device),
-        consumer_pack=_device_copy_map(maps.consumer_pack, device),
-        received_pack=_device_copy_map(maps.received_pack, device),
+        send_pack=_device_copy_map(maps.send_pack, route.producer_row_count, device),
+        consumer_pack=_device_copy_map(
+            maps.consumer_pack, len(route.received_global_rows), device
+        ),
+        received_pack=_device_copy_map(
+            maps.received_pack, len(route.consumer_global_rows), device
+        ),
         owner_reduce=_device_reduce_map(maps.owner_reduce, device),
         owner_restore=owner_restore,
         consumer_global_rows=_to_int32(route.consumer_global_rows, device),
@@ -339,7 +361,7 @@ def _make_compression_map(
     if not config.ratio:
         return None
     support = config.compressor_support
-    expected = len(rank_plan.owned_blocks) * support
+    expected = len(rank_plan.produced_blocks) * support
     if len(rank_plan.compression_source_from_overlap) != expected:
         raise ValueError("compression support map has an invalid row count")
     source_rows = [max(row, 0) for row in rank_plan.compression_source_from_overlap]
@@ -353,11 +375,11 @@ def _make_compression_map(
     source_unpack = make_dsa_reduce_map(tuple(source_rows), overlap_row_count)
     validate_dsa_reduce_map(source_unpack, len(source_rows), overlap_row_count)
     return DsaDeviceCompressionMap(
-        source_pack=_device_copy_map(source_pack, device),
+        source_pack=_device_copy_map(source_pack, overlap_row_count, device),
         source_unpack=_device_reduce_map(source_unpack, device),
         valid_rows=torch.tensor(valid_rows, dtype=torch.bool, device=device),
         block_positions=_to_int32(
-            [block.position for block in rank_plan.owned_blocks], device
+            [block.position for block in rank_plan.produced_blocks], device
         ),
     )
 
@@ -451,7 +473,7 @@ def _make_indexer_map(
     rank_plan: DsaRankPlan,
     device: torch.device,
 ) -> DsaDeviceIndexerMap | None:
-    if rank_plan.indexer_qw_route is None or rank_plan.compressed_ki_route is None:
+    if rank_plan.compressed_ki_route is None:
         return None
     compressed_position = {
         global_row: position
@@ -460,7 +482,7 @@ def _make_indexer_map(
         )
     }
     k_pack_rows: list[int] = []
-    for fragment in rank_plan.worker_fragments:
+    for fragment in rank_plan.query_fragments:
         block_begin = rank_plan.sample_block_offsets[fragment.sample_id]
         k_pack_rows.extend(
             compressed_position[block_begin + block_offset]
@@ -469,8 +491,6 @@ def _make_indexer_map(
     if len(k_pack_rows) != rank_plan.packed_indexer_k_count:
         raise ValueError("Indexer K pack rows do not match grouped cu_seqlens")
     k_pack = make_dsa_copy_map(tuple(k_pack_rows), len(compressed_position))
-    k_unpack = make_dsa_reduce_map(tuple(k_pack_rows), len(compressed_position))
-    validate_dsa_reduce_map(k_unpack, len(k_pack_rows), len(compressed_position))
     total_compressed_blocks = sum(rank_plan.sample_block_counts)
     global_to_consumer = [-1] * total_compressed_blocks
     for global_block, consumer_row in compressed_position.items():
@@ -483,11 +503,11 @@ def _make_indexer_map(
             rank_plan.indexer_q_sample_block_offsets, device
         ),
         seq_lens=_to_int32(rank_plan.indexer_seq_lens, device),
-        k_pack=_device_copy_map(k_pack, device),
-        k_unpack=_device_reduce_map(k_unpack, device),
+        k_pack=_device_copy_map(k_pack, len(compressed_position), device),
         ki_global_to_consumer=_to_int32(global_to_consumer, device),
         max_seqlen_q=rank_plan.indexer_max_seqlen_q,
-        max_seqlen_k=rank_plan.indexer_max_seqlen_k,
+        logical_max_seqlen_k=rank_plan.indexer_logical_max_seqlen_k,
+        backend_max_seqlen_k=rank_plan.indexer_backend_max_seqlen_k,
     )
 
 
@@ -515,17 +535,18 @@ def make_dsa_device_rank_plan(
     window = make_dsa_device_route_plan("WINDOW_KV", rank_plan.window_route, device)
     return DsaDeviceRankPlan(
         rank=rank,
+        source_token_count=rank_plan.source_token_count,
         local_token_count=rank_plan.local_token_count,
         local_q_sample_ids=_to_int32(rank_plan.local_q_sample_ids, device),
         local_q_positions=_to_int32(rank_plan.local_q_positions, device),
         compression=_make_compression_map(config, rank_plan, device),
         attention=_make_attention_map(plan, rank_plan, config, device),
         indexer=_make_indexer_map(rank_plan, device),
+        token_layout_route=route("TOKEN_LAYOUT", rank_plan.token_layout_route),
         window_route=window,
         overlap_x_route=route("OVERLAP_X", rank_plan.overlap_x_route),
         compressed_kv_route=route("COMPRESSED_KV", rank_plan.compressed_kv_route),
         compressed_ki_route=route("COMPRESSED_KI", rank_plan.compressed_ki_route),
-        indexer_qw_route=route("INDEXER_QW", rank_plan.indexer_qw_route),
     )
 
 
@@ -534,9 +555,13 @@ def copy_dsa_device_map(
 ) -> torch.Tensor:
     """Run the CuTe row gather using device-resident metadata."""
 
+    if mapping.is_identity:
+        return source
+
     from magi_attention.kernel.cutedsl.dsa_pack import copy_dsa_rows
 
-    return copy_dsa_rows(source, mapping.source_rows)
+    with dsa_nvtx_range("packing::cute_row_copy", enabled=source.is_cuda):
+        return copy_dsa_rows(source, mapping.source_rows)
 
 
 def reduce_dsa_device_map(
@@ -544,9 +569,13 @@ def reduce_dsa_device_map(
 ) -> torch.Tensor:
     """Run the CuTe FP32-accumulating CSR reduction."""
 
+    if mapping.is_identity:
+        return source
+
     from magi_attention.kernel.cutedsl.dsa_pack import reduce_dsa_rows
 
-    return reduce_dsa_rows(source, mapping.row_offsets, mapping.source_rows)
+    with dsa_nvtx_range("packing::cute_csr_reduce", enabled=source.is_cuda):
+        return reduce_dsa_rows(source, mapping.row_offsets, mapping.source_rows)
 
 
 __all__ = [

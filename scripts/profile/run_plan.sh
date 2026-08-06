@@ -16,7 +16,7 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: $0 --plan {sequential|balanced} --artifact-dir DIR --world-size 8 --steps 5 --tokens 131072 --warmup N" >&2
+    echo "Usage: $0 --plan {sequential|balanced} --artifact-dir DIR --world-size 8 --steps 5 --tokens 131072 --warmup N [--step-mode {forward|forward-backward|attention-suite|pro-pair}] [--layout-policy {legacy|shared-greedy|structural-balanced}] [--local-improvement-passes {0|1|4|8}] [--profiler-attach-warmup-steps N]" >&2
 }
 
 plan=""
@@ -25,6 +25,10 @@ world_size=""
 steps=""
 tokens=""
 warmup=""
+step_mode="forward"
+layout_policy="legacy"
+local_improvement_passes="4"
+profiler_attach_warmup_steps="0"
 while (($# > 0)); do
     case "$1" in
         --plan)
@@ -51,6 +55,22 @@ while (($# > 0)); do
             warmup="${2:-}"
             shift 2
             ;;
+        --step-mode)
+            step_mode="${2:-}"
+            shift 2
+            ;;
+        --layout-policy)
+            layout_policy="${2:-}"
+            shift 2
+            ;;
+        --local-improvement-passes)
+            local_improvement_passes="${2:-}"
+            shift 2
+            ;;
+        --profiler-attach-warmup-steps)
+            profiler_attach_warmup_steps="${2:-}"
+            shift 2
+            ;;
         *)
             usage
             exit 2
@@ -70,6 +90,50 @@ if [[ ! "$warmup" =~ ^[1-9][0-9]*$ || -z "$artifact_dir" ]]; then
     usage
     exit 2
 fi
+if [[ "$step_mode" != "forward" && "$step_mode" != "forward-backward" && "$step_mode" != "attention-suite" && "$step_mode" != "pro-pair" ]]; then
+    usage
+    exit 2
+fi
+if [[ "$layout_policy" != "legacy" && "$layout_policy" != "shared-greedy" && "$layout_policy" != "structural-balanced" ]]; then
+    usage
+    exit 2
+fi
+if [[ ! "$local_improvement_passes" =~ ^(0|1|4|8)$ ]]; then
+    usage
+    exit 2
+fi
+if [[ ! "$profiler_attach_warmup_steps" =~ ^[0-8]$ ]]; then
+    usage
+    exit 2
+fi
+if [[ "$step_mode" != "pro-pair" && "$layout_policy" != "shared-greedy" && \
+      ( "$local_improvement_passes" != "4" || \
+        "$profiler_attach_warmup_steps" != "0" ) ]]; then
+    echo "dispatch-ablation controls require shared-greedy" >&2
+    exit 2
+fi
+if [[ "$step_mode" == "pro-pair" && "$layout_policy" != "structural-balanced" ]]; then
+    echo "the Pro pair requires structural-balanced layout" >&2
+    exit 2
+fi
+if [[ "$step_mode" == "pro-pair" && \
+      ( "$local_improvement_passes" != "4" || \
+        "$profiler_attach_warmup_steps" != "0" ) ]]; then
+    echo "the formal Pro pair does not enable dispatch ablation" >&2
+    exit 2
+fi
+if [[ "$step_mode" != "pro-pair" && "$layout_policy" == "structural-balanced" ]]; then
+    echo "structural-balanced layout profiling is only defined for pro-pair" >&2
+    exit 2
+fi
+if [[ "$layout_policy" == "shared-greedy" && "$step_mode" != "attention-suite" ]]; then
+    echo "shared-greedy layout profiling is only defined for attention-suite" >&2
+    exit 2
+fi
+if [[ "$step_mode" != "forward" && "$plan" != "balanced" ]]; then
+    echo "the backward profile modes capture only the balanced plan" >&2
+    exit 2
+fi
 if [[ ! -d "$artifact_dir" ]]; then
     echo "profile artifact directory does not exist: $artifact_dir" >&2
     exit 1
@@ -77,7 +141,15 @@ fi
 
 control_dir="$artifact_dir/control"
 mkdir -p "$control_dir"
-report_base="$artifact_dir/${plan}_5steps"
+report_suffix=""
+if [[ "$step_mode" == "forward-backward" ]]; then
+    report_suffix="_forward_backward"
+elif [[ "$step_mode" == "attention-suite" ]]; then
+    report_suffix="_attention_suite"
+elif [[ "$step_mode" == "pro-pair" ]]; then
+    report_suffix="_pro_pair"
+fi
+report_base="$artifact_dir/${plan}_5steps${report_suffix}"
 report_path="${report_base}.nsys-rep"
 sqlite_path="${report_base}.sqlite"
 if [[ -e "$report_path" || -e "$sqlite_path" || -e "$control_dir/start" ]]; then
@@ -86,6 +158,18 @@ if [[ -e "$report_path" || -e "$sqlite_path" || -e "$control_dir/start" ]]; then
 fi
 
 session="magi_dsa_${plan}_$$_$(date -u +%Y%m%dT%H%M%SZ)"
+worker_script="/workspace/Magi-DSA/benchmarks/dsa_v4/profile_5step.py"
+if [[ "$step_mode" == "attention-suite" || "$step_mode" == "pro-pair" ]]; then
+    worker_script="/workspace/Magi-DSA/benchmarks/dsa_v4/profile_attention_suite.py"
+fi
+worker_extra_args=()
+if [[ "$step_mode" == "attention-suite" || "$step_mode" == "pro-pair" ]]; then
+    worker_extra_args+=(
+        --layout-policy "$layout_policy"
+        --local-improvement-passes "$local_improvement_passes"
+        --profiler-attach-warmup-steps "$profiler_attach_warmup_steps"
+    )
+fi
 launch_log="$artifact_dir/NSYS_LAUNCH.log"
 start_log="$artifact_dir/NSYS_START.log"
 stop_log="$artifact_dir/NSYS_STOP.log"
@@ -125,7 +209,11 @@ trap cleanup EXIT INT TERM
 {
     echo "session=$session"
     echo "plan=$plan"
-    echo "nsys launch --session-new=$session --trace=cuda,nvtx --resolve-symbols=false --wait=all torchrun --standalone --nnodes=1 --nproc-per-node=$world_size benchmarks/dsa_v4/profile_5step.py --mode profile --plan $plan --artifact-dir $artifact_dir --seed 0 --tokens $tokens --steps $steps --warmup $warmup"
+    echo "step_mode=$step_mode"
+    echo "layout_policy=$layout_policy"
+    echo "local_improvement_passes=$local_improvement_passes"
+    echo "profiler_attach_warmup_steps=$profiler_attach_warmup_steps"
+    echo "nsys launch --session-new=$session --trace=cuda,nvtx --resolve-symbols=false --wait=all torchrun --standalone --nnodes=1 --nproc-per-node=$world_size $worker_script --mode profile --plan $plan --step-mode $step_mode --artifact-dir $artifact_dir --seed 0 --tokens $tokens --steps $steps --warmup $warmup ${worker_extra_args[*]}"
 } >"$artifact_dir/PLAN_COMMAND.txt"
 
 setsid nsys launch \
@@ -137,14 +225,16 @@ setsid nsys launch \
         --standalone \
         --nnodes=1 \
         --nproc-per-node="$world_size" \
-        /workspace/Magi-DSA/benchmarks/dsa_v4/profile_5step.py \
+        "$worker_script" \
         --mode profile \
         --plan "$plan" \
+        --step-mode "$step_mode" \
         --artifact-dir "$artifact_dir" \
         --seed 0 \
         --tokens "$tokens" \
         --steps "$steps" \
         --warmup "$warmup" \
+        "${worker_extra_args[@]}" \
     >"$launch_log" 2>&1 &
 launch_pid="$!"
 launch_pgid="$(ps -o pgid= -p "$launch_pid" | tr -d ' ')"
@@ -251,6 +341,7 @@ python /workspace/Magi-DSA/scripts/profile/extract_nsys.py \
     --sqlite "$sqlite_path" \
     --output-dir "$artifact_dir" \
     --steps "$steps" \
+    --step-mode "$step_mode" \
     --world-size "$world_size"
 
 echo "profile plan complete: plan=$plan report=$report_path"

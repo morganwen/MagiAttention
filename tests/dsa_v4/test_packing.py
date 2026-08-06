@@ -16,8 +16,9 @@ from __future__ import annotations
 
 import torch
 
-from magi_attention.dsa_config import MagiDSAConfig
+from magi_attention.dsa_config import DsaStructuralLayoutConfig, MagiDSAConfig
 from magi_attention.functional.dsa_packing import (
+    _make_indexer_map,
     copy_dsa_rows_reference,
     make_dsa_copy_map,
     make_dsa_reduce_map,
@@ -57,16 +58,16 @@ def test_route_maps_reconstruct_consumers_and_reduce_owner_gradients() -> None:
             indexer_atom_size=4,
         ),
         cu_seqlens=(0, 7, 18, 31),
-        local_token_counts=(5, 0, 8, 9, 9),
+        source_token_counts=(5, 0, 8, 9, 9),
         policy="indexer_balanced",
     )
-    routes = [rank.indexer_qw_route for rank in plan.rank_plans]
+    routes = [rank.token_layout_route for rank in plan.rank_plans]
     assert all(route is not None for route in routes)
     concrete = [route for route in routes if route is not None]
     maps = [make_dsa_route_maps(route) for route in concrete]
     producers = [
         torch.arange(route.producer_row_count, dtype=torch.float32).unsqueeze(1)
-        + plan.rank_plans[rank].local_global_begin
+        + plan.rank_plans[rank].source_global_begin
         for rank, route in enumerate(concrete)
     ]
     packed_send = [
@@ -110,8 +111,8 @@ def test_route_maps_reconstruct_consumers_and_reduce_owner_gradients() -> None:
             for consumer_row, global_row in enumerate(
                 destination_route.consumer_global_rows
             ):
-                owner_begin = plan.rank_plans[source].local_global_begin
-                owner_end = plan.rank_plans[source].local_global_end
+                owner_begin = plan.rank_plans[source].source_global_begin
+                owner_end = plan.rank_plans[source].source_global_end
                 if owner_begin <= global_row < owner_end:
                     expected[global_row - owner_begin] += consumer_grads[destination][
                         consumer_row
@@ -123,10 +124,10 @@ def test_empty_rank_route_maps_keep_zero_sized_permutations_valid() -> None:
     plan = build_dsa_execution_plan(
         MagiDSAConfig(ratio=4),
         cu_seqlens=(0, 256),
-        local_token_counts=(128, 0, 128),
+        source_token_counts=(128, 0, 128),
         policy="indexer_balanced",
     )
-    route = plan.rank_plans[1].indexer_qw_route
+    route = plan.rank_plans[1].token_layout_route
     assert route is not None
     maps = make_dsa_route_maps(route)
     source = torch.empty((0, 8), dtype=torch.float32)
@@ -134,3 +135,38 @@ def test_empty_rank_route_maps_keep_zero_sized_permutations_valid() -> None:
     assert packed.shape == (0, 8)
     reduced = reduce_dsa_rows_reference(packed, maps.owner_reduce)
     assert reduced.shape == (0, 8)
+
+
+def test_csa_indexer_k_pack_materializes_each_fragment_from_one_unique_bank() -> None:
+    plan = build_dsa_execution_plan(
+        MagiDSAConfig(ratio=4),
+        cu_seqlens=(0, 257, 600),
+        source_token_counts=(150, 150, 150, 150),
+        policy="structural_balanced",
+        structural_layout_config=DsaStructuralLayoutConfig(
+            chunk_size=64,
+            min_chunks_per_rank=2,
+        ),
+    )
+    rank_plan = plan.rank_plans[0]
+    indexer_map = _make_indexer_map(rank_plan, torch.device("cpu"))
+
+    assert indexer_map is not None
+    assert not hasattr(indexer_map, "k_unpack")
+    assert rank_plan.compressed_ki_route is not None
+    unique_global_rows = torch.tensor(
+        rank_plan.compressed_ki_route.consumer_global_rows,
+        dtype=torch.int64,
+    )
+    packed_global_rows = unique_global_rows[indexer_map.k_pack.source_rows.long()]
+    expected_global_rows = torch.tensor(
+        [
+            rank_plan.sample_block_offsets[fragment.sample_id] + block_offset
+            for fragment in rank_plan.query_fragments
+            for block_offset in range(fragment.q_end // 4)
+        ],
+        dtype=torch.int64,
+    )
+    assert torch.equal(packed_global_rows, expected_global_rows)
+    assert packed_global_rows.numel() == rank_plan.packed_indexer_k_count
+    assert packed_global_rows.numel() > unique_global_rows.numel()

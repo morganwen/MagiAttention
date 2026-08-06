@@ -73,6 +73,74 @@ if [[ -z "$case_name" ]]; then
 fi
 
 repo_root="$(git rev-parse --show-toplevel)"
+flashmla_base_revision="9241ae3ef9bac614dd25e45e507e089f888280e0"
+flashmla_patch_revision="13d173ac48abd8ec88a4e742bcaaa59c5ccf4ece"
+flashmla_patch_sha256="6957dbde516c73066c5911108761325edc1bdcd8f62e15dc0a84f4f290118d4b"
+flashmla_pro_patch_revision="b7643bd54521f563b839b98289b5cd048c062ba2"
+flashmla_pro_patch_sha256="c534e13ff432ac1c694cb24981826c11be26a2d9743d7175ddb05f887279461f"
+cudnn_backend_version="9.24.0.43"
+cudnn_frontend_version="1.26.0"
+cudnn_frontend_revision="35fd7b0d0e1d4952b904c79341c5e84e3af0a328"
+cutlass_dsl_version="4.5.0"
+quack_version="0.4.1"
+tvm_ffi_version="0.1.8.post0"
+magi_source_revision="$(git -C "$repo_root" rev-parse HEAD)"
+
+image_label() {
+    docker image inspect "$image" --format "{{ index .Config.Labels \"$1\" }}"
+}
+
+require_image_label() {
+    local label="$1"
+    local expected="$2"
+    local description="$3"
+    local actual
+    actual="$(image_label "$label")"
+    if [[ "$actual" != "$expected" ]]; then
+        echo "correctness image $description label mismatch: expected $expected, found ${actual:-<missing>}" >&2
+        exit 1
+    fi
+}
+
+require_image_label "org.magi-dsa.flashmla-revision" "$flashmla_base_revision" \
+    "FlashMLA base revision"
+require_image_label "org.magi-dsa.flashmla-dual-lse-patch-revision" \
+    "$flashmla_patch_revision" "FlashMLA dual-LSE patch revision"
+require_image_label "org.magi-dsa.flashmla-dual-lse-patch-sha256" \
+    "$flashmla_patch_sha256" "FlashMLA dual-LSE patch SHA-256"
+require_image_label "org.magi-dsa.flashmla-pro-h128-patch-revision" \
+    "$flashmla_pro_patch_revision" "FlashMLA Pro H128 patch revision"
+require_image_label "org.magi-dsa.flashmla-pro-h128-patch-sha256" \
+    "$flashmla_pro_patch_sha256" "FlashMLA Pro H128 patch SHA-256"
+require_image_label "org.magi-dsa.cudnn-backend" "$cudnn_backend_version" \
+    "cuDNN backend version"
+require_image_label "org.magi-dsa.cudnn-frontend" "$cudnn_frontend_version" \
+    "cuDNN frontend version"
+require_image_label "org.magi-dsa.cudnn-frontend-revision" \
+    "$cudnn_frontend_revision" "cuDNN frontend revision"
+require_image_label "org.magi-dsa.cudnn-frontend-source" \
+    "official-unmodified" "cuDNN frontend source"
+require_image_label "org.magi-dsa.cudnn-frontend-local-patches" \
+    "none" "cuDNN frontend local patches"
+require_image_label "org.magi-dsa.cutlass-dsl" "$cutlass_dsl_version" \
+    "CUTLASS DSL version"
+require_image_label "org.magi-dsa.quack-kernels" "$quack_version" \
+    "Quack version"
+require_image_label "org.magi-dsa.tvm-ffi" "$tvm_ffi_version" \
+    "TVM-FFI version"
+require_image_label "org.magi-dsa.magi-attention-revision" \
+    "$magi_source_revision" "Magi source revision"
+require_image_label "org.magi-dsa.install-mode" "python-wheel" \
+    "Magi install mode"
+
+image_flashmla_patch_revision="$(image_label \
+    "org.magi-dsa.flashmla-dual-lse-patch-revision")"
+image_flashmla_patch_sha256="$(image_label \
+    "org.magi-dsa.flashmla-dual-lse-patch-sha256")"
+image_flashmla_pro_patch_revision="$(image_label \
+    "org.magi-dsa.flashmla-pro-h128-patch-revision")"
+image_flashmla_pro_patch_sha256="$(image_label \
+    "org.magi-dsa.flashmla-pro-h128-patch-sha256")"
 pack_sha="$(sha256sum "$repo_root/magi_attention/kernel/cutedsl/dsa_pack.py" | cut -c1-16)"
 aot_dir="${MAGI_DSA_CUTE_AOT:-$repo_root/.cache/magi-dsa-v4/aot-cutlass-4.5.0-sm103-$pack_sha}"
 cudnn_cache_dir="${MAGI_DSA_CUDNN_CACHE:-$repo_root/.cache/magi-dsa-v4/cudnn-dsa-9.24.0.43-frontend-35fd7b0d-cutlass-4.5.0-sm103}"
@@ -84,23 +152,41 @@ run_id="$(date -u +%Y%m%dT%H%M%SZ)-$run_scope-$case_name"
 if ((installed_wheel == 1)); then
     run_id="${run_id}-installed-wheel"
 fi
+rank_cache_dir="${MAGI_DSA_RANK_CACHE:-$repo_root/.cache/magi-dsa-v4/distributed-rank-cache/$run_id}"
 artifact_dir="$repo_root/artifacts/correctness/$run_id"
 if [[ -e "$artifact_dir" ]]; then
     echo "refusing to overwrite existing artifact directory: $artifact_dir" >&2
     exit 1
 fi
-mkdir -p "$artifact_dir" "$aot_dir" "$cudnn_cache_dir/cuda" "$cudnn_cache_dir/cute-dsl" \
-    "$cudnn_cache_dir/magi-workspace"
+mkdir -p "$artifact_dir/workdir" "$aot_dir" "$cudnn_cache_dir/cuda" \
+    "$cudnn_cache_dir/cute-dsl" "$cudnn_cache_dir/magi-workspace" \
+    "$rank_cache_dir/launcher/quack" "$rank_cache_dir/launcher/tmp" \
+    "$rank_cache_dir/launcher/torch-extensions" \
+    "$rank_cache_dir/launcher/torch-home" \
+    "$rank_cache_dir/launcher/torchinductor" \
+    "$rank_cache_dir/launcher/triton" "$rank_cache_dir/launcher/xdg" \
+    "$rank_cache_dir/workers"
 chmod 0777 "$artifact_dir" "$aot_dir" "$cudnn_cache_dir" \
     "$cudnn_cache_dir/cuda" "$cudnn_cache_dir/cute-dsl"
 chmod 0777 "$cudnn_cache_dir/magi-workspace"
+chmod 0777 "$artifact_dir/workdir" "$rank_cache_dir" \
+    "$rank_cache_dir/launcher" "$rank_cache_dir/launcher/quack" \
+    "$rank_cache_dir/launcher/tmp" "$rank_cache_dir/launcher/torch-extensions" \
+    "$rank_cache_dir/launcher/torch-home" \
+    "$rank_cache_dir/launcher/torchinductor" \
+    "$rank_cache_dir/launcher/triton" "$rank_cache_dir/launcher/xdg" \
+    "$rank_cache_dir/workers"
 if [[ "$case_name" == csa-* || "$case_name" == cp8-* ]]; then
     aot_required="1"
-    aot_object_count="$(find "$aot_dir" -maxdepth 1 -type f -name '*.o' | wc -l)"
-    if ((aot_object_count != 11)); then
-        echo "missing CuTe AOT objects; run bash scripts/test/prewarm_cute.sh" >&2
-        exit 1
-    fi
+    mapfile -t required_aot_objects < <(
+        python3 "$repo_root/scripts/test/dsa_pack_aot_manifest.py"
+    )
+    for object_name in "${required_aot_objects[@]}"; do
+        if [[ ! -f "$aot_dir/$object_name" ]]; then
+            echo "missing CuTe AOT object $object_name; run bash scripts/test/prewarm_cute.sh" >&2
+            exit 1
+        fi
+    done
 else
     aot_required="0"
 fi
@@ -120,7 +206,33 @@ trap cleanup EXIT INT TERM
 echo "artifact_dir=$artifact_dir" | tee "$artifact_dir/COMMAND.txt"
 echo "aot_dir=$aot_dir" | tee -a "$artifact_dir/COMMAND.txt"
 echo "cudnn_cache_dir=$cudnn_cache_dir" | tee -a "$artifact_dir/COMMAND.txt"
+echo "rank_cache_dir=$rank_cache_dir" | tee -a "$artifact_dir/COMMAND.txt"
+echo "rank_cache_policy=per-run-per-rank" | tee -a "$artifact_dir/COMMAND.txt"
 echo "image=$image" | tee -a "$artifact_dir/COMMAND.txt"
+echo "flashmla_base_revision=$flashmla_base_revision" \
+    | tee -a "$artifact_dir/COMMAND.txt"
+echo "flashmla_dual_lse_patch_revision=$flashmla_patch_revision" \
+    | tee -a "$artifact_dir/COMMAND.txt"
+echo "flashmla_dual_lse_patch_sha256=$flashmla_patch_sha256" \
+    | tee -a "$artifact_dir/COMMAND.txt"
+echo "flashmla_pro_h128_patch_revision=$flashmla_pro_patch_revision" \
+    | tee -a "$artifact_dir/COMMAND.txt"
+echo "flashmla_pro_h128_patch_sha256=$flashmla_pro_patch_sha256" \
+    | tee -a "$artifact_dir/COMMAND.txt"
+echo "cudnn_backend_version=$cudnn_backend_version" \
+    | tee -a "$artifact_dir/COMMAND.txt"
+echo "cudnn_frontend_version=$cudnn_frontend_version" \
+    | tee -a "$artifact_dir/COMMAND.txt"
+echo "cudnn_frontend_revision=$cudnn_frontend_revision" \
+    | tee -a "$artifact_dir/COMMAND.txt"
+echo "cudnn_frontend_source=official-unmodified" \
+    | tee -a "$artifact_dir/COMMAND.txt"
+echo "cudnn_frontend_local_patches=none" \
+    | tee -a "$artifact_dir/COMMAND.txt"
+echo "cutlass_dsl_version=$cutlass_dsl_version" | tee -a "$artifact_dir/COMMAND.txt"
+echo "quack_version=$quack_version" | tee -a "$artifact_dir/COMMAND.txt"
+echo "tvm_ffi_version=$tvm_ffi_version" | tee -a "$artifact_dir/COMMAND.txt"
+echo "magi_source_revision=$magi_source_revision" | tee -a "$artifact_dir/COMMAND.txt"
 echo "installed_wheel=$installed_wheel" | tee -a "$artifact_dir/COMMAND.txt"
 echo "NCCL_DEBUG=$nccl_debug" | tee -a "$artifact_dir/COMMAND.txt"
 echo "TORCH_DISTRIBUTED_DEBUG=$torch_distributed_debug" | tee -a "$artifact_dir/COMMAND.txt"
@@ -139,6 +251,36 @@ echo "total_deadline_seconds=$total_deadline_seconds" | tee -a "$artifact_dir/CO
 echo "actual_execution_deadline_seconds=$actual_deadline_seconds" | tee -a "$artifact_dir/COMMAND.txt"
 echo "verification_deadline_seconds=$verification_deadline_seconds" | tee -a "$artifact_dir/COMMAND.txt"
 git rev-parse HEAD >"$artifact_dir/SOURCE_REVISION.txt"
+cat >"$artifact_dir/IMAGE_CONTRACT.txt" <<EOF
+flashmla_base_revision=$flashmla_base_revision
+flashmla_dual_lse_patch_revision=$flashmla_patch_revision
+flashmla_dual_lse_patch_sha256=$flashmla_patch_sha256
+flashmla_pro_h128_patch_revision=$flashmla_pro_patch_revision
+flashmla_pro_h128_patch_sha256=$flashmla_pro_patch_sha256
+cudnn_backend_version=$cudnn_backend_version
+cudnn_frontend_version=$cudnn_frontend_version
+cudnn_frontend_revision=$cudnn_frontend_revision
+cudnn_frontend_source=official-unmodified
+cudnn_frontend_local_patches=none
+cutlass_dsl_version=$cutlass_dsl_version
+quack_version=$quack_version
+tvm_ffi_version=$tvm_ffi_version
+magi_source_revision=$magi_source_revision
+install_mode=python-wheel
+validation=all_required_image_labels_exact
+EOF
+cat >"$artifact_dir/FLASHMLA_DUAL_LSE_PATCH.txt" <<EOF
+base_revision=$flashmla_base_revision
+patch_revision=$flashmla_patch_revision
+patch_sha256=$flashmla_patch_sha256
+image_label_revision=$image_flashmla_patch_revision
+image_label_sha256=$image_flashmla_patch_sha256
+pro_h128_patch_revision=$flashmla_pro_patch_revision
+pro_h128_patch_sha256=$flashmla_pro_patch_sha256
+pro_h128_image_label_revision=$image_flashmla_pro_patch_revision
+pro_h128_image_label_sha256=$image_flashmla_pro_patch_sha256
+behavior=CSA sparse forward returns full sparse_lse and compressed-prefix lse_indexer from the same FlashMLA kernel invocation
+EOF
 git remote get-url origin >"$artifact_dir/SOURCE_REMOTE.txt"
 git submodule status --recursive >"$artifact_dir/SUBMODULES.txt"
 git status --short >"$artifact_dir/DIRTY_STATUS.txt"
@@ -165,7 +307,7 @@ source_environment=(--env PYTHONPATH=/workspace/Magi-DSA)
 installed_environment=()
 if ((installed_wheel == 1)); then
     worker_path="/workspace/Magi-DSA/tests/dsa_v4/distributed_worker.py"
-    container_workdir="/tmp"
+    container_workdir="/cp2-artifact/workdir"
     source_environment=()
     installed_environment=(
         --env MAGI_DSA_REQUIRE_INSTALLED_WHEEL=1
@@ -183,11 +325,21 @@ setsid timeout --signal=TERM --kill-after=5s "${total_deadline_seconds}s" docker
     --ulimit stack=67108864 \
     --env CUDA_CACHE_PATH=/cudnn-dsa-cache/cuda \
     --env CUTE_DSL_CACHE_DIR=/cudnn-dsa-cache/cute-dsl \
+    --env MAGI_DSA_RANK_CACHE_ROOT=/rank-cache/workers \
     --env MAGI_DSA_CP2_ARTIFACT_DIR=/cp2-artifact \
     --env MAGI_DSA_CUTE_AOT_DIR=/dsa-pack-aot \
     --env "MAGI_DSA_CUTE_AOT_REQUIRED=$aot_required" \
     --env MAGI_DSA_PHASE_LOG=1 \
     --env MAGI_ATTENTION_WORKSPACE_BASE=/cudnn-dsa-cache/magi-workspace \
+    --env QUACK_CACHE_DIR=/rank-cache/launcher/quack \
+    --env TEMP=/rank-cache/launcher/tmp \
+    --env TMP=/rank-cache/launcher/tmp \
+    --env TMPDIR=/rank-cache/launcher/tmp \
+    --env TORCH_EXTENSIONS_DIR=/rank-cache/launcher/torch-extensions \
+    --env TORCH_HOME=/rank-cache/launcher/torch-home \
+    --env TORCHINDUCTOR_CACHE_DIR=/rank-cache/launcher/torchinductor \
+    --env TRITON_CACHE_DIR=/rank-cache/launcher/triton \
+    --env XDG_CACHE_HOME=/rank-cache/launcher/xdg \
     --env "NCCL_DEBUG=$nccl_debug" \
     "${source_environment[@]}" \
     "${installed_environment[@]}" \
@@ -195,6 +347,7 @@ setsid timeout --signal=TERM --kill-after=5s "${total_deadline_seconds}s" docker
     --volume "$aot_dir:/dsa-pack-aot:ro" \
     --volume "$artifact_dir:/cp2-artifact" \
     --volume "$cudnn_cache_dir:/cudnn-dsa-cache" \
+    --volume "$rank_cache_dir:/rank-cache" \
     --volume "$repo_root:/workspace/Magi-DSA:ro" \
     --workdir "$container_workdir" \
     "$image" \
@@ -335,7 +488,16 @@ audit_arguments=(
 if ((actual_timed_out == 1)); then
     audit_arguments+=(--timed-out)
 fi
-python3 scripts/test/audit_dsa_phases.py "${audit_arguments[@]}" | tee "$artifact_dir/PHASE_AUDIT.stdout"
+phase_audit_status=0
+if python3 scripts/test/audit_dsa_phases.py "${audit_arguments[@]}" \
+    | tee "$artifact_dir/PHASE_AUDIT.stdout"; then
+    phase_audit_status=0
+else
+    phase_audit_status="$?"
+fi
+if ((runner_status == 0 && phase_audit_status != 0)); then
+    runner_status="$phase_audit_status"
+fi
 
 echo "path=$cudnn_cache_dir" >"$artifact_dir/CUDNN_CACHE.txt"
 if timeout --signal=TERM --kill-after=5s 60s docker run --rm \

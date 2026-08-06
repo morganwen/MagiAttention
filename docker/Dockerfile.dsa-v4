@@ -20,6 +20,11 @@ FROM ${BASE_IMAGE} AS flashmla-builder
 
 ARG FLASHMLA_REPOSITORY=https://github.com/deepseek-ai/FlashMLA.git
 ARG FLASHMLA_REVISION=9241ae3ef9bac614dd25e45e507e089f888280e0
+ARG FLASHMLA_DUAL_LSE_PATCH_REVISION=13d173ac48abd8ec88a4e742bcaaa59c5ccf4ece
+ARG FLASHMLA_DUAL_LSE_PATCH_PARENT_REVISION=4c3d231ff3c85db9e27d87fe3356f93d0281fc33
+ARG FLASHMLA_DUAL_LSE_PATCH_SHA256=6957dbde516c73066c5911108761325edc1bdcd8f62e15dc0a84f4f290118d4b
+ARG FLASHMLA_PRO_H128_PATCH_REVISION=b7643bd54521f563b839b98289b5cd048c062ba2
+ARG FLASHMLA_PRO_H128_PATCH_SHA256=c534e13ff432ac1c694cb24981826c11be26a2d9743d7175ddb05f887279461f
 
 ENV CPATH=/usr/local/cuda/include/cccl \
     FLASH_MLA_DISABLE_SM90=1 \
@@ -30,6 +35,34 @@ RUN git clone --filter=blob:none --no-checkout "${FLASHMLA_REPOSITORY}" /opt/Fla
     cd /opt/FlashMLA && \
     git checkout --detach "${FLASHMLA_REVISION}" && \
     test "$(git rev-parse HEAD)" = "${FLASHMLA_REVISION}" && \
+    git fetch --no-tags --filter=blob:none origin \
+        "${FLASHMLA_DUAL_LSE_PATCH_REVISION}" \
+        "${FLASHMLA_PRO_H128_PATCH_REVISION}" && \
+    git cat-file -e "${FLASHMLA_DUAL_LSE_PATCH_REVISION}^{commit}" && \
+    test "$(git rev-parse "${FLASHMLA_DUAL_LSE_PATCH_REVISION}^")" \
+        = "${FLASHMLA_DUAL_LSE_PATCH_PARENT_REVISION}" && \
+    git show --format= --binary "${FLASHMLA_DUAL_LSE_PATCH_REVISION}" \
+        > /tmp/flashmla-dual-lse.patch && \
+    echo "${FLASHMLA_DUAL_LSE_PATCH_SHA256}  /tmp/flashmla-dual-lse.patch" \
+        | sha256sum --check --strict && \
+    git apply --check --whitespace=error-all /tmp/flashmla-dual-lse.patch && \
+    git apply --whitespace=error-all /tmp/flashmla-dual-lse.patch && \
+    test "$(git diff --name-only | wc -l)" -eq 15 && \
+    git cat-file -e "${FLASHMLA_PRO_H128_PATCH_REVISION}^{commit}" && \
+    test "$(git rev-parse "${FLASHMLA_PRO_H128_PATCH_REVISION}^")" \
+        = "${FLASHMLA_DUAL_LSE_PATCH_REVISION}" && \
+    git show --format= --binary "${FLASHMLA_PRO_H128_PATCH_REVISION}" \
+        > /tmp/flashmla-pro-h128.patch && \
+    echo "${FLASHMLA_PRO_H128_PATCH_SHA256}  /tmp/flashmla-pro-h128.patch" \
+        | sha256sum --check --strict && \
+    git apply --check --whitespace=error-all /tmp/flashmla-pro-h128.patch && \
+    git apply --whitespace=error-all /tmp/flashmla-pro-h128.patch && \
+    test "$(git diff --name-only | wc -l)" -eq 19 && \
+    grep -Fq "indexer_topk == 1024" csrc/api/sparse_fwd.h && \
+    grep -Fq \
+        "run_fwd_for_small_topk_phase1_kernel<SparseAttnFwdMode::Prefill, 512, 1024>" \
+        csrc/api/sparse_fwd.h && \
+    git diff --check && \
     git submodule update --init --recursive csrc/cutlass
 
 WORKDIR /opt/FlashMLA
@@ -71,20 +104,35 @@ ARG CUDNN_FRONTEND_VERSION=1.26.0
 ARG CUDNN_FRONTEND_REVISION=35fd7b0d0e1d4952b904c79341c5e84e3af0a328
 ARG CUTLASS_DSL_VERSION=4.5.0
 ARG FLASHMLA_REVISION=9241ae3ef9bac614dd25e45e507e089f888280e0
+ARG FLASHMLA_DUAL_LSE_PATCH_REVISION=13d173ac48abd8ec88a4e742bcaaa59c5ccf4ece
+ARG FLASHMLA_DUAL_LSE_PATCH_SHA256=6957dbde516c73066c5911108761325edc1bdcd8f62e15dc0a84f4f290118d4b
+ARG FLASHMLA_PRO_H128_PATCH_REVISION=b7643bd54521f563b839b98289b5cd048c062ba2
+ARG FLASHMLA_PRO_H128_PATCH_SHA256=c534e13ff432ac1c694cb24981826c11be26a2d9743d7175ddb05f887279461f
 ARG MAGI_ATTENTION_REVISION=unknown
+ARG PACKAGING_VERSION=25.0
+ARG PYTEST_VERSION=8.4.2
 ARG QUACK_VERSION=0.4.1
 ARG TVM_FFI_VERSION=0.1.8.post0
 
 # The base digest supplies CUDA 13.2, cuBLAS, cuda-python, torch, and torch-c-dlpack-ext.
 # Every dependency that changes the frozen DSA ABI is installed explicitly.
+RUN python3 -m pip uninstall --yes \
+        nvidia-cutlass-dsl \
+        nvidia-cutlass-dsl-libs-base \
+        nvidia-cutlass-dsl-libs-cu13 && \
+    python3 -m pip install --no-cache-dir --upgrade \
+        "nvidia-cutlass-dsl[cu13]==${CUTLASS_DSL_VERSION}"
+
 RUN python3 -m pip install --no-cache-dir --no-deps --upgrade \
         "nvidia-cudnn-cu13==${CUDNN_BACKEND_VERSION}" \
         "nvidia-cudnn-frontend==${CUDNN_FRONTEND_VERSION}" \
-        "nvidia-cutlass-dsl==${CUTLASS_DSL_VERSION}" \
-        "nvidia-cutlass-dsl-libs-base==${CUTLASS_DSL_VERSION}" \
-        "nvidia-cutlass-dsl-libs-cu13==${CUTLASS_DSL_VERSION}" \
         "apache-tvm-ffi==${TVM_FFI_VERSION}" \
         "quack-kernels==${QUACK_VERSION}"
+
+# CP1 is a release-image gate, so its test runner is part of the frozen image.
+RUN python3 -m pip install --no-cache-dir \
+        "packaging==${PACKAGING_VERSION}" \
+        "pytest==${PYTEST_VERSION}"
 
 COPY --from=flashmla-builder /opt/wheels /opt/flashmla-wheels
 COPY --from=magi-builder /opt/magi-wheels /opt/magi-wheels
@@ -95,17 +143,26 @@ RUN python3 -m pip install --no-cache-dir --no-deps \
         /opt/magi-wheels/magi_attention-*.whl
 
 ENV LD_LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH} \
+    MAGI_DSA_FLASHMLA_BASE_REVISION=${FLASHMLA_REVISION} \
+    MAGI_DSA_FLASHMLA_DUAL_LSE_PATCH_REVISION=${FLASHMLA_DUAL_LSE_PATCH_REVISION} \
+    MAGI_DSA_FLASHMLA_PRO_H128_PATCH_REVISION=${FLASHMLA_PRO_H128_PATCH_REVISION} \
     MAGI_DSA_SOURCE_REVISION=${MAGI_ATTENTION_REVISION}
 
 WORKDIR /tmp
 
-RUN python3 -c "import os; from importlib import metadata; from pathlib import Path; import cudnn; import flash_mla; import magi_attention; from cudnn import DSA; from magi_attention.dsa_layer import MagiDSALayer; from magi_attention.dsa_runtime_mgr import MagiDSARuntimeMgr; assert cudnn.__version__ == '1.26.0'; assert cudnn.backend_version() == 92400; assert metadata.version('nvidia-cudnn-cu13') == '9.24.0.43'; assert metadata.version('nvidia-cutlass-dsl') == '4.5.0'; assert metadata.version('apache-tvm-ffi') == '0.1.8.post0'; assert metadata.version('quack-kernels') == '0.4.1'; assert metadata.version('flash-mla').endswith('+9241ae3'); assert metadata.version('magi-attention') == '1.1.1+g' + os.environ['MAGI_DSA_SOURCE_REVISION']; assert set(Path(magi_attention.__file__).parts).intersection({'site-packages', 'dist-packages'}); assert DSA.indexer_forward_wrapper; assert DSA.indexer_top_k_wrapper; assert DSA.sparse_attention_backward_wrapper; assert flash_mla.flash_mla_sparse_fwd; assert MagiDSALayer; assert MagiDSARuntimeMgr"
+RUN python3 -c "import inspect; import os; from importlib import metadata; from pathlib import Path; import cudnn; import flash_mla; import magi_attention; from cudnn import DSA; from cutlass import Int32; from magi_attention.dsa_layer import MagiDSALayer; from magi_attention.dsa_runtime_mgr import MagiDSARuntimeMgr; assert cudnn.__version__ == '1.26.0'; assert cudnn.backend_version() == 92400; assert metadata.version('nvidia-cudnn-cu13') == '9.24.0.43'; assert metadata.version('nvidia-cutlass-dsl') == '4.5.0'; assert metadata.version('nvidia-cutlass-dsl-libs-base') == '4.5.0'; assert metadata.version('nvidia-cutlass-dsl-libs-cu13') == '4.5.0'; assert Int32; assert metadata.version('apache-tvm-ffi') == '0.1.8.post0'; assert metadata.version('packaging') == '25.0'; assert metadata.version('pytest') == '8.4.2'; assert metadata.version('quack-kernels') == '0.4.1'; assert metadata.version('flash-mla').endswith('+9241ae3'); assert 'indexer_topk' in inspect.signature(flash_mla.flash_mla_sparse_fwd).parameters; indexer_forward_parameters = inspect.signature(DSA.indexer_forward_wrapper).parameters; assert 'q_causal_offsets' in indexer_forward_parameters; assert indexer_forward_parameters['q_causal_offsets'].kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY); indexer_topk_parameters = inspect.signature(DSA.indexer_top_k_wrapper).parameters; assert 'return_val' in indexer_topk_parameters; assert indexer_topk_parameters['return_val'].kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY); assert metadata.version('magi-attention') == '1.1.1+g' + os.environ['MAGI_DSA_SOURCE_REVISION']; assert set(Path(magi_attention.__file__).parts).intersection({'site-packages', 'dist-packages'}); assert DSA.indexer_forward_wrapper; assert DSA.indexer_top_k_wrapper; assert DSA.sparse_attention_backward_wrapper; assert DSA.indexer_backward_wrapper; assert flash_mla.flash_mla_sparse_fwd; assert MagiDSALayer; assert MagiDSARuntimeMgr"
 
 LABEL org.opencontainers.image.base.digest="sha256:192d749b4d773610ec9e01c0443a9df545d196c412b7b8fd33bfa3da362a49e7" \
       org.magi-dsa.cudnn-backend="9.24.0.43" \
       org.magi-dsa.cudnn-frontend="1.26.0" \
       org.magi-dsa.cudnn-frontend-revision="${CUDNN_FRONTEND_REVISION}" \
+      org.magi-dsa.cudnn-frontend-local-patches="none" \
+      org.magi-dsa.cudnn-frontend-source="official-unmodified" \
       org.magi-dsa.cutlass-dsl="4.5.0" \
+      org.magi-dsa.flashmla-dual-lse-patch-revision="${FLASHMLA_DUAL_LSE_PATCH_REVISION}" \
+      org.magi-dsa.flashmla-dual-lse-patch-sha256="${FLASHMLA_DUAL_LSE_PATCH_SHA256}" \
+      org.magi-dsa.flashmla-pro-h128-patch-revision="${FLASHMLA_PRO_H128_PATCH_REVISION}" \
+      org.magi-dsa.flashmla-pro-h128-patch-sha256="${FLASHMLA_PRO_H128_PATCH_SHA256}" \
       org.magi-dsa.flashmla-revision="${FLASHMLA_REVISION}" \
       org.magi-dsa.install-mode="python-wheel" \
       org.magi-dsa.magi-attention-revision="${MAGI_ATTENTION_REVISION}" \

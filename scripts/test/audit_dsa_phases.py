@@ -57,6 +57,8 @@ def _is_collective(name: str) -> bool:
 
 
 def audit(path: Path, world_size: int, timed_out: bool) -> dict[str, object]:
+    if world_size <= 0:
+        raise ValueError("world size must be positive")
     execute_started: set[int] = set()
     execute_ended: set[int] = set()
     stacks: dict[int, list[str]] = {rank: [] for rank in range(world_size)}
@@ -68,11 +70,21 @@ def audit(path: Path, world_size: int, timed_out: bool) -> dict[str, object]:
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         for record_type, payload in _records(line):
             rank = _json_rank(payload["rank"])
+            if rank < 0 or rank >= world_size:
+                raise ValueError(f"phase rank {rank} is outside [0, {world_size})")
             event = str(payload["event"])
             if record_type == "control":
                 if event == "execute_begin":
+                    if rank in execute_started:
+                        errors[rank].append("duplicate execute_begin")
+                    if rank in execute_ended:
+                        errors[rank].append("execute_begin after execute_end")
                     execute_started.add(rank)
                 elif event == "execute_end":
+                    if rank not in execute_started:
+                        errors[rank].append("execute_end before execute_begin")
+                    if rank in execute_ended:
+                        errors[rank].append("duplicate execute_end")
                     execute_ended.add(rank)
                 continue
             if rank not in execute_started or rank in execute_ended:
@@ -86,6 +98,12 @@ def audit(path: Path, world_size: int, timed_out: bool) -> dict[str, object]:
                     stacks[rank].pop()
                 else:
                     errors[rank].append(f"unmatched {event} for {name}")
+                if event == "error":
+                    error = payload.get("error")
+                    suffix = "" if error is None else f": {error}"
+                    errors[rank].append(f"phase error for {name}{suffix}")
+            else:
+                errors[rank].append(f"unknown phase event {event} for {name}")
 
     rank_reports: list[dict[str, object]] = []
     latest_open: list[str | None] = []
@@ -108,20 +126,41 @@ def audit(path: Path, world_size: int, timed_out: bool) -> dict[str, object]:
         name is not None and _is_collective(name) for name in latest_open
     )
     same_collective = len(set(latest_open)) == 1 if all_open_collective else False
+    all_ended = len(execute_ended) == world_size
+    error_count = sum(len(rank_errors) for rank_errors in errors.values())
+    open_phase_count = sum(len(stack) for stack in stacks.values())
+    collective_stall_confirmed = bool(
+        timed_out and all_started and all_open_collective and same_collective
+    )
+    failure_reasons: list[str] = []
+    if not all_started:
+        failure_reasons.append("not_all_ranks_execute_started")
+    if not all_ended:
+        failure_reasons.append("not_all_ranks_execute_ended")
+    if error_count:
+        failure_reasons.append("phase_errors")
+    if open_phase_count:
+        failure_reasons.append("open_phases")
+    if timed_out:
+        failure_reasons.append("timed_out")
+    if collective_stall_confirmed:
+        failure_reasons.append("collective_stall_confirmed")
     return {
-        "all_ranks_execute_ended": len(execute_ended) == world_size,
+        "all_ranks_execute_ended": all_ended,
         "all_ranks_execute_started": all_started,
-        "collective_stall_confirmed": bool(
-            timed_out and all_started and all_open_collective and same_collective
-        ),
+        "collective_stall_confirmed": collective_stall_confirmed,
+        "error_count": error_count,
+        "failure_reasons": failure_reasons,
         "latest_open_phases": latest_open,
+        "open_phase_count": open_phase_count,
         "ranks": rank_reports,
+        "result": "PASS" if not failure_reasons else "FAIL",
         "timed_out": timed_out,
         "world_size": world_size,
     }
 
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--log", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -133,7 +172,8 @@ def main() -> None:
         json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     print(json.dumps(report, sort_keys=True))
+    return 0 if report["result"] == "PASS" else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

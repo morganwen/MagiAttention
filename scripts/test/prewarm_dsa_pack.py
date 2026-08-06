@@ -24,6 +24,14 @@ from magi_attention.kernel.cutedsl.dsa_pack import (
     export_dsa_pack_aot,
     reduce_dsa_rows,
 )
+from scripts.test.dsa_pack_aot_manifest import COPY_SPECS, REDUCE_SPECS
+
+_TORCH_DTYPES = {
+    "bf16": torch.bfloat16,
+    "f32": torch.float32,
+    "i32": torch.int32,
+}
+_DTYPE_TAGS = {dtype: tag for tag, dtype in _TORCH_DTYPES.items()}
 
 
 def _prewarm_copy(dtype: torch.dtype, width: int) -> None:
@@ -60,21 +68,8 @@ def _prewarm_reduce(dtype: torch.dtype, width: int) -> None:
 def main() -> None:
     if torch.cuda.get_device_capability() != (10, 3):
         raise RuntimeError("Magi-DSA CuTe prewarm requires B300 SM103")
-    copy_specs = (
-        (torch.bfloat16, 8),
-        (torch.bfloat16, 128),
-        (torch.bfloat16, 512),
-        (torch.bfloat16, 4096),
-        (torch.bfloat16, 8256),
-        (torch.int32, 4),
-        (torch.int32, 516),
-    )
-    reduce_specs = (
-        (torch.bfloat16, 8),
-        (torch.bfloat16, 128),
-        (torch.bfloat16, 512),
-        (torch.bfloat16, 4096),
-    )
+    copy_specs = tuple((_TORCH_DTYPES[tag], width) for tag, width in COPY_SPECS)
+    reduce_specs = tuple((_TORCH_DTYPES[tag], width) for tag, width in REDUCE_SPECS)
     output_dir = os.environ.get("MAGI_DSA_CUTE_AOT_OUTPUT_DIR")
     if output_dir:
         os.environ["MAGI_DSA_CUTE_AOT_DIR"] = output_dir
@@ -85,7 +80,7 @@ def main() -> None:
             if not output_dir
             else os.path.join(
                 output_dir,
-                f"copy_sm103_{'bf16' if dtype == torch.bfloat16 else 'i32'}_w{width}.o",
+                f"copy_sm103_{_DTYPE_TAGS[dtype]}_w{width}.o",
             )
         )
         _prewarm_copy(dtype, width)
@@ -100,7 +95,10 @@ def main() -> None:
         expected_path = (
             None
             if not output_dir
-            else os.path.join(output_dir, f"reduce_sm103_bf16_w{width}.o")
+            else os.path.join(
+                output_dir,
+                f"reduce_sm103_{_DTYPE_TAGS[dtype]}_w{width}.o",
+            )
         )
         _prewarm_reduce(dtype, width)
         if (

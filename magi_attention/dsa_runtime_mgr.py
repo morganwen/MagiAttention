@@ -23,17 +23,18 @@ from typing import TYPE_CHECKING, Iterator
 import torch
 import torch.distributed as dist
 
-from magi_attention.dsa_config import DsaPlanPolicy, MagiDSAConfig
+from magi_attention.dsa_config import (
+    DsaPlanPolicy,
+    DsaSharedLayoutConfig,
+    DsaStructuralLayoutConfig,
+    MagiDSAConfig,
+)
 from magi_attention.dsa_types import (
     MagiDSAForwardResult,
     MagiDSAInput,
     MagiDSAPackedMeta,
 )
-from magi_attention.functional.dsa_comm import (
-    restore_dsa_bijective_tensor,
-    route_dsa_tensor,
-    route_dsa_tensor_no_grad,
-)
+from magi_attention.functional.dsa_comm import layout_dsa_hidden, route_dsa_tensor
 from magi_attention.functional.dsa_packing import (
     DsaDeviceRankPlan,
     DsaDeviceRoutePlan,
@@ -72,6 +73,12 @@ class DsaExecutionHandle:
     world_size: int
     device: torch.device
     local_token_capacity: int
+    sparse_backward_stream: torch.cuda.Stream | None
+    csa_main_stream: torch.cuda.Stream | None
+    csa_indexer_stream: torch.cuda.Stream | None
+    csa_route_stream: torch.cuda.Stream | None
+    hca_main_stream: torch.cuda.Stream | None
+    hca_route_stream: torch.cuda.Stream | None
 
     @property
     def plan_hash(self) -> str:
@@ -92,10 +99,32 @@ class MagiDSARuntimeMgr:
         cp_group: dist.ProcessGroup | None = None,
         *,
         policy: DsaPlanPolicy = "indexer_balanced",
+        shared_layout_config: DsaSharedLayoutConfig | None = None,
+        structural_layout_config: DsaStructuralLayoutConfig | None = None,
         max_cached_handles: int = 4,
     ) -> None:
-        if policy not in ("sequential", "indexer_balanced"):
-            raise ValueError("DSA policy must be sequential or indexer_balanced")
+        if policy not in (
+            "sequential",
+            "indexer_balanced",
+            "shared_greedy",
+            "structural_balanced",
+        ):
+            raise ValueError(
+                "DSA policy must be sequential, indexer_balanced, shared_greedy, "
+                "or structural_balanced"
+            )
+        if policy == "shared_greedy" and shared_layout_config is None:
+            raise ValueError("shared_greedy requires an explicit shared_layout_config")
+        if policy != "shared_greedy" and shared_layout_config is not None:
+            raise ValueError("shared_layout_config is only valid for shared_greedy")
+        if policy == "structural_balanced" and structural_layout_config is None:
+            raise ValueError(
+                "structural_balanced requires an explicit structural_layout_config"
+            )
+        if policy != "structural_balanced" and structural_layout_config is not None:
+            raise ValueError(
+                "structural_layout_config is only valid for structural_balanced"
+            )
         if max_cached_handles <= 0:
             raise ValueError("max_cached_handles must be positive")
         if cp_group is None:
@@ -111,6 +140,8 @@ class MagiDSARuntimeMgr:
         self.config = config
         self.cp_group = cp_group
         self.policy = policy
+        self.shared_layout_config = shared_layout_config
+        self.structural_layout_config = structural_layout_config
         self.max_cached_handles = max_cached_handles
         self._identity = id(self)
         self._handle_cache: OrderedDict[
@@ -147,6 +178,12 @@ class MagiDSARuntimeMgr:
             warm_invocations=self._warm_invocations,
         )
 
+    @property
+    def runtime_identity(self) -> int:
+        """Opaque identity used to reject handles from another runtime."""
+
+        return self._identity
+
     def clear_handle_cache(self) -> None:
         self._handle_cache.clear()
 
@@ -156,6 +193,16 @@ class MagiDSARuntimeMgr:
                 "config": asdict(self.config),
                 "cu_seqlens": packed_meta.cu_seqlens,
                 "policy": self.policy,
+                "shared_layout_config": (
+                    None
+                    if self.shared_layout_config is None
+                    else asdict(self.shared_layout_config)
+                ),
+                "structural_layout_config": (
+                    None
+                    if self.structural_layout_config is None
+                    else asdict(self.structural_layout_config)
+                ),
                 "world_size": self.world_size,
             }
         )
@@ -211,6 +258,8 @@ class MagiDSARuntimeMgr:
                 packed_meta.cu_seqlens,
                 local_counts,
                 policy=self.policy,
+                shared_layout_config=self.shared_layout_config,
+                structural_layout_config=self.structural_layout_config,
             )
         payload: list[DsaExecutionPlan | None]
         if self.rank == 0:
@@ -221,6 +270,8 @@ class MagiDSARuntimeMgr:
                     packed_meta.cu_seqlens,
                     local_counts,
                     policy=self.policy,
+                    shared_layout_config=self.shared_layout_config,
+                    structural_layout_config=self.structural_layout_config,
                 )
             ]
         else:
@@ -271,37 +322,15 @@ class MagiDSARuntimeMgr:
     def _health_check(self, handle: DsaExecutionHandle) -> None:
         device_plan = handle.device_plan
         routes = (
+            device_plan.token_layout_route,
             device_plan.window_route,
             device_plan.overlap_x_route,
             device_plan.compressed_kv_route,
             device_plan.compressed_ki_route,
-            device_plan.indexer_qw_route,
         )
         for route in routes:
             if route is not None:
                 self._health_check_route(route)
-        query_route = device_plan.indexer_qw_route
-        if query_route is not None:
-            rank_plan = handle.plan.rank_plans[handle.rank]
-            query_ids = (
-                torch.arange(
-                    rank_plan.local_global_begin,
-                    rank_plan.local_global_end,
-                    dtype=torch.int32,
-                    device=handle.device,
-                )
-                .unsqueeze(1)
-                .expand(-1, 4)
-                .contiguous()
-            )
-            worker_ids = route_dsa_tensor_no_grad(query_ids, query_route, self.cp_group)
-            restored = restore_dsa_bijective_tensor(
-                worker_ids, query_route, self.cp_group
-            )
-            if not torch.equal(restored, query_ids):
-                raise RuntimeError(
-                    "INDEXER_AUX inverse-permutation health check failed"
-                )
         torch.cuda.synchronize(handle.device)
         self._health_checks += 1
 
@@ -339,6 +368,13 @@ class MagiDSARuntimeMgr:
             return cached
 
         plan = self._build_and_broadcast_plan(packed_meta, local_counts)
+        if any(
+            query_count > capacity
+            for query_count, capacity in zip(plan.query_token_counts, capacities)
+        ):
+            raise ValueError(
+                "a final Query token count exceeds its declared execution capacity"
+            )
         device_plan = make_dsa_device_rank_plan(
             plan, self.rank, self.config, resolved_device
         )
@@ -352,6 +388,36 @@ class MagiDSARuntimeMgr:
             world_size=self.world_size,
             device=resolved_device,
             local_token_capacity=local_token_capacity,
+            sparse_backward_stream=(
+                torch.cuda.Stream(device=resolved_device)
+                if self.config.ratio == 4
+                else None
+            ),
+            csa_main_stream=(
+                torch.cuda.Stream(device=resolved_device)
+                if self.config.ratio == 4
+                else None
+            ),
+            csa_indexer_stream=(
+                torch.cuda.Stream(device=resolved_device)
+                if self.config.ratio == 4
+                else None
+            ),
+            csa_route_stream=(
+                torch.cuda.Stream(device=resolved_device)
+                if self.config.ratio == 4
+                else None
+            ),
+            hca_main_stream=(
+                torch.cuda.Stream(device=resolved_device, priority=-1)
+                if self.config.ratio == 128
+                else None
+            ),
+            hca_route_stream=(
+                torch.cuda.Stream(device=resolved_device, priority=-1)
+                if self.config.ratio == 128
+                else None
+            ),
         )
         if health_check:
             self._health_check(handle)
@@ -376,10 +442,10 @@ class MagiDSARuntimeMgr:
             )
         if (
             dsa_input.packed_meta.local_token_count
-            != handle.device_plan.local_token_count
+            != handle.device_plan.source_token_count
         ):
             raise ValueError(
-                "input local token count does not match the frozen rank plan"
+                "input source token count does not match the frozen rank plan"
             )
         tensors = (
             dsa_input.x,
@@ -390,6 +456,50 @@ class MagiDSARuntimeMgr:
         )
         if any(tensor.device != handle.device for tensor in tensors):
             raise ValueError("all Magi-DSA inputs must be on the handle device")
+
+    def layout_hidden(
+        self,
+        source_x: torch.Tensor,
+        handle: DsaExecutionHandle,
+    ) -> torch.Tensor:
+        """Apply the model-boundary TOKEN_LAYOUT before local projections."""
+
+        if handle.runtime_identity != self._identity:
+            raise ValueError(
+                "execution handle belongs to a different MagiDSARuntimeMgr"
+            )
+        if source_x.device != handle.device:
+            raise ValueError("source hidden state is on the wrong device")
+        if (
+            source_x.ndim != 2
+            or source_x.shape[0] != handle.device_plan.source_token_count
+            or source_x.shape[1] != self.config.hidden_size
+            or source_x.dtype != torch.bfloat16
+            or not source_x.is_contiguous()
+        ):
+            raise ValueError(
+                "source hidden state must be contiguous owner-local CUDA BF16"
+            )
+        route = handle.device_plan.token_layout_route
+        if route is None:
+            if (
+                handle.device_plan.source_token_count
+                != handle.device_plan.local_token_count
+            ):
+                raise RuntimeError("a changed Query layout is missing TOKEN_LAYOUT")
+            return source_x
+        return layout_dsa_hidden(source_x, route, self.cp_group)
+
+    def get_position_ids(self, handle: DsaExecutionHandle) -> torch.Tensor:
+        """Return resident sample-relative positions in final Query-row order."""
+
+        if handle.runtime_identity != self._identity:
+            raise ValueError(
+                "execution handle belongs to a different MagiDSARuntimeMgr"
+            )
+        if handle.rank != self.rank or handle.world_size != self.world_size:
+            raise ValueError("execution handle CP identity does not match the runtime")
+        return handle.device_plan.local_q_positions
 
     def calc_dsa(
         self,

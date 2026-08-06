@@ -67,6 +67,7 @@ timeout --signal=TERM --kill-after=5s 1800s docker build \
 docker image inspect "$image_tag" --format '{{.Id}} {{json .Config.Labels}}'
 timeout --signal=TERM --kill-after=5s 60s docker run --rm \
     --entrypoint python3 \
-    --workdir /tmp \
+    --env PYTHONSAFEPATH=1 \
+    --workdir /opt \
     "$image_tag" \
-    -c 'import os; from importlib import metadata; from pathlib import Path; import magi_attention; from magi_attention.dsa_layer import MagiDSALayer; from magi_attention.dsa_runtime_mgr import MagiDSARuntimeMgr; assert metadata.version("magi-attention") == "1.1.1+g" + os.environ["MAGI_DSA_SOURCE_REVISION"]; assert set(Path(magi_attention.__file__).parts).intersection({"site-packages", "dist-packages"}); print(metadata.version("magi-attention")); print(magi_attention.__file__); print(MagiDSALayer.__name__, MagiDSARuntimeMgr.__name__)'
+    -c 'import os; from importlib import metadata; from pathlib import Path; import magi_attention; from magi_attention.dsa_layer import MagiDSALayer; from magi_attention.dsa_runtime_mgr import MagiDSARuntimeMgr; assert metadata.version("magi-attention") == "1.1.1+g" + os.environ["MAGI_DSA_SOURCE_REVISION"]; assert metadata.version("packaging") == "25.0"; assert metadata.version("pytest") == "8.4.2"; assert set(Path(magi_attention.__file__).parts).intersection({"site-packages", "dist-packages"}); print(metadata.version("magi-attention")); print(metadata.version("packaging")); print(metadata.version("pytest")); print(magi_attention.__file__); print(MagiDSALayer.__name__, MagiDSARuntimeMgr.__name__)'

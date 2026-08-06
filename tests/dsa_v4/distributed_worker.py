@@ -16,37 +16,93 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import importlib
 import json
 import os
+import tempfile
 import time
 import traceback
+from dataclasses import asdict
 from datetime import timedelta
 from importlib import metadata as package_metadata
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
-import torch
-import torch.distributed as dist
 
-from magi_attention.dsa_config import DsaPlanPolicy, DsaRatio, MagiDSAConfig
-from magi_attention.dsa_layer import MagiDSALayer
-from magi_attention.dsa_runtime_mgr import DsaExecutionHandle, MagiDSARuntimeMgr
-from magi_attention.dsa_types import (
+def _configure_rank_local_caches() -> dict[str, str]:
+    cache_root_value = os.environ.get("MAGI_DSA_RANK_CACHE_ROOT")
+    if not cache_root_value:
+        return {}
+    rank_value = os.environ.get("RANK")
+    local_rank_value = os.environ.get("LOCAL_RANK")
+    if rank_value is None or local_rank_value is None:
+        raise RuntimeError("rank-local cache setup requires RANK and LOCAL_RANK")
+    rank = int(rank_value)
+    local_rank = int(local_rank_value)
+    root = Path(cache_root_value) / f"rank{rank}_local{local_rank}"
+    cache_paths = {
+        "QUACK_CACHE_DIR": root / "quack",
+        "TEMP": root / "tmp",
+        "TMP": root / "tmp",
+        "TMPDIR": root / "tmp",
+        "TORCH_EXTENSIONS_DIR": root / "torch-extensions",
+        "TORCH_HOME": root / "torch-home",
+        "TORCHINDUCTOR_CACHE_DIR": root / "torchinductor",
+        "TRITON_CACHE_DIR": root / "triton",
+        "XDG_CACHE_HOME": root / "xdg",
+    }
+    for directory in set(cache_paths.values()):
+        directory.mkdir(parents=True, exist_ok=True)
+    for variable, directory in cache_paths.items():
+        os.environ[variable] = str(directory)
+    # The worker configures TMPDIR before importing compiler stacks. Resetting
+    # this module cache also protects against an earlier stdlib temp lookup.
+    tempfile.tempdir = None
+    return {variable: str(path) for variable, path in cache_paths.items()}
+
+
+_RANK_LOCAL_CACHE_PATHS = _configure_rank_local_caches()
+
+# These imports are intentionally delayed until rank-local compiler caches exist.
+# isort: off
+import torch  # noqa: E402
+import torch.distributed as dist  # noqa: E402
+
+from magi_attention.dsa_config import (  # noqa: E402
+    DsaPlanPolicy,
+    DsaRatio,
+    DsaSharedLayoutConfig,
+    DsaStructuralLayoutConfig,
+    MagiDSAConfig,
+)
+from magi_attention.dsa_layer import MagiDSALayer  # noqa: E402
+from magi_attention.dsa_model_adapter import layout_and_project_dsa_input  # noqa: E402
+from magi_attention.dsa_nvtx import dsa_nvtx_range  # noqa: E402
+from magi_attention.dsa_pro_runtime_mgr import MagiDSAProRuntimeMgr  # noqa: E402
+from magi_attention.dsa_runtime_mgr import (  # noqa: E402
+    DsaExecutionHandle,
+    MagiDSARuntimeMgr,
+)
+from magi_attention.dsa_types import (  # noqa: E402
     MagiDSAForwardResult,
     MagiDSAInput,
     MagiDSAPackedMeta,
 )
-from magi_attention.functional.dsa_comm import (
-    restore_dsa_bijective_tensor,
-    route_dsa_tensor,
-    route_dsa_tensor_no_grad,
+from magi_attention.functional.dsa_comm import (  # noqa: E402
+    finish_dsa_tensor_route,
+    start_dsa_tensor_route,
+    unlayout_dsa_query_tensor,
 )
-from magi_attention.functional.dsa_phase import dsa_phase
-from magi_attention.functional.dsa_reference import (
+from magi_attention.functional.dsa_phase import dsa_phase  # noqa: E402
+from magi_attention.functional.dsa_reference import (  # noqa: E402
+    assert_backend_native_topk_outputs_close,
     dsa_reference,
-    validate_canonical_topk,
+    validate_backend_native_topk,
+    validate_backend_native_topk_pair,
 )
+
+# isort: on
 
 _CP2_CU_SEQLENS = (0, 13, 32)
 _CP2_LOCAL_COUNTS = (15, 17)
@@ -106,6 +162,29 @@ def _cp2_record(event: str, **fields: object) -> None:
         with path.open("a", encoding="utf-8") as output:
             output.write(json.dumps(payload, sort_keys=True) + "\n")
     print(f"MAGI_DSA_CP2 {json.dumps(payload, sort_keys=True)}", flush=True)
+
+
+def _worker_device_metadata(rank: int, local_rank: int) -> dict[str, object]:
+    current_device = int(torch.cuda.current_device())
+    properties = torch.cuda.get_device_properties(current_device)
+    raw_uuid = getattr(properties, "uuid", None)
+    if raw_uuid is None:
+        raise RuntimeError("CUDA device properties do not expose a device UUID")
+    if isinstance(raw_uuid, (bytes, bytearray)):
+        device_uuid = bytes(raw_uuid).hex()
+    else:
+        device_uuid = str(raw_uuid)
+    if not device_uuid:
+        raise RuntimeError("CUDA device UUID is empty")
+    return {
+        "cache_paths": dict(_RANK_LOCAL_CACHE_PATHS),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "current_device": current_device,
+        "device_name": properties.name,
+        "device_uuid": device_uuid,
+        "local_rank": local_rank,
+        "rank": rank,
+    }
 
 
 def _save_rank_report(report: dict[str, object]) -> None:
@@ -245,13 +324,9 @@ def _small_config() -> MagiDSAConfig:
 
 
 def _cp2_backend_config() -> MagiDSAConfig:
-    """Keep fixed backend dimensions while reducing only the CP2 model trunk."""
+    """Use the complete frozen DeepSeek-V4-Pro schema for CP2 correctness."""
 
-    return MagiDSAConfig(
-        ratio=4,
-        hidden_size=128,
-        q_lora_rank=128,
-    )
+    return MagiDSAConfig(ratio=4)
 
 
 def _run_route_smoke(rank: int, world_size: int) -> dict[str, object]:
@@ -265,45 +340,70 @@ def _run_route_smoke(rank: int, world_size: int) -> dict[str, object]:
     handle = runtime.prepare_execution(
         meta,
         torch.device("cuda", rank),
-        local_token_capacity=max(local_count, 1),
+        local_token_capacity=max(local_count, 16),
     )
-    route = handle.device_plan.indexer_qw_route
+    route = handle.device_plan.token_layout_route
     if route is None:
-        raise RuntimeError("CSA smoke plan has no INDEXER_QW route")
+        raise RuntimeError("CSA smoke plan has no TOKEN_LAYOUT route")
     rank_plan = handle.plan.rank_plans[rank]
     global_ids = torch.arange(
-        rank_plan.local_global_begin,
-        rank_plan.local_global_end,
-        dtype=torch.int32,
+        rank_plan.source_global_begin,
+        rank_plan.source_global_end,
+        dtype=torch.float32,
         device="cuda",
     )
-    int_payload = global_ids.unsqueeze(1).expand(-1, 4).contiguous()
-    worker_payload = route_dsa_tensor_no_grad(int_payload, route, dist.group.WORLD)
-    expected_worker = route.consumer_global_rows.unsqueeze(1).expand(-1, 4)
-    if not torch.equal(worker_payload, expected_worker):
-        raise AssertionError("forward INDEXER_QW permutation does not match global IDs")
-    restored = restore_dsa_bijective_tensor(worker_payload, route, dist.group.WORLD)
-    if not torch.equal(restored, int_payload):
-        raise AssertionError("INDEXER_AUX restore is not the inverse query permutation")
-
-    differentiable = (
+    source_x = (
         global_ids.to(torch.bfloat16)
         .unsqueeze(1)
-        .expand(-1, 8)
+        .expand(-1, runtime.config.hidden_size)
         .contiguous()
         .requires_grad_(True)
     )
-    worker_float = route_dsa_tensor(differentiable, route, dist.group.WORLD)
-    gradient = torch.autograd.grad(worker_float.float().sum(), differentiable)[0]
-    if not torch.equal(gradient, torch.ones_like(differentiable)):
-        raise AssertionError("query permutation backward is not a global bijection")
+    local_x = runtime.layout_hidden(source_x, handle)
+    expected_local = route.consumer_global_rows.to(torch.bfloat16).unsqueeze(1)
+    expected_local = expected_local.expand(-1, runtime.config.hidden_size)
+    if not torch.equal(local_x, expected_local):
+        raise AssertionError("TOKEN_LAYOUT does not match final Query global rows")
+    source_order = unlayout_dsa_query_tensor(local_x.detach(), route, dist.group.WORLD)
+    expected_source = global_ids.to(torch.bfloat16).unsqueeze(1)
+    expected_source = expected_source.expand(-1, runtime.config.hidden_size)
+    if not torch.equal(source_order, expected_source):
+        raise AssertionError("diagnostic unlayout does not restore source-owner rows")
+    gradient = torch.autograd.grad(local_x.float().sum(), source_x)[0]
+    if not torch.equal(gradient, torch.ones_like(source_x)):
+        raise AssertionError("TOKEN_LAYOUT backward is not a global bijection")
+
+    first_source = source_x.detach().clone().requires_grad_(True)
+    second_source = (source_x.detach() + 1).contiguous().requires_grad_(True)
+    first_transfer = start_dsa_tensor_route(first_source, route, dist.group.WORLD)
+    second_transfer = start_dsa_tensor_route(second_source, route, dist.group.WORLD)
+    if first_transfer.received.data_ptr() == second_transfer.received.data_ptr():
+        raise AssertionError("two in-flight routes reused one receive buffer")
+    first_local = finish_dsa_tensor_route(first_transfer)
+    second_local = finish_dsa_tensor_route(second_transfer)
+    if not torch.equal(first_local, expected_local):
+        raise AssertionError("the first in-flight route returned incorrect rows")
+    if not torch.equal(second_local, expected_local + 1):
+        raise AssertionError("the second in-flight route returned incorrect rows")
+    accumulated_loss = first_local.float().sum() + second_local.float().sum()
+    accumulated_loss.backward(retain_graph=True)
+    accumulated_loss.backward()
+    for source in (first_source, second_source):
+        if source.grad is None or not torch.equal(
+            source.grad, torch.full_like(source, 2)
+        ):
+            raise AssertionError(
+                "reentrant route backward did not accumulate gradients"
+            )
     torch.cuda.synchronize()
     counters = runtime.counters
     if counters.health_checks != 1 or counters.device_materializations != 1:
         raise AssertionError("cold route health check/materialization count mismatch")
     return {
-        "consumer_rows": route.consumer_row_count,
-        "local_rows": local_count,
+        "case": "smoke",
+        "final_query_rows": route.consumer_row_count,
+        "source_rows": local_count,
+        "two_inflight_reentrant": True,
         "object_collectives": counters.object_collective_invocations,
         "plan_hash": handle.plan_hash,
         "rank": rank,
@@ -339,6 +439,26 @@ def _global_inputs(
     total_tokens: int = _CP2_CU_SEQLENS[-1],
     seed: int = 411,
 ) -> tuple[torch.Tensor, ...]:
+    global_x, sink = _global_source(config, total_tokens=total_tokens, seed=seed)
+    global_x.requires_grad_(requires_grad)
+    positions = _packed_position_ids((0, total_tokens), device=global_x.device)
+    global_qr, global_q, global_kv = _project_test_dsa_inputs(
+        global_x, positions, config
+    )
+    sink.requires_grad_(requires_grad)
+    projected = (global_qr, global_q, global_kv)
+    if requires_grad:
+        for tensor in projected:
+            tensor.retain_grad()
+    return (global_x, *projected, sink)
+
+
+def _global_source(
+    config: MagiDSAConfig,
+    *,
+    total_tokens: int,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
     torch.manual_seed(seed)
     global_x = torch.randn(
         total_tokens,
@@ -346,44 +466,57 @@ def _global_inputs(
         device="cuda",
         dtype=torch.bfloat16,
     )
-    global_qr = torch.randn(
-        total_tokens,
-        config.q_lora_rank,
-        device="cuda",
-        dtype=torch.bfloat16,
-    )
-    global_q = (
-        torch.randn(
-            total_tokens,
-            config.num_query_heads,
-            config.head_dim,
-            device="cuda",
-            dtype=torch.bfloat16,
-        )
-        * 0.25
-    )
-    global_kv = (
-        torch.randn(
-            total_tokens,
-            config.head_dim,
-            device="cuda",
-            dtype=torch.bfloat16,
-        )
-        * 0.25
-    )
     sink = torch.randn(
         config.num_query_heads,
         device="cuda",
         dtype=torch.float32,
     ).contiguous()
-    tensors = (global_x, global_qr, global_q, global_kv)
-    if requires_grad:
-        tensors = tuple(value.requires_grad_(True) for value in tensors)
-        sink = sink.requires_grad_(True)
-    return (*tensors, sink)
+    return global_x, sink
 
 
-def _owner_input(
+def _packed_position_ids(
+    cu_seqlens: tuple[int, ...], *, device: torch.device
+) -> torch.Tensor:
+    return torch.cat(
+        tuple(
+            torch.arange(end - begin, dtype=torch.int32, device=device)
+            for begin, end in zip(cu_seqlens, cu_seqlens[1:])
+        )
+    )
+
+
+def _repeat_feature(source: torch.Tensor, width: int) -> torch.Tensor:
+    if width <= source.shape[1]:
+        return source[:, :width].clone(memory_format=torch.contiguous_format)
+    repeats = (width + source.shape[1] - 1) // source.shape[1]
+    return source.repeat(1, repeats)[:, :width].contiguous()
+
+
+def _project_test_dsa_inputs(
+    local_x: torch.Tensor,
+    position_ids: torch.Tensor,
+    config: MagiDSAConfig,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Deterministic parameter-free model projection used only by test workers."""
+
+    if position_ids.shape != (local_x.shape[0],):
+        raise ValueError("test projector received invalid final-local position IDs")
+    with dsa_nvtx_range("model_projection::test_qr", enabled=local_x.is_cuda):
+        qr = _repeat_feature(local_x, config.q_lora_rank)
+    with dsa_nvtx_range("model_projection::test_q", enabled=local_x.is_cuda):
+        q_base = _repeat_feature(local_x, config.head_dim)
+        q = (
+            q_base.unsqueeze(1)
+            .expand(-1, config.num_query_heads, -1)
+            .contiguous()
+            .mul_(0.25)
+        )
+    with dsa_nvtx_range("model_projection::test_kv", enabled=local_x.is_cuda):
+        latent_kv = _repeat_feature(local_x, config.head_dim).mul_(0.25)
+    return qr, q, latent_kv
+
+
+def _owner_source(
     config: MagiDSAConfig,
     rank: int,
     world_size: int,
@@ -392,56 +525,208 @@ def _owner_input(
     cu_seqlens: tuple[int, ...] = _CP2_CU_SEQLENS,
     local_counts: tuple[int, ...] = _CP2_LOCAL_COUNTS,
     seed: int = 411,
-) -> tuple[MagiDSAInput, tuple[torch.Tensor, ...]]:
+) -> tuple[torch.Tensor, torch.Tensor, MagiDSAPackedMeta]:
     begin, end = _owner_bounds(rank, world_size, local_counts)
-    global_tensors = _global_inputs(
+    global_x, global_sink = _global_source(
         config,
-        requires_grad=False,
         total_tokens=cu_seqlens[-1],
         seed=seed,
     )
-    tensors = tuple(
-        value[begin:end].clone().contiguous().requires_grad_(requires_grad)
-        for value in global_tensors[:-1]
-    )
-    sink = global_tensors[-1].clone().contiguous().requires_grad_(requires_grad)
-
+    source_x = global_x[begin:end].clone().contiguous().requires_grad_(requires_grad)
+    sink = global_sink.clone().contiguous().requires_grad_(requires_grad)
     meta = MagiDSAPackedMeta(cu_seqlens, end - begin)
-    dsa_input = MagiDSAInput(
-        tensors[0],
-        tensors[1],
-        tensors[2],
-        tensors[3],
+    return source_x, sink, meta
+
+
+def _materialize_owner_input(
+    source_x: torch.Tensor,
+    sink: torch.Tensor,
+    packed_meta: MagiDSAPackedMeta,
+    runtime: MagiDSARuntimeMgr,
+    handle: DsaExecutionHandle,
+) -> tuple[MagiDSAInput, tuple[torch.Tensor, ...]]:
+    config = runtime.config
+
+    def projector(
+        local_x: torch.Tensor, position_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return _project_test_dsa_inputs(local_x, position_ids, config)
+
+    dsa_input = layout_and_project_dsa_input(
+        source_x,
         sink,
-        meta,
+        packed_meta,
+        runtime,
+        handle,
+        projector,
     )
-    return dsa_input, (*tensors, sink)
+    if source_x.requires_grad:
+        for tensor in (dsa_input.qr, dsa_input.q, dsa_input.latent_kv):
+            tensor.retain_grad()
+    return dsa_input, (
+        source_x,
+        dsa_input.qr,
+        dsa_input.q,
+        dsa_input.latent_kv,
+        sink,
+    )
 
 
 def _runtime_result(
     layer: MagiDSALayer,
-    dsa_input: MagiDSAInput,
+    source_x: torch.Tensor,
+    sink: torch.Tensor,
+    packed_meta: MagiDSAPackedMeta,
     policy: DsaPlanPolicy,
-) -> tuple[MagiDSAForwardResult, MagiDSARuntimeMgr]:
-    runtime, handle = _prepare_runtime(layer, dsa_input, policy)
-    return runtime.calc_dsa(layer, dsa_input, handle), runtime
+) -> tuple[MagiDSAForwardResult, MagiDSARuntimeMgr, DsaExecutionHandle]:
+    runtime, handle = _prepare_runtime(layer, packed_meta, source_x.device, policy)
+    dsa_input, _ = _materialize_owner_input(
+        source_x, sink, packed_meta, runtime, handle
+    )
+    return runtime.calc_dsa(layer, dsa_input, handle), runtime, handle
 
 
 def _prepare_runtime(
     layer: MagiDSALayer,
-    dsa_input: MagiDSAInput,
+    packed_meta: MagiDSAPackedMeta,
+    device: torch.device,
     policy: DsaPlanPolicy,
     *,
     health_check: bool = False,
+    shared_layout_config: DsaSharedLayoutConfig | None = None,
+    structural_layout_config: DsaStructuralLayoutConfig | None = None,
 ) -> tuple[MagiDSARuntimeMgr, DsaExecutionHandle]:
-    runtime = MagiDSARuntimeMgr(layer.config, dist.group.WORLD, policy=policy)
+    if policy == "structural_balanced" and structural_layout_config is None:
+        structural_layout_config = DsaStructuralLayoutConfig()
+    runtime = MagiDSARuntimeMgr(
+        layer.config,
+        dist.group.WORLD,
+        policy=policy,
+        shared_layout_config=shared_layout_config,
+        structural_layout_config=structural_layout_config,
+    )
+    final_query_capacity = (
+        packed_meta.cu_seqlens[-1]
+        if policy == "shared_greedy"
+        else (packed_meta.cu_seqlens[-1] + dist.get_world_size() - 1)
+        // dist.get_world_size()
+    )
     handle = runtime.prepare_execution(
-        dsa_input.packed_meta,
-        dsa_input.x.device,
-        local_token_capacity=dsa_input.packed_meta.local_token_count,
+        packed_meta,
+        device,
+        local_token_capacity=max(
+            packed_meta.local_token_count,
+            final_query_capacity,
+        ),
         health_check=health_check,
     )
     return runtime, handle
+
+
+def _plan_evidence(handle: DsaExecutionHandle) -> dict[str, object]:
+    plan = handle.plan
+    rank_plan = plan.rank_plans[handle.rank]
+    rank_layout_payload = {
+        "local_q_positions": rank_plan.local_q_positions,
+        "local_q_sample_ids": rank_plan.local_q_sample_ids,
+        "local_query_global_rows": rank_plan.local_query_global_rows,
+        "query_fragments": [asdict(fragment) for fragment in rank_plan.query_fragments],
+        "token_layout_route": (
+            None
+            if rank_plan.token_layout_route is None
+            else asdict(rank_plan.token_layout_route)
+        ),
+    }
+    rank_layout_signature = hashlib.sha256(
+        json.dumps(
+            rank_layout_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    structural_metrics: dict[str, object] | None = None
+    structural_rank_cost: dict[str, object] | None = None
+    if plan.policy == "structural_balanced":
+        if plan.layout_metrics is None or plan.structural_layout_config is None:
+            raise AssertionError("structural plan evidence is incomplete")
+        structural_metrics = asdict(plan.layout_metrics)
+        rank_costs = structural_metrics.get("rank_costs")
+        if (
+            not isinstance(rank_costs, (list, tuple))
+            or len(rank_costs) != handle.world_size
+        ):
+            raise AssertionError("structural rank-cost evidence is incomplete")
+        rank_cost = rank_costs[handle.rank]
+        if not isinstance(rank_cost, dict):
+            raise TypeError("structural rank-cost evidence must be a dictionary")
+        structural_rank_cost = rank_cost
+    return {
+        "declared_local_token_capacity": handle.local_token_capacity,
+        "fragment_count": len(rank_plan.query_fragments),
+        "local_query_tokens": rank_plan.local_token_count,
+        "local_source_tokens": rank_plan.source_token_count,
+        "plan_hash": plan.plan_hash,
+        "policy": plan.policy,
+        "query_layout_hash": plan.query_layout_hash,
+        "query_token_counts": list(plan.query_token_counts),
+        "rank_query_layout_signature": rank_layout_signature,
+        "ratio": plan.ratio,
+        "source_token_counts": list(plan.source_token_counts),
+        "structural_layout_config": (
+            None
+            if plan.structural_layout_config is None
+            else asdict(plan.structural_layout_config)
+        ),
+        "structural_layout_metrics": structural_metrics,
+        "structural_rank_cost": structural_rank_cost,
+    }
+
+
+def _prepare_owner_case(
+    layer: MagiDSALayer,
+    rank: int,
+    world_size: int,
+    policy: DsaPlanPolicy,
+    *,
+    requires_grad: bool,
+    cu_seqlens: tuple[int, ...] = _CP2_CU_SEQLENS,
+    local_counts: tuple[int, ...] = _CP2_LOCAL_COUNTS,
+    seed: int = 411,
+    health_check: bool = False,
+    shared_layout_config: DsaSharedLayoutConfig | None = None,
+    structural_layout_config: DsaStructuralLayoutConfig | None = None,
+) -> tuple[
+    MagiDSAInput,
+    tuple[torch.Tensor, ...],
+    MagiDSARuntimeMgr,
+    DsaExecutionHandle,
+]:
+    source_x, sink, packed_meta = _owner_source(
+        layer.config,
+        rank,
+        world_size,
+        requires_grad=requires_grad,
+        cu_seqlens=cu_seqlens,
+        local_counts=local_counts,
+        seed=seed,
+    )
+    runtime, handle = _prepare_runtime(
+        layer,
+        packed_meta,
+        source_x.device,
+        policy,
+        health_check=health_check,
+        shared_layout_config=shared_layout_config,
+        structural_layout_config=structural_layout_config,
+    )
+    dsa_input, input_tensors = _materialize_owner_input(
+        source_x,
+        sink,
+        packed_meta,
+        runtime,
+        handle,
+    )
+    return dsa_input, input_tensors, runtime, handle
 
 
 def _max_abs(actual: torch.Tensor, expected: torch.Tensor) -> float:
@@ -455,15 +740,103 @@ def _max_abs(actual: torch.Tensor, expected: torch.Tensor) -> float:
     return float((actual_float[finite] - expected_float[finite]).abs().max().item())
 
 
+def _canonicalize_rows(
+    local: torch.Tensor,
+    global_rows: torch.Tensor,
+    total_tokens: int,
+    *,
+    label: str,
+) -> torch.Tensor:
+    """Assemble one distributed exact-cover tensor in canonical global order."""
+
+    global_rows = global_rows.to(device=local.device, dtype=torch.int64)
+    if local.shape[0] != global_rows.numel():
+        raise AssertionError(f"{label} does not match its global-row metadata")
+    canonical = torch.zeros(
+        (total_tokens, *local.shape[1:]),
+        dtype=local.dtype,
+        device=local.device,
+    )
+    canonical.index_copy_(0, global_rows, local)
+    with dsa_phase(f"collective_canonicalize::{label}"):
+        dist.all_reduce(canonical)
+    return canonical
+
+
+def _canonicalize_query_tensor(
+    local: torch.Tensor,
+    handle: DsaExecutionHandle,
+    *,
+    label: str,
+) -> torch.Tensor:
+    global_rows = torch.tensor(
+        handle.plan.rank_plans[handle.rank].local_query_global_rows,
+        dtype=torch.int64,
+        device=local.device,
+    )
+    return _canonicalize_rows(
+        local,
+        global_rows,
+        handle.plan.total_tokens,
+        label=label,
+    )
+
+
+def _canonicalize_source_tensor(
+    local: torch.Tensor,
+    handle: DsaExecutionHandle,
+    *,
+    label: str,
+) -> torch.Tensor:
+    rank_plan = handle.plan.rank_plans[handle.rank]
+    global_rows = torch.arange(
+        rank_plan.source_global_begin,
+        rank_plan.source_global_end,
+        dtype=torch.int64,
+        device=local.device,
+    )
+    return _canonicalize_rows(
+        local,
+        global_rows,
+        handle.plan.total_tokens,
+        label=label,
+    )
+
+
+def _canonicalize_forward_result(
+    local: MagiDSAForwardResult,
+    handle: DsaExecutionHandle,
+) -> MagiDSAForwardResult:
+    global_kl = local.kl.detach().clone()
+    with dsa_phase("collective_canonicalize::kl"):
+        dist.all_reduce(global_kl)
+    return MagiDSAForwardResult(
+        output=_canonicalize_query_tensor(local.output, handle, label="output"),
+        kl=global_kl,
+        sparse_lse=_canonicalize_query_tensor(
+            local.sparse_lse, handle, label="sparse_lse"
+        ),
+        topk_ids=_canonicalize_query_tensor(local.topk_ids, handle, label="topk_ids"),
+        topk_length=_canonicalize_query_tensor(
+            local.topk_length, handle, label="topk_length"
+        ),
+        indexer_lse=_canonicalize_query_tensor(
+            local.indexer_lse, handle, label="indexer_lse"
+        ),
+    )
+
+
 def _assert_forward_equal(
     actual: MagiDSAForwardResult, expected: MagiDSAForwardResult
-) -> None:
-    if not torch.equal(actual.topk_ids, expected.topk_ids):
-        raise AssertionError("sequential and balanced natural top-k IDs differ")
-    if not torch.equal(actual.topk_length, expected.topk_length):
-        raise AssertionError("sequential and balanced top-k lengths differ")
-    torch.testing.assert_close(
-        actual.output.float(), expected.output.float(), atol=5e-3, rtol=5e-3
+) -> dict[str, object]:
+    output_diagnostics = assert_backend_native_topk_outputs_close(
+        actual.output,
+        expected.output,
+        actual.topk_ids,
+        actual.topk_length,
+        expected.topk_ids,
+        expected.topk_length,
+        label="balanced vs sequential",
     )
     torch.testing.assert_close(
         actual.sparse_lse, expected.sparse_lse, atol=5e-3, rtol=5e-3
@@ -472,31 +845,44 @@ def _assert_forward_equal(
         actual.indexer_lse, expected.indexer_lse, atol=5e-3, rtol=5e-3
     )
     torch.testing.assert_close(actual.kl, expected.kl, atol=2e-2, rtol=2e-2)
+    return output_diagnostics
 
 
 def _run_csa_natural(rank: int, world_size: int) -> dict[str, object]:
     config = MagiDSAConfig(ratio=4)
     _, sequential_layer, balanced_layer = _release_layers(config)
-    dsa_input, _ = _owner_input(
+    source_x, sink, packed_meta = _owner_source(
         config,
         rank,
         world_size,
         requires_grad=False,
     )
     with torch.no_grad():
-        sequential, sequential_runtime = _runtime_result(
-            sequential_layer, dsa_input, "sequential"
+        sequential_local, sequential_runtime, sequential_handle = _runtime_result(
+            sequential_layer,
+            source_x,
+            sink,
+            packed_meta,
+            "sequential",
         )
-        balanced, balanced_runtime = _runtime_result(
-            balanced_layer, dsa_input, "indexer_balanced"
+        balanced_local, balanced_runtime, balanced_handle = _runtime_result(
+            balanced_layer,
+            source_x,
+            sink,
+            packed_meta,
+            "structural_balanced",
         )
+        sequential = _canonicalize_forward_result(sequential_local, sequential_handle)
+        balanced = _canonicalize_forward_result(balanced_local, balanced_handle)
     torch.cuda.synchronize()
     _assert_forward_equal(balanced, sequential)
     return {
+        "balanced_plan_evidence": _plan_evidence(balanced_handle),
+        "balanced_policy": balanced_handle.plan.policy,
         "case": "csa-natural",
         "indexer_lse_max_abs": _max_abs(balanced.indexer_lse, sequential.indexer_lse),
         "kl_abs": _max_abs(balanced.kl, sequential.kl),
-        "local_rows": dsa_input.packed_meta.local_token_count,
+        "local_rows": packed_meta.local_token_count,
         "output_max_abs": _max_abs(balanced.output, sequential.output),
         "rank": rank,
         "sequential_warm_calls": sequential_runtime.counters.warm_invocations,
@@ -546,9 +932,9 @@ def _backward_snapshot(
 
         def capture_score(*args: Any, **kwargs: Any) -> Any:
             backend_result = original_score(*args, **kwargs)
-            captured_raw_scores["indexer_raw_scores"] = backend_result[
-                "scores"
-            ].detach()
+            captured_raw_scores["indexer_raw_scores"] = (
+                backend_result["scores"].detach().clone()
+            )
             return backend_result
 
         DSA.indexer_forward_wrapper = capture_score
@@ -568,24 +954,34 @@ def _backward_snapshot(
     with dsa_phase("collective_kl_value"):
         dist.all_reduce(global_kl)
     snapshots: dict[str, torch.Tensor] = {
-        "indexer_lse": result.indexer_lse.detach().clone(),
+        "indexer_lse": _canonicalize_query_tensor(
+            result.indexer_lse.detach(), handle, label="indexer_lse"
+        ),
         "kl": result.kl.detach().clone(),
         "kl_global": global_kl,
-        "output": result.output.detach().clone(),
-        "sparse_lse": result.sparse_lse.detach().clone(),
-        "topk_ids": result.topk_ids.detach().clone(),
-        "topk_length": result.topk_length.detach().clone(),
+        "output": _canonicalize_query_tensor(
+            result.output.detach(), handle, label="output"
+        ),
+        "sparse_lse": _canonicalize_query_tensor(
+            result.sparse_lse.detach(), handle, label="sparse_lse"
+        ),
+        "topk_ids": _canonicalize_query_tensor(
+            result.topk_ids.detach(), handle, label="topk_ids"
+        ),
+        "topk_length": _canonicalize_query_tensor(
+            result.topk_length.detach(), handle, label="topk_length"
+        ),
     }
     if layer.indexer is not None:
         indexer_map = handle.device_plan.indexer
-        query_route = handle.plan.rank_plans[dist.get_rank()].indexer_qw_route
-        if indexer_map is None or query_route is None:
+        rank_plan = handle.plan.rank_plans[handle.rank]
+        if indexer_map is None:
             raise AssertionError("CSA snapshot is missing Indexer plan metadata")
         if "indexer_raw_scores" not in captured_raw_scores:
             if indexer_map.seq_lens.numel():
                 raise AssertionError("CSA snapshot did not capture Indexer raw scores")
             captured_raw_scores["indexer_raw_scores"] = torch.empty(
-                (0, indexer_map.max_seqlen_k),
+                (0, indexer_map.backend_max_seqlen_k),
                 dtype=torch.float32,
                 device=dsa_input.x.device,
             )
@@ -597,7 +993,7 @@ def _backward_snapshot(
                     indexer_map.q_sample_block_offsets.detach().clone()
                 ),
                 "indexer_score_global_rows": torch.tensor(
-                    query_route.consumer_global_rows,
+                    rank_plan.local_query_global_rows,
                     dtype=torch.int64,
                     device=raw_scores.device,
                 ),
@@ -611,7 +1007,18 @@ def _backward_snapshot(
         if gradient_name not in gradient_names and tensor.grad is not None:
             raise AssertionError(f"{name} unexpectedly received a gradient")
         if tensor.grad is not None:
-            snapshots[gradient_name] = tensor.grad.detach().clone()
+            gradient = tensor.grad.detach()
+            if name == "x":
+                gradient = _canonicalize_source_tensor(
+                    gradient, handle, label=gradient_name
+                )
+            elif name in ("qr", "q", "kv"):
+                gradient = _canonicalize_query_tensor(
+                    gradient, handle, label=gradient_name
+                )
+            else:
+                gradient = gradient.clone()
+            snapshots[gradient_name] = gradient
     for name, parameter in layer.named_parameters():
         assert parameter.grad is not None
         snapshots[f"parameter::{name}"] = parameter.grad.detach().clone()
@@ -623,8 +1030,12 @@ def _reference_snapshot(
     input_tensors: tuple[torch.Tensor, ...],
     cu_seqlens: tuple[int, ...] = _CP2_CU_SEQLENS,
     gradient_names: tuple[str, ...] = _ALL_GRADIENT_NAMES,
+    control_context: dict[str, object] | None = None,
 ) -> dict[str, torch.Tensor]:
+    context = dict(control_context or {})
     x, qr, q, latent_kv, sink = input_tensors
+    forward_started = time.monotonic()
+    _cp2_record("reference_forward_begin", **context)
     result = dsa_reference(
         layer,
         x,
@@ -634,6 +1045,20 @@ def _reference_snapshot(
         sink,
         cu_seqlens,
     )
+    _cp2_record(
+        "reference_forward_launch_end",
+        elapsed_seconds=time.monotonic() - forward_started,
+        **context,
+    )
+    torch.cuda.synchronize()
+    _cp2_record(
+        "reference_forward_end",
+        elapsed_seconds=time.monotonic() - forward_started,
+        **context,
+    )
+
+    raw_score_started = time.monotonic()
+    _cp2_record("reference_raw_score_begin", **context)
     reference_raw_scores = None
     if layer.indexer is not None:
         reference_raw_scores = _reference_csa_index_scores(
@@ -641,9 +1066,35 @@ def _reference_snapshot(
             input_tensors,
             cu_seqlens,
         )
+    _cp2_record(
+        "reference_raw_score_launch_end",
+        elapsed_seconds=time.monotonic() - raw_score_started,
+        skipped=layer.indexer is None,
+        **context,
+    )
+    torch.cuda.synchronize()
+    _cp2_record(
+        "reference_raw_score_end",
+        elapsed_seconds=time.monotonic() - raw_score_started,
+        skipped=layer.indexer is None,
+        **context,
+    )
+
+    backward_started = time.monotonic()
+    _cp2_record("reference_backward_begin", **context)
     loss = result.output.float().square().mean() + result.kl
     loss.backward()
+    _cp2_record(
+        "reference_backward_launch_end",
+        elapsed_seconds=time.monotonic() - backward_started,
+        **context,
+    )
     torch.cuda.synchronize()
+    _cp2_record(
+        "reference_backward_end",
+        elapsed_seconds=time.monotonic() - backward_started,
+        **context,
+    )
     snapshots: dict[str, torch.Tensor] = {
         "indexer_lse": result.indexer_lse.detach().clone(),
         "kl": result.kl.detach().clone(),
@@ -755,7 +1206,7 @@ def _assert_raw_indexer_scores(
         lengths.detach().cpu().tolist(),
     )
     max_abs = 0.0
-    for worker_row, (global_row_value, block_offset_value, length_value) in enumerate(
+    for local_row, (global_row_value, block_offset_value, length_value) in enumerate(
         metadata
     ):
         global_row = int(global_row_value)
@@ -770,7 +1221,7 @@ def _assert_raw_indexer_scores(
             or block_offset + length > reference_scores.shape[1]
         ):
             raise AssertionError(f"{label}: raw-score metadata is out of bounds")
-        backend_valid = raw_scores[worker_row, :length]
+        backend_valid = raw_scores[local_row, :length]
         reference_valid = reference_scores[
             global_row,
             block_offset : block_offset + length,
@@ -786,7 +1237,7 @@ def _assert_raw_indexer_scores(
             rtol=5e-3,
             name=f"{label}: Indexer raw score row {global_row}",
         )
-        backend_padding = raw_scores[worker_row, length:]
+        backend_padding = raw_scores[local_row, length:]
         if backend_padding.numel() and not bool(
             torch.all(torch.isneginf(backend_padding)).item()
         ):
@@ -797,82 +1248,35 @@ def _assert_raw_indexer_scores(
     return max_abs
 
 
-_LOCAL_REFERENCE_FIELDS = frozenset(
-    {
-        "grad_kv",
-        "grad_q",
-        "grad_qr",
-        "grad_x",
-        "indexer_lse",
-        "output",
-        "sparse_lse",
-        "topk_ids",
-        "topk_length",
-    }
-)
-
-
-def _expected_tensor(
-    snapshots: dict[str, torch.Tensor],
-    name: str,
-    reference_bounds: tuple[int, int] | None,
-) -> torch.Tensor:
-    value = snapshots[name]
-    if reference_bounds is not None and name in _LOCAL_REFERENCE_FIELDS:
-        begin, end = reference_bounds
-        return value[begin:end]
-    return value
-
-
 def _compare_natural_snapshots(
     actual: dict[str, torch.Tensor],
     expected: dict[str, torch.Tensor],
     *,
     label: str,
-    reference_bounds: tuple[int, int] | None = None,
     gradient_names: tuple[str, ...] = _ALL_GRADIENT_NAMES,
     compare_parameter_values: bool = True,
-    topk_comparison: Literal["ordered_exact", "canonical_reference"] = "ordered_exact",
-) -> tuple[dict[str, float], list[str]]:
-    expected_topk_ids = _expected_tensor(
-        expected,
-        "topk_ids",
-        reference_bounds,
+    compare_raw_indexer_scores: bool = False,
+) -> tuple[dict[str, object], list[str]]:
+    output_diagnostics = assert_backend_native_topk_outputs_close(
+        actual["output"],
+        expected["output"],
+        actual["topk_ids"],
+        actual["topk_length"],
+        expected["topk_ids"],
+        expected["topk_length"],
+        label=label,
     )
-    expected_topk_length = _expected_tensor(
-        expected,
-        "topk_length",
-        reference_bounds,
-    )
-    if topk_comparison == "ordered_exact":
-        if not torch.equal(actual["topk_ids"], expected_topk_ids):
-            raise AssertionError(f"{label}: ordered natural Top-K IDs differ")
-        if not torch.equal(actual["topk_length"], expected_topk_length):
-            raise AssertionError(f"{label}: natural Top-K lengths differ")
-    elif topk_comparison == "canonical_reference":
-        validate_canonical_topk(
-            actual["topk_ids"],
-            actual["topk_length"],
-            expected_topk_ids,
-            expected_topk_length,
-            label=label,
-        )
-    else:
-        raise ValueError(f"unsupported Top-K comparison mode: {topk_comparison}")
     raw_score_max_abs = 0.0
-    if topk_comparison == "canonical_reference" and (
-        "indexer_raw_scores" in actual or "indexer_raw_scores" in expected
-    ):
+    if compare_raw_indexer_scores:
         raw_score_max_abs = _assert_raw_indexer_scores(
             actual,
             expected,
             label=label,
         )
-    for name in ("output", "sparse_lse", "indexer_lse"):
-        expected_value = _expected_tensor(expected, name, reference_bounds)
+    for name in ("sparse_lse", "indexer_lse"):
         _assert_regular_close(
             actual[name],
-            expected_value,
+            expected[name],
             atol=5e-3,
             rtol=5e-3,
             name=f"{label}: {name}",
@@ -884,32 +1288,30 @@ def _compare_natural_snapshots(
         rtol=2e-2,
         name=f"{label}: KL",
     )
-    if reference_bounds is None:
-        _assert_regular_close(
-            actual["kl"],
-            expected["kl"],
-            atol=2e-2,
-            rtol=2e-2,
-            name=f"{label}: local KL",
-        )
+    gradient_failures: list[str] = []
     for name in gradient_names:
         if name == "grad_kv":
             continue
-        expected_value = _expected_tensor(expected, name, reference_bounds)
-        _assert_regular_close(
-            actual[name],
-            expected_value,
-            atol=2e-2,
-            rtol=2e-2,
-            name=f"{label}: {name}",
-        )
+        try:
+            _assert_regular_close(
+                actual[name],
+                expected[name],
+                atol=2e-2,
+                rtol=2e-2,
+                name=f"{label}: {name}",
+            )
+        except AssertionError as error:
+            gradient_failures.append(str(error))
     kv_mismatch = 0.0
     if "grad_kv" in gradient_names:
-        kv_mismatch = _assert_bf16_reduction_close(
-            actual["grad_kv"],
-            _expected_tensor(expected, "grad_kv", reference_bounds),
-            name=f"{label}: latent_kv gradient",
-        )
+        try:
+            kv_mismatch = _assert_bf16_reduction_close(
+                actual["grad_kv"],
+                expected["grad_kv"],
+                name=f"{label}: latent_kv gradient",
+            )
+        except AssertionError as error:
+            gradient_failures.append(str(error))
     parameter_names = sorted(name for name in actual if name.startswith("parameter::"))
     expected_parameter_names = sorted(
         name for name in expected if name.startswith("parameter::")
@@ -918,29 +1320,28 @@ def _compare_natural_snapshots(
         raise AssertionError(f"{label}: parameter gradient schemas differ")
     if compare_parameter_values:
         for name in parameter_names:
-            _assert_regular_close(
-                actual[name],
-                expected[name],
-                atol=2e-2,
-                rtol=2e-2,
-                name=f"{label}: {name}",
-            )
-    expected_output = _expected_tensor(expected, "output", reference_bounds)
-    expected_indexer_lse = _expected_tensor(
-        expected,
-        "indexer_lse",
-        reference_bounds,
-    )
+            try:
+                _assert_regular_close(
+                    actual[name],
+                    expected[name],
+                    atol=2e-2,
+                    rtol=2e-2,
+                    name=f"{label}: {name}",
+                )
+            except AssertionError as error:
+                gradient_failures.append(str(error))
+    if gradient_failures:
+        raise AssertionError(" | ".join(gradient_failures))
     return (
         {
+            **output_diagnostics,
             "indexer_lse_max_abs": _max_abs(
                 actual["indexer_lse"],
-                expected_indexer_lse,
+                expected["indexer_lse"],
             ),
             "indexer_raw_score_max_abs": raw_score_max_abs,
             "kl_abs": _max_abs(actual["kl_global"], expected["kl_global"]),
             "kv_gradient_mismatch_ratio": kv_mismatch,
-            "output_max_abs": _max_abs(actual["output"], expected_output),
         },
         parameter_names,
     )
@@ -954,11 +1355,14 @@ def _prewarm_natural_plan(
     world_size: int,
     policy: DsaPlanPolicy,
 ) -> tuple[float, dict[str, object]]:
-    warm_input, warm_tensors = _owner_input(
+    source_x, sink, packed_meta = _owner_source(
         layer.config,
         rank,
         world_size,
         requires_grad=True,
+    )
+    warm_input, warm_tensors = _materialize_owner_input(
+        source_x, sink, packed_meta, runtime, handle
     )
     layer.zero_grad(set_to_none=True)
     _cp2_record("prewarm_begin", policy=policy)
@@ -1004,33 +1408,47 @@ def _run_csa_natural_backward(
     config = _cp2_backend_config()
     reference_layer, sequential_layer, balanced_layer = _release_layers(config)
     reference_inputs = _global_inputs(config, requires_grad=True)
-    _cp2_record("reference_begin")
+    reference_context: dict[str, object] = {
+        "case": "csa-natural-backward",
+        "path": "csa",
+    }
+    _cp2_record("reference_begin", **reference_context)
     reference_started = time.monotonic()
-    reference = _reference_snapshot(reference_layer, reference_inputs)
+    reference = _reference_snapshot(
+        reference_layer,
+        reference_inputs,
+        control_context=reference_context,
+    )
     reference_seconds = time.monotonic() - reference_started
-    _cp2_record("reference_end", elapsed_seconds=reference_seconds)
+    _cp2_record(
+        "reference_end",
+        elapsed_seconds=reference_seconds,
+        **reference_context,
+    )
 
-    sequential_input, sequential_tensors = _owner_input(
-        config,
-        rank,
-        world_size,
-        requires_grad=True,
-    )
-    balanced_input, balanced_tensors = _owner_input(
-        config,
-        rank,
-        world_size,
-        requires_grad=True,
-    )
-    sequential_runtime, sequential_handle = _prepare_runtime(
-        sequential_layer,
+    (
         sequential_input,
+        sequential_tensors,
+        sequential_runtime,
+        sequential_handle,
+    ) = _prepare_owner_case(
+        sequential_layer,
+        rank,
+        world_size,
         "sequential",
+        requires_grad=True,
     )
-    balanced_runtime, balanced_handle = _prepare_runtime(
-        balanced_layer,
+    (
         balanced_input,
-        "indexer_balanced",
+        balanced_tensors,
+        balanced_runtime,
+        balanced_handle,
+    ) = _prepare_owner_case(
+        balanced_layer,
+        rank,
+        world_size,
+        "structural_balanced",
+        requires_grad=True,
     )
     sequential_prewarm_seconds, _ = _prewarm_natural_plan(
         sequential_layer,
@@ -1046,7 +1464,7 @@ def _run_csa_natural_backward(
         balanced_handle,
         rank,
         world_size,
-        "indexer_balanced",
+        "structural_balanced",
     )
     sequential_layer.zero_grad(set_to_none=True)
     balanced_layer.zero_grad(set_to_none=True)
@@ -1057,7 +1475,7 @@ def _run_csa_natural_backward(
     _cp2_record(
         "execute_begin",
         deadline_seconds=60,
-        plans=("sequential", "indexer_balanced"),
+        plans=("sequential", "structural_balanced"),
     )
     execution_started = time.monotonic()
     sequential = _backward_snapshot(
@@ -1079,7 +1497,7 @@ def _run_csa_natural_backward(
     _cp2_record(
         "execute_end",
         elapsed_seconds=execution_seconds,
-        plans=("sequential", "indexer_balanced"),
+        plans=("sequential", "structural_balanced"),
     )
     if execution_seconds >= 60.0:
         raise TimeoutError(
@@ -1103,23 +1521,22 @@ def _run_csa_natural_backward(
         sequential,
         label="balanced vs sequential",
     )
-    reference_bounds = _owner_bounds(rank, world_size)
     sequential_reference_metrics, _ = _compare_natural_snapshots(
         sequential,
         reference,
         label="sequential vs CP1 reference",
-        reference_bounds=reference_bounds,
-        topk_comparison="canonical_reference",
+        compare_raw_indexer_scores=True,
     )
     balanced_reference_metrics, _ = _compare_natural_snapshots(
         balanced,
         reference,
         label="balanced vs CP1 reference",
-        reference_bounds=reference_bounds,
-        topk_comparison="canonical_reference",
+        compare_raw_indexer_scores=True,
     )
     _cp2_record("verification_end", case="csa-natural-backward")
     return {
+        "balanced_plan_evidence": _plan_evidence(balanced_handle),
+        "balanced_policy": balanced_handle.plan.policy,
         "balanced_prewarm_seconds": balanced_prewarm_seconds,
         "balanced_reference": balanced_reference_metrics,
         "balanced_warm_calls": balanced_runtime.counters.warm_invocations,
@@ -1138,7 +1555,7 @@ def _run_csa_natural_backward(
 
 def _release_gradient_names(ratio: DsaRatio) -> tuple[str, ...]:
     if ratio == 0:
-        return ("grad_q", "grad_kv", "grad_sink")
+        return ("grad_x", "grad_q", "grad_kv", "grad_sink")
     if ratio == 4:
         return _ALL_GRADIENT_NAMES
     if ratio == 128:
@@ -1185,6 +1602,7 @@ def _reference_csa_index_scores(
         x,
         cu_seqlens,
     )
+    indexer_scale = layer.config.indexer_head_dim**-0.5
     scores = torch.full(
         (cu_seqlens[-1], compressed_ki.shape[0]),
         float("-inf"),
@@ -1202,7 +1620,7 @@ def _reference_csa_index_scores(
             compressed_ki[block_begin:block_end].float(),
         )
         scores[q_begin:q_end, block_begin:block_end] = (
-            dots.relu() * weights[q_begin:q_end].float().unsqueeze(-1)
+            dots.relu() * indexer_scale * weights[q_begin:q_end].float().unsqueeze(-1)
         ).sum(dim=1)
     return scores
 
@@ -1223,13 +1641,16 @@ def _capture_indexer_forward(
 
     def capture_score(*args: Any, **kwargs: Any) -> Any:
         result = original_score(*args, **kwargs)
-        captured["scores"] = result["scores"].detach()
+        captured["scores"] = result["scores"].detach().clone()
         return result
 
     def capture_topk(*args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("return_val") is not False:
+            raise AssertionError("production cuDNN Top-K must run in IDs-only mode")
         result = original_topk(*args, **kwargs)
+        if result["values"] is not None:
+            raise AssertionError("IDs-only cuDNN Top-K unexpectedly returned values")
         captured["raw_topk_indices"] = result["indices"].detach()
-        captured["raw_topk_values"] = result["values"].detach()
         return result
 
     DSA.indexer_forward_wrapper = capture_score
@@ -1239,7 +1660,7 @@ def _capture_indexer_forward(
     finally:
         DSA.indexer_forward_wrapper = original_score
         DSA.indexer_top_k_wrapper = original_topk
-    missing = {"scores", "raw_topk_indices", "raw_topk_values"} - captured.keys()
+    missing = {"scores", "raw_topk_indices"} - captured.keys()
     if missing:
         raise AssertionError(f"cuDNN diagnostic capture is missing {sorted(missing)}")
     return result, captured
@@ -1254,9 +1675,8 @@ def _save_topk_backend_capture(
     if not artifact_dir:
         return
     rank_plan = handle.plan.rank_plans[rank]
-    query_route = rank_plan.indexer_qw_route
     indexer_map = handle.device_plan.indexer
-    if query_route is None or indexer_map is None:
+    if indexer_map is None:
         raise RuntimeError("CP8 diagnostic plan is missing Indexer metadata")
     payload: dict[str, object] = {
         name: value.detach().cpu() for name, value in captured.items()
@@ -1266,7 +1686,7 @@ def _save_topk_backend_capture(
             "q_sample_block_offsets": indexer_map.q_sample_block_offsets.cpu(),
             "rank": rank,
             "seq_lens": indexer_map.seq_lens.cpu(),
-            "worker_global_rows": tuple(query_route.consumer_global_rows),
+            "query_global_rows": rank_plan.local_query_global_rows,
         }
     )
     destination = Path(artifact_dir) / f"topk_backend_rank{rank}.pt"
@@ -1284,14 +1704,14 @@ def _topk_diagnostic_report(
     rank: int,
     world_size: int,
 ) -> dict[str, object]:
-    begin, end = _owner_bounds(rank, world_size, _CP8_LOCAL_COUNTS)
-    expected_ids = expected.topk_ids[begin:end]
-    expected_lengths = expected.topk_length[begin:end]
+    del world_size
+    rank_plan = handle.plan.rank_plans[rank]
+    query_rows = torch.tensor(rank_plan.local_query_global_rows, dtype=torch.int64)
+    expected_ids = expected.topk_ids.cpu().index_select(0, query_rows)
+    expected_lengths = expected.topk_length.cpu().index_select(0, query_rows)
     actual_ids = actual.topk_ids.cpu()
     actual_lengths = actual.topk_length.cpu()
-    expected_ids = expected_ids.cpu()
-    expected_lengths = expected_lengths.cpu()
-    validate_canonical_topk(
+    validate_backend_native_topk_pair(
         actual_ids,
         actual_lengths,
         expected_ids,
@@ -1300,14 +1720,11 @@ def _topk_diagnostic_report(
     )
     reference_scores = reference_scores.cpu()
     backend_scores = captured["scores"].float().cpu()
+    raw_backend_ids = captured["raw_topk_indices"].to(torch.int32).cpu()
 
-    rank_plan = handle.plan.rank_plans[rank]
-    query_route = rank_plan.indexer_qw_route
     indexer_map = handle.device_plan.indexer
-    if query_route is None or indexer_map is None:
+    if indexer_map is None:
         raise RuntimeError("CP8 diagnostic plan is missing Indexer metadata")
-    worker_rows = tuple(int(value) for value in query_route.consumer_global_rows)
-    worker_lookup = {global_row: row for row, global_row in enumerate(worker_rows)}
     offsets = indexer_map.q_sample_block_offsets.cpu()
     backend_lengths = indexer_map.seq_lens.cpu()
 
@@ -1317,25 +1734,13 @@ def _topk_diagnostic_report(
     details: list[dict[str, object]] = []
     score_max_abs = 0.0
     all_sets_equal = True
-    all_actual_match_backend_order = True
-    for local_row in range(end - begin):
-        global_row = begin + local_row
-        worker_row = worker_lookup.get(global_row)
-        if worker_row is None:
-            if local_row in mismatch_rows:
-                details.append(
-                    {
-                        "global_row": global_row,
-                        "local_row": local_row,
-                        "worker_row": None,
-                    }
-                )
-            all_actual_match_backend_order = False
-            continue
-        backend_length = int(backend_lengths[worker_row].item())
-        block_offset = int(offsets[worker_row].item())
+    all_actual_match_backend_output = True
+    for local_row, global_row_value in enumerate(rank_plan.local_query_global_rows):
+        global_row = int(global_row_value)
+        backend_length = int(backend_lengths[local_row].item())
+        block_offset = int(offsets[local_row].item())
+        backend_visible = backend_scores[local_row, :backend_length]
         if backend_length:
-            backend_visible = backend_scores[worker_row, :backend_length]
             reference_visible = reference_scores[
                 global_row,
                 block_offset : block_offset + backend_length,
@@ -1357,17 +1762,31 @@ def _topk_diagnostic_report(
                 score_max_abs,
                 float((backend_visible - reference_visible).abs().max().item()),
             )
-        backend_padding = backend_scores[worker_row, backend_length:]
+        backend_padding = backend_scores[local_row, backend_length:]
         if backend_padding.numel() and not bool(
             torch.all(torch.isneginf(backend_padding)).item()
         ):
             raise AssertionError(
                 "CP8 diagnostic Indexer raw-score causal padding is not -inf"
             )
+        actual_length = int(actual_lengths[local_row].item())
+        backend_output = (raw_backend_ids[local_row, :actual_length] + block_offset).to(
+            torch.int32
+        )
+        actual_matches_backend_output = torch.equal(
+            actual_ids[local_row, :actual_length],
+            backend_output,
+        )
+        all_actual_match_backend_output &= actual_matches_backend_output
+        validate_backend_native_topk(
+            backend_visible,
+            actual_ids[local_row, :actual_length],
+            actual_length,
+            global_offset=block_offset,
+        )
         if local_row not in mismatch_rows:
             continue
 
-        actual_length = int(actual_lengths[local_row].item())
         expected_length = int(expected_lengths[local_row].item())
         actual_valid = [
             int(value) for value in actual_ids[local_row, :actual_length].tolist()
@@ -1390,24 +1809,11 @@ def _topk_diagnostic_report(
             ),
             min(actual_length, expected_length),
         )
-        backend_visible = backend_scores[worker_row, :backend_length]
-        backend_order = (
-            torch.argsort(
-                backend_visible,
-                descending=True,
-                stable=True,
-            )
-            + block_offset
-        ).to(torch.int32)
-        actual_matches_backend_order = torch.equal(
-            actual_ids[local_row, :actual_length],
-            backend_order[:actual_length],
-        )
-        all_actual_match_backend_order &= actual_matches_backend_order
         detail: dict[str, object] = {
             "actual_ids": actual_valid,
             "actual_length": actual_length,
-            "actual_matches_backend_score_order": actual_matches_backend_order,
+            "actual_matches_backend_output": actual_matches_backend_output,
+            "backend_output_ids": backend_output.tolist(),
             "backend_length": backend_length,
             "expected_ids": expected_valid,
             "expected_length": expected_length,
@@ -1415,7 +1821,7 @@ def _topk_diagnostic_report(
             "global_row": global_row,
             "local_row": local_row,
             "sets_equal": sets_equal,
-            "worker_row": worker_row,
+            "query_local_row": local_row,
         }
         if first_difference < min(actual_length, expected_length):
             actual_id = actual_valid[first_difference]
@@ -1424,7 +1830,7 @@ def _topk_diagnostic_report(
             expected_column = expected_id - block_offset
             detail["first_pair"] = {
                 "actual_backend_score": float(
-                    backend_scores[worker_row, actual_column].item()
+                    backend_scores[local_row, actual_column].item()
                 ),
                 "actual_id": actual_id,
                 "actual_reference_score": float(
@@ -1432,12 +1838,12 @@ def _topk_diagnostic_report(
                 ),
                 "backend_gap_actual_minus_expected": float(
                     (
-                        backend_scores[worker_row, actual_column]
-                        - backend_scores[worker_row, expected_column]
+                        backend_scores[local_row, actual_column]
+                        - backend_scores[local_row, expected_column]
                     ).item()
                 ),
                 "expected_backend_score": float(
-                    backend_scores[worker_row, expected_column].item()
+                    backend_scores[local_row, expected_column].item()
                 ),
                 "expected_id": expected_id,
                 "expected_reference_score": float(
@@ -1453,7 +1859,7 @@ def _topk_diagnostic_report(
         details.append(detail)
 
     return {
-        "all_actual_match_backend_score_order": all_actual_match_backend_order,
+        "all_actual_match_backend_output": all_actual_match_backend_output,
         "all_mismatch_sets_equal": all_sets_equal,
         "backend_reference_score_max_abs": score_max_abs,
         "backend_reference_score_tolerance": {"atol": 5e-3, "rtol": 5e-3},
@@ -1461,7 +1867,7 @@ def _topk_diagnostic_report(
         "lengths_exact": torch.equal(actual_lengths, expected_lengths),
         "mismatch_row_count": len(mismatch_rows),
         "mismatch_rows": details,
-        "owner_global_bounds": [begin, end],
+        "query_global_rows": list(rank_plan.local_query_global_rows),
         "selected_all_visible": bool(
             torch.all(expected_lengths <= actual.topk_ids.shape[1]).item()
         ),
@@ -1474,7 +1880,7 @@ def _run_cp8_topk_diagnostic(rank: int, world_size: int) -> dict[str, object]:
         raise ValueError("CP8 Top-K diagnostic requires exactly eight ranks")
     config = MagiDSAConfig(ratio=4)
     config.validate_release_contract()
-    reference_layer, sequential_layer = _release_layer_copies(
+    reference_layer, structural_layer = _release_layer_copies(
         config,
         seed=440,
         count=2,
@@ -1502,25 +1908,21 @@ def _run_cp8_topk_diagnostic(rank: int, world_size: int) -> dict[str, object]:
             _CP8_CU_SEQLENS,
         )
 
-    dsa_input, _ = _owner_input(
-        config,
+    dsa_input, _, runtime, handle = _prepare_owner_case(
+        structural_layer,
         rank,
         world_size,
+        "structural_balanced",
         requires_grad=False,
         cu_seqlens=_CP8_CU_SEQLENS,
         local_counts=_CP8_LOCAL_COUNTS,
         seed=450,
-    )
-    runtime, handle = _prepare_runtime(
-        sequential_layer,
-        dsa_input,
-        "sequential",
         health_check=True,
     )
     _cp2_record("prewarm_begin", case="cp8-topk-diagnostic")
     prewarm_started = time.monotonic()
     with torch.no_grad():
-        runtime.calc_dsa(sequential_layer, dsa_input, handle)
+        runtime.calc_dsa(structural_layer, dsa_input, handle)
     torch.cuda.synchronize()
     prewarm_seconds = time.monotonic() - prewarm_started
     _cp2_record(
@@ -1539,7 +1941,7 @@ def _run_cp8_topk_diagnostic(rank: int, world_size: int) -> dict[str, object]:
     execution_started = time.monotonic()
     with torch.no_grad():
         actual, captured = _capture_indexer_forward(
-            sequential_layer,
+            structural_layer,
             dsa_input,
             runtime,
             handle,
@@ -1568,8 +1970,10 @@ def _run_cp8_topk_diagnostic(rank: int, world_size: int) -> dict[str, object]:
         "case": "cp8-topk-diagnostic",
         "diagnostics": diagnostics,
         "execution_seconds": execution_seconds,
+        "plan_policy": handle.plan.policy,
         "prewarm_seconds": prewarm_seconds,
         "rank": rank,
+        "structural_plan_evidence": _plan_evidence(handle),
         "warm_calls": runtime.counters.warm_invocations,
     }
 
@@ -1585,7 +1989,7 @@ def _prewarm_cp8_candidate(
     seed: int,
     gradient_names: tuple[str, ...],
 ) -> float:
-    warm_input, warm_tensors = _owner_input(
+    source_x, sink, packed_meta = _owner_source(
         layer.config,
         rank,
         world_size,
@@ -1593,6 +1997,9 @@ def _prewarm_cp8_candidate(
         cu_seqlens=_CP8_CU_SEQLENS,
         local_counts=_CP8_LOCAL_COUNTS,
         seed=seed,
+    )
+    warm_input, warm_tensors = _materialize_owner_input(
+        source_x, sink, packed_meta, runtime, handle
     )
     layer.zero_grad(set_to_none=True)
     _cp2_record("prewarm_begin", case="cp8-natural-backward", path=label)
@@ -1638,16 +2045,13 @@ def _run_cp8_natural_backward(rank: int, world_size: int) -> dict[str, object]:
         csa_reference_layer,
         csa_sequential_layer,
         csa_balanced_layer,
-    ) = _release_layer_copies(configs[4], seed=440, count=3)
+        csa_structural_layer,
+    ) = _release_layer_copies(configs[4], seed=440, count=4)
     window_reference_layer, window_layer = _release_layer_copies(
-        configs[0],
-        seed=441,
-        count=2,
+        configs[0], seed=441, count=2
     )
-    hca_reference_layer, hca_layer = _release_layer_copies(
-        configs[128],
-        seed=442,
-        count=2,
+    hca_reference_layer, hca_layer, hca_structural_layer = _release_layer_copies(
+        configs[128], seed=442, count=3
     )
 
     references: dict[str, dict[str, torch.Tensor]] = {}
@@ -1671,6 +2075,10 @@ def _run_cp8_natural_backward(rank: int, world_size: int) -> dict[str, object]:
             reference_inputs,
             _CP8_CU_SEQLENS,
             _release_gradient_names(ratio),
+            control_context={
+                "case": "cp8-natural-backward",
+                "path": label,
+            },
         )
         reference_seconds[label] = time.monotonic() - started
         _cp2_record(
@@ -1693,28 +2101,56 @@ def _run_cp8_natural_backward(rank: int, world_size: int) -> dict[str, object]:
         ],
     ] = {}
     candidate_cases: tuple[
-        tuple[str, MagiDSALayer, DsaRatio, DsaPlanPolicy, int], ...
+        tuple[
+            str,
+            MagiDSALayer,
+            DsaRatio,
+            DsaPlanPolicy,
+            int,
+            DsaSharedLayoutConfig | None,
+        ],
+        ...,
     ] = (
-        ("csa_sequential", csa_sequential_layer, 4, "sequential", 450),
-        ("csa_balanced", csa_balanced_layer, 4, "indexer_balanced", 450),
-        ("window", window_layer, 0, "sequential", 451),
-        ("hca", hca_layer, 128, "sequential", 452),
+        ("csa_sequential", csa_sequential_layer, 4, "sequential", 450, None),
+        (
+            "csa_balanced",
+            csa_balanced_layer,
+            4,
+            "indexer_balanced",
+            450,
+            None,
+        ),
+        (
+            "csa_structural",
+            csa_structural_layer,
+            4,
+            "structural_balanced",
+            450,
+            None,
+        ),
+        ("window", window_layer, 0, "sequential", 451, None),
+        ("hca", hca_layer, 128, "sequential", 452, None),
+        (
+            "hca_structural",
+            hca_structural_layer,
+            128,
+            "structural_balanced",
+            452,
+            None,
+        ),
     )
-    for label, layer, ratio, policy, seed in candidate_cases:
-        dsa_input, input_tensors = _owner_input(
-            configs[ratio],
+    for label, layer, ratio, policy, seed, solver_config in candidate_cases:
+        dsa_input, input_tensors, runtime, handle = _prepare_owner_case(
+            layer,
             rank,
             world_size,
+            policy,
             requires_grad=True,
             cu_seqlens=_CP8_CU_SEQLENS,
             local_counts=_CP8_LOCAL_COUNTS,
             seed=seed,
-        )
-        runtime, handle = _prepare_runtime(
-            layer,
-            dsa_input,
-            policy,
             health_check=True,
+            shared_layout_config=solver_config,
         )
         candidates[label] = (
             layer,
@@ -1725,6 +2161,17 @@ def _run_cp8_natural_backward(rank: int, world_size: int) -> dict[str, object]:
             _release_gradient_names(ratio),
             seed,
         )
+
+    structural_layout_hashes = {
+        candidates[label][4].plan.query_layout_hash
+        for label in ("csa_structural", "hca_structural")
+    }
+    if len(structural_layout_hashes) != 1:
+        raise AssertionError("CP8 structural CSA/HCA plans use different Query layouts")
+    MagiDSAProRuntimeMgr._validate_shared_layout(
+        candidates["csa_structural"][4],
+        candidates["hca_structural"][4],
+    )
 
     prewarm_seconds: dict[str, float] = {}
     for label, candidate in candidates.items():
@@ -1794,9 +2241,8 @@ def _run_cp8_natural_backward(rank: int, world_size: int) -> dict[str, object]:
     _save_cudnn_cache_inventory("cp8_after_execute", final_inventory)
 
     _cp2_record("verification_begin", case="cp8-natural-backward")
-    bounds = _owner_bounds(rank, world_size, _CP8_LOCAL_COUNTS)
     compare_parameter_values = rank == 0
-    metrics: dict[str, dict[str, float]] = {}
+    metrics: dict[str, dict[str, object]] = {}
     metrics["csa_plan_alignment"], csa_parameters = _compare_natural_snapshots(
         actual["csa_balanced"],
         actual["csa_sequential"],
@@ -1808,33 +2254,37 @@ def _run_cp8_natural_backward(rank: int, world_size: int) -> dict[str, object]:
         case="cp8-natural-backward",
         checkpoint="csa_plan_alignment",
     )
-    for label in ("csa_sequential", "csa_balanced"):
+    metrics["csa_structural_plan_alignment"], _ = _compare_natural_snapshots(
+        actual["csa_structural"],
+        actual["csa_sequential"],
+        label="CP8 structural vs sequential CSA",
+        compare_parameter_values=compare_parameter_values,
+    )
+    for label in ("csa_sequential", "csa_balanced", "csa_structural"):
         metrics[f"{label}_reference"], _ = _compare_natural_snapshots(
             actual[label],
             references["csa"],
             label=f"CP8 {label} vs reference",
-            reference_bounds=bounds,
             compare_parameter_values=compare_parameter_values,
-            topk_comparison="canonical_reference",
+            compare_raw_indexer_scores=True,
         )
         _cp2_record(
             "verification_checkpoint",
             case="cp8-natural-backward",
             checkpoint=f"{label}_reference",
         )
-    non_csa_cases: tuple[tuple[str, DsaRatio], ...] = (
-        ("window", 0),
-        ("hca", 128),
+    non_csa_cases: tuple[tuple[str, str, DsaRatio], ...] = (
+        ("window", "window", 0),
+        ("hca", "hca", 128),
+        ("hca_structural", "hca", 128),
     )
-    for label, ratio in non_csa_cases:
+    for label, reference_label, ratio in non_csa_cases:
         metrics[f"{label}_reference"], _ = _compare_natural_snapshots(
             actual[label],
-            references[label],
+            references[reference_label],
             label=f"CP8 {label} vs reference",
-            reference_bounds=bounds,
             gradient_names=_release_gradient_names(ratio),
             compare_parameter_values=compare_parameter_values,
-            topk_comparison="canonical_reference",
         )
         _cp2_record(
             "verification_checkpoint",
@@ -1844,6 +2294,9 @@ def _run_cp8_natural_backward(rank: int, world_size: int) -> dict[str, object]:
 
     _cp2_record("verification_end", case="cp8-natural-backward")
 
+    plan_evidence = {
+        label: _plan_evidence(candidate[4]) for label, candidate in candidates.items()
+    }
     return {
         "case": "cp8-natural-backward",
         "execution_seconds": execution_seconds,
@@ -1851,9 +2304,12 @@ def _run_cp8_natural_backward(rank: int, world_size: int) -> dict[str, object]:
         "metrics": metrics,
         "model_parameter_values_checked": compare_parameter_values,
         "parameter_gradients": len(csa_parameters),
+        "plan_evidence": plan_evidence,
         "prewarm_seconds": prewarm_seconds,
         "rank": rank,
         "reference_seconds": reference_seconds,
+        "structural_query_layout_hash": next(iter(structural_layout_hashes)),
+        "structural_layout_shared": True,
         "warm_calls": {
             label: candidate[3].counters.warm_invocations
             for label, candidate in candidates.items()
@@ -1880,6 +2336,8 @@ def main() -> None:
     world_size = int(os.environ["WORLD_SIZE"])
     installed_wheel = _installed_wheel_metadata()
     torch.cuda.set_device(local_rank)
+    worker_device = _worker_device_metadata(rank, local_rank)
+    _cp2_record("worker_device_ready", **worker_device)
     process_group_timeout = (
         1800
         if arguments.case
@@ -1908,6 +2366,7 @@ def main() -> None:
             report = _run_cp8_natural_backward(rank, world_size)
         else:
             raise AssertionError("unreachable distributed case")
+        report["worker_device"] = worker_device
         if installed_wheel is not None:
             report["installed_wheel"] = installed_wheel
         if arguments.case == "smoke":
