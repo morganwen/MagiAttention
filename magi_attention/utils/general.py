@@ -46,6 +46,26 @@ def ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
+def _make_device_tensor(
+    values: Any,
+    *,
+    dtype: torch.dtype | None = None,
+    device: torch.device | int | None = None,
+) -> torch.Tensor:
+    """Materialize host metadata through pinned non-blocking H2D.
+
+    The input dtype is preserved or inferred when ``dtype`` is omitted, and the
+    current CUDA device is used when ``device`` is omitted. Host planning stays
+    on the CPU and only crosses to the device through this one-way copy, so no
+    caller needs a ``.cpu()``/``.item()`` round trip.
+    """
+
+    host_tensor = torch.as_tensor(values, dtype=dtype)
+    if device is None:
+        device = torch.cuda.current_device()
+    return host_tensor.pin_memory().to(device=device, non_blocking=True)
+
+
 def rprint_rank(
     msg: str,
     rank: int | None = None,

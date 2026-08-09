@@ -310,9 +310,12 @@ class DynamicAttnSolver(BaseDistAttnSolver):
         except Exception as e:  # pragma: no cover - debug only
             raise e
 
+    # Both intersection helpers are pure two-pointer scans over ranges, so they
+    # are static and reusable by _calc_group_collective_arg_from_ranges below.
+    # Existing ``self._calc_intersection*`` call sites keep working unchanged.
+    @staticmethod
     @nvtx.instrument_nvtx
     def _calc_intersection_with_index(
-        self,
         rangesA: AttnRanges,
         rangesB: list[tuple[AttnRange, int]],
     ) -> list[list[int]]:
@@ -339,9 +342,9 @@ class DynamicAttnSolver(BaseDistAttnSolver):
                 j += 1
         return intersections
 
+    @staticmethod
     @nvtx.instrument_nvtx
     def _calc_intersection(
-        self,
         rangesA: AttnRanges,
         rangesB: AttnRanges,
     ) -> list[list[int]]:
@@ -497,6 +500,112 @@ class DynamicAttnSolver(BaseDistAttnSolver):
             else self.split_alignment_qo,
         )
         return group_collective_arg
+
+    @staticmethod
+    def _calc_group_collective_arg_from_ranges(
+        *,
+        host_ranges: list[AttnRanges],
+        calc_ranges_per_rank: list[AttnRanges],
+        cp_rank: int,
+        cp_size: int,
+        cp_group: dist.ProcessGroup | None,
+        cp_mesh: DeviceMesh | None,
+        deterministic: bool,
+        split_alignment: int,
+        calc_local_range: bool,
+    ) -> GroupCollectiveArg:
+        """Plan one group collective from plain owner and consumer ranges.
+
+        This is the bucket-free form of :meth:`_calc_group_collective_arg`. It
+        takes the owner ranges each rank holds and the ranges each rank needs,
+        and returns the same host-side :class:`GroupCollectiveArg` the dense CP
+        path uses. Extensions that route their own payloads over CP reuse this
+        instead of re-deriving splits and rank routes.
+        """
+
+        # =========== process local-calc-remote-hold message ===========
+        indexed_remote_hold_ranges = []
+        for idx, intervals in enumerate(host_ranges):
+            # if calc_local_range == True, host range needs send to itself
+            if (idx != cp_rank) or calc_local_range:
+                indexed_remote_hold_ranges.extend(
+                    [(interval, idx) for interval in intervals]
+                )
+        # sort with range start
+        indexed_remote_hold_ranges.sort(key=lambda x: x[0].start)
+
+        local_calc_ranges = calc_ranges_per_rank[cp_rank]
+        # local_calc_ranges is sorted and merged
+        intersections = DynamicAttnSolver._calc_intersection_with_index(
+            local_calc_ranges, indexed_remote_hold_ranges
+        )
+
+        # splict_size = end - start
+        output_split_size_list = [x[1] - x[0] for x in intersections]
+        src_index_list = [x[2] for x in intersections]
+
+        # =========== process local-hold-remote-calc message ===========
+        host_ranges_this_rank: AttnRanges = host_ranges[cp_rank]
+        # host_ranges is sorted and merged
+
+        # Obtain the sending ranges and ranks using the scan line method
+        scanning_line_event = []
+        for remote_rank in range(cp_size):
+            # calc global range do not need host range communicate to itself
+            if (not calc_local_range) and remote_rank == cp_rank:
+                continue
+            remote_calc_ranges = calc_ranges_per_rank[remote_rank]
+
+            intersections = DynamicAttnSolver._calc_intersection(
+                host_ranges_this_rank, remote_calc_ranges
+            )
+            for interval in intersections:
+                # add remote rank at start and delete at end
+                # event msg = +- (remote_rank + 1) to deal with remote_rank = 0
+                scanning_line_event.append((interval[0], remote_rank + 1))
+                scanning_line_event.append((interval[1], -remote_rank - 1))
+
+        scanning_line_event.sort(key=lambda x: x[0])
+
+        input_split_size_list = []
+        dst_indices_list = []
+        dst_indices: set[int] = set()
+        i = 0
+        for host_range in host_ranges_this_rank:
+            cur_start = host_range.start
+            while cur_start < host_range.end:
+                while (
+                    i < len(scanning_line_event)
+                    and scanning_line_event[i][0] <= cur_start
+                ):
+                    event_msg = scanning_line_event[i][1]
+                    if event_msg > 0:
+                        add_rank = event_msg - 1
+                        dst_indices.add(add_rank)
+                    else:
+                        del_rank = -event_msg - 1
+                        dst_indices.remove(del_rank)
+                    i += 1
+                if i < len(scanning_line_event):
+                    cur_end = min(host_range.end, scanning_line_event[i][0])
+                else:
+                    cur_end = host_range.end
+                input_split_size_list.append(cur_end - cur_start)
+                dst_indices_list.append(list(dst_indices))
+                cur_start = cur_end
+
+        return GroupCollectiveArg(
+            input_split_size_list=input_split_size_list,
+            output_split_size_list=output_split_size_list,
+            dst_indices_list=dst_indices_list,
+            src_index_list=src_index_list,
+            rank=cp_rank,
+            world_size=cp_size,
+            group=cp_group,
+            device_mesh=cp_mesh,
+            deterministic=deterministic,
+            split_alignment=split_alignment,
+        )
 
     @nvtx.instrument_nvtx
     def make_comm_meta(self) -> CommMeta:
