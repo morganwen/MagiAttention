@@ -163,14 +163,9 @@ def dsa_reference(
     total_tokens = cu[-1]
     positions = dsa_position_ids(cu, device=x.device)
 
-    if layer.compressor is not None:
-        compressed_kv, sample_block_offsets, sample_block_counts = _compress_global(
-            layer.compressor, x, cu
-        )
-    else:
-        compressed_kv = x.new_empty((0, config.head_dim))
-        sample_block_offsets = tuple(0 for _ in range(len(cu) - 1))
-        sample_block_counts = tuple(0 for _ in range(len(cu) - 1))
+    compressed_kv, sample_block_offsets, sample_block_counts = _compress_global(
+        layer.compressor, x, cu
+    )
 
     if layer.indexer is not None:
         q_index, weights = layer.indexer.project_queries(
@@ -224,7 +219,7 @@ def dsa_reference(
             global_row = sample_begin + position
             raw_begin = max(0, position - config.window_size + 1)
             raw_rows = latent_kv[sample_begin + raw_begin : global_row + 1]
-            visible = (position + 1) // config.ratio if config.ratio else 0
+            visible = (position + 1) // config.ratio
 
             if config.ratio == 4:
                 if visible:
@@ -257,20 +252,12 @@ def dsa_reference(
                 selected_compressed = sample_compressed_kv.index_select(
                     0, selected_local
                 )
-            elif config.ratio == 128:
+            else:
                 selected_length = 0
                 selected_local = torch.arange(
                     visible, device=x.device, dtype=torch.int64
                 )
                 selected_compressed = sample_compressed_kv[:visible]
-                topk_row = torch.empty(0, device=x.device, dtype=torch.int32)
-                indexer_lse = torch.full(
-                    (), float("-inf"), device=x.device, dtype=torch.float32
-                )
-            else:
-                selected_length = 0
-                selected_local = torch.empty(0, device=x.device, dtype=torch.int64)
-                selected_compressed = latent_kv.new_empty((0, config.head_dim))
                 topk_row = torch.empty(0, device=x.device, dtype=torch.int32)
                 indexer_lse = torch.full(
                     (), float("-inf"), device=x.device, dtype=torch.float32
