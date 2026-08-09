@@ -141,8 +141,6 @@ image_flashmla_pro_patch_revision="$(image_label \
     "org.magi-dsa.flashmla-pro-h128-patch-revision")"
 image_flashmla_pro_patch_sha256="$(image_label \
     "org.magi-dsa.flashmla-pro-h128-patch-sha256")"
-pack_sha="$(sha256sum "$repo_root/extensions/magi_attn_extensions/DSA/kernels/cutedsl/pack.py" | cut -c1-16)"
-aot_dir="${MAGI_DSA_CUTE_AOT:-$repo_root/.cache/magi-dsa-v4/aot-cutlass-4.5.0-sm103-$pack_sha}"
 cudnn_cache_dir="${MAGI_DSA_CUDNN_CACHE:-$repo_root/.cache/magi-dsa-v4/cudnn-dsa-9.24.0.43-frontend-35fd7b0d-cutlass-4.5.0-sm103}"
 run_scope="cp8"
 if [[ "$world_size" == "2" ]]; then
@@ -158,7 +156,7 @@ if [[ -e "$artifact_dir" ]]; then
     echo "refusing to overwrite existing artifact directory: $artifact_dir" >&2
     exit 1
 fi
-mkdir -p "$artifact_dir/workdir" "$aot_dir" "$cudnn_cache_dir/cuda" \
+mkdir -p "$artifact_dir/workdir" "$cudnn_cache_dir/cuda" \
     "$cudnn_cache_dir/cute-dsl" "$cudnn_cache_dir/magi-workspace" \
     "$rank_cache_dir/launcher/quack" "$rank_cache_dir/launcher/tmp" \
     "$rank_cache_dir/launcher/torch-extensions" \
@@ -166,7 +164,7 @@ mkdir -p "$artifact_dir/workdir" "$aot_dir" "$cudnn_cache_dir/cuda" \
     "$rank_cache_dir/launcher/torchinductor" \
     "$rank_cache_dir/launcher/triton" "$rank_cache_dir/launcher/xdg" \
     "$rank_cache_dir/workers"
-chmod 0777 "$artifact_dir" "$aot_dir" "$cudnn_cache_dir" \
+chmod 0777 "$artifact_dir" "$cudnn_cache_dir" \
     "$cudnn_cache_dir/cuda" "$cudnn_cache_dir/cute-dsl"
 chmod 0777 "$cudnn_cache_dir/magi-workspace"
 chmod 0777 "$artifact_dir/workdir" "$rank_cache_dir" \
@@ -176,20 +174,6 @@ chmod 0777 "$artifact_dir/workdir" "$rank_cache_dir" \
     "$rank_cache_dir/launcher/torchinductor" \
     "$rank_cache_dir/launcher/triton" "$rank_cache_dir/launcher/xdg" \
     "$rank_cache_dir/workers"
-if [[ "$case_name" == csa-* || "$case_name" == cp8-* ]]; then
-    aot_required="1"
-    mapfile -t required_aot_objects < <(
-        python3 "$repo_root/scripts/test/dsa_pack_aot_manifest.py"
-    )
-    for object_name in "${required_aot_objects[@]}"; do
-        if [[ ! -f "$aot_dir/$object_name" ]]; then
-            echo "missing CuTe AOT object $object_name; run bash scripts/test/prewarm_cute.sh" >&2
-            exit 1
-        fi
-    done
-else
-    aot_required="0"
-fi
 container_name="magi-dsa-$run_scope-$case_name-$$"
 runner_pid=""
 runner_pgid=""
@@ -204,7 +188,6 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "artifact_dir=$artifact_dir" | tee "$artifact_dir/COMMAND.txt"
-echo "aot_dir=$aot_dir" | tee -a "$artifact_dir/COMMAND.txt"
 echo "cudnn_cache_dir=$cudnn_cache_dir" | tee -a "$artifact_dir/COMMAND.txt"
 echo "rank_cache_dir=$rank_cache_dir" | tee -a "$artifact_dir/COMMAND.txt"
 echo "rank_cache_policy=per-run-per-rank" | tee -a "$artifact_dir/COMMAND.txt"
@@ -327,8 +310,6 @@ setsid timeout --signal=TERM --kill-after=5s "${total_deadline_seconds}s" docker
     --env CUTE_DSL_CACHE_DIR=/cudnn-dsa-cache/cute-dsl \
     --env MAGI_DSA_RANK_CACHE_ROOT=/rank-cache/workers \
     --env MAGI_DSA_CP2_ARTIFACT_DIR=/cp2-artifact \
-    --env MAGI_DSA_CUTE_AOT_DIR=/dsa-pack-aot \
-    --env "MAGI_DSA_CUTE_AOT_REQUIRED=$aot_required" \
     --env MAGI_DSA_PHASE_LOG=1 \
     --env MAGI_ATTENTION_WORKSPACE_BASE=/cudnn-dsa-cache/magi-workspace \
     --env QUACK_CACHE_DIR=/rank-cache/launcher/quack \
@@ -344,7 +325,6 @@ setsid timeout --signal=TERM --kill-after=5s "${total_deadline_seconds}s" docker
     "${source_environment[@]}" \
     "${installed_environment[@]}" \
     --env "TORCH_DISTRIBUTED_DEBUG=$torch_distributed_debug" \
-    --volume "$aot_dir:/dsa-pack-aot:ro" \
     --volume "$artifact_dir:/cp2-artifact" \
     --volume "$cudnn_cache_dir:/cudnn-dsa-cache" \
     --volume "$rank_cache_dir:/rank-cache" \

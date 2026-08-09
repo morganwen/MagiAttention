@@ -823,7 +823,6 @@ def test_release_orchestrator_builds_once_and_reuses_one_image_id() -> None:
     assert "provided_artifacts != 0 && provided_artifacts != 3" in source
     assert "generate_artifacts=1" in source
     for command in (
-        'MAGI_DSA_IMAGE="$image" bash "$repo_root/scripts/test/prewarm_cute.sh"',
         'bash "$repo_root/scripts/test/run_cp1.sh"',
         "--world-size 2",
         "--case csa-natural-backward",

@@ -25,8 +25,8 @@ from magi_attn_extensions.DSA.config import (
     DsaStructuralLayoutConfig,
     MagiDSAConfig,
 )
-from magi_attn_extensions.DSA.layer import MagiDSALayer
-from magi_attn_extensions.DSA.packing import copy_dsa_device_map
+from magi_attn_extensions.DSA.modeling import MagiDSALayer
+from magi_attention.common.range_op import range_gather
 from magi_attn_extensions.DSA.reference import (
     _compress_global,
     assert_backend_native_topk_outputs_close,
@@ -57,10 +57,9 @@ def test_cp1_csa_indexer_raw_scores_match_pure_pytorch_reference() -> None:
         device="cuda",
         dtype=torch.bfloat16,
     )
-    meta = MagiDSAPackedMeta((0, tokens), tokens)
+    meta = MagiDSAPackedMeta((0, tokens), (tokens,))
     runtime = MagiDSARuntimeMgr(
         config,
-        policy="structural_balanced",
         structural_layout_config=DsaStructuralLayoutConfig(),
     )
     handle = runtime.prepare_execution(
@@ -111,7 +110,11 @@ def test_cp1_csa_indexer_raw_scores_match_pure_pytorch_reference() -> None:
             x,
             meta.cu_seqlens,
         )
-        grouped_k = copy_dsa_device_map(compressed_ki, indexer_map.k_pack)
+        grouped_k = range_gather(
+            compressed_ki,
+            indexer_map.k_gather_ranges,
+            total_size=indexer_map.packed_k_rows,
+        )
         score_weights = weights
         DSA.indexer_forward_wrapper = capture_score
         DSA.indexer_top_k_wrapper = capture_topk
@@ -184,10 +187,9 @@ def test_cp1_csa_release_forward_matches_reference() -> None:
         torch.randn(tokens, config.head_dim, device="cuda", dtype=torch.bfloat16) * 0.25
     ).contiguous()
     sink = torch.randn(config.num_query_heads, device="cuda", dtype=torch.float32)
-    meta = MagiDSAPackedMeta((0, tokens), tokens)
+    meta = MagiDSAPackedMeta((0, tokens), (tokens,))
     runtime = MagiDSARuntimeMgr(
         config,
-        policy="structural_balanced",
         structural_layout_config=DsaStructuralLayoutConfig(),
     )
     handle = runtime.prepare_execution(
@@ -197,7 +199,7 @@ def test_cp1_csa_release_forward_matches_reference() -> None:
 
     with torch.no_grad():
         expected = dsa_reference(layer, x, qr, q, latent_kv, sink, meta.cu_seqlens)
-        actual = runtime.calc_dsa(layer, dsa_input, handle)
+        actual = runtime.calc_dsa(layer.projections(), dsa_input, handle)
     torch.cuda.synchronize()
 
     output_diagnostics = assert_backend_native_topk_outputs_close(
@@ -249,10 +251,9 @@ def test_cp1_csa_natural_backward_matches_all_input_and_parameter_gradients() ->
     sink_value = torch.randn(config.num_query_heads, device="cuda", dtype=torch.float32)
     actual_sink = sink_value.clone().requires_grad_(True)
     reference_sink = sink_value.clone().requires_grad_(True)
-    meta = MagiDSAPackedMeta((0, tokens), tokens)
+    meta = MagiDSAPackedMeta((0, tokens), (tokens,))
     runtime = MagiDSARuntimeMgr(
         config,
-        policy="structural_balanced",
         structural_layout_config=DsaStructuralLayoutConfig(),
     )
     handle = runtime.prepare_execution(
@@ -260,7 +261,7 @@ def test_cp1_csa_natural_backward_matches_all_input_and_parameter_gradients() ->
     )
 
     actual = runtime.calc_dsa(
-        actual_layer,
+        actual_layer.projections(),
         MagiDSAInput(
             actual_x,
             actual_qr,
@@ -360,10 +361,9 @@ def test_cp1_csa_overlap_backward_supports_retain_graph() -> None:
         dtype=torch.float32,
         requires_grad=True,
     )
-    meta = MagiDSAPackedMeta((0, tokens), tokens)
+    meta = MagiDSAPackedMeta((0, tokens), (tokens,))
     runtime = MagiDSARuntimeMgr(
         config,
-        policy="structural_balanced",
         structural_layout_config=DsaStructuralLayoutConfig(),
     )
     handle = runtime.prepare_execution(
@@ -372,7 +372,7 @@ def test_cp1_csa_overlap_backward_supports_retain_graph() -> None:
         local_token_capacity=tokens,
     )
     result = runtime.calc_dsa(
-        layer,
+        layer.projections(),
         MagiDSAInput(x, qr, q, latent_kv, sink, meta),
         handle,
     )
@@ -404,7 +404,7 @@ def test_cp1_csa_overlap_backward_supports_retain_graph() -> None:
         )
 
 
-@pytest.mark.parametrize("ratio", [0, 128])
+@pytest.mark.parametrize("ratio", [128])
 def test_cp1_window_and_hca_ragged_forward_backward_match_reference(
     ratio: DsaRatio,
 ) -> None:
@@ -432,13 +432,13 @@ def test_cp1_window_and_hca_ragged_forward_backward_match_reference(
     sink_value = torch.randn(config.num_query_heads, device="cuda", dtype=torch.float32)
     actual_sink = sink_value.clone().requires_grad_(True)
     reference_sink = sink_value.clone().requires_grad_(True)
-    meta = MagiDSAPackedMeta(cu_seqlens, tokens)
+    meta = MagiDSAPackedMeta(cu_seqlens, (tokens,))
     runtime = MagiDSARuntimeMgr(config)
     handle = runtime.prepare_execution(
         meta, torch.device("cuda"), local_token_capacity=tokens
     )
     actual = runtime.calc_dsa(
-        actual_layer,
+        actual_layer.projections(),
         MagiDSAInput(actual_x, actual_qr, actual_q, actual_kv, actual_sink, meta),
         handle,
     )

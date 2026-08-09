@@ -30,8 +30,8 @@ from typing import Any, cast
 import torch
 import torch.distributed as dist
 from magi_attn_extensions.DSA.comm import unlayout_dsa_query_tensor
-from magi_attn_extensions.DSA.config import DsaPlanPolicy, MagiDSAConfig
-from magi_attn_extensions.DSA.layer import MagiDSALayer
+from magi_attn_extensions.DSA.config import MagiDSAConfig
+from magi_attn_extensions.DSA.modeling import MagiDSALayer
 from magi_attn_extensions.DSA.model_adapter import layout_and_project_dsa_input
 from magi_attn_extensions.DSA.nvtx import dsa_nvtx_range
 from magi_attn_extensions.DSA.runtime import MagiDSARuntimeMgr
@@ -41,10 +41,8 @@ from magi_attn_extensions.DSA.types import (
     MagiDSAPackedMeta,
 )
 
-_POLICY_BY_PLAN: dict[str, DsaPlanPolicy] = {
-    "balanced": "indexer_balanced",
-    "sequential": "sequential",
-}
+# One planner remains, so a "plan" is now only an artifact-directory label.
+_PLAN_LABELS = ("balanced", "sequential")
 _STEP_MODES = ("forward", "forward-backward")
 _TENSOR_NAMES = ("x", "qr", "q", "latent_kv", "sink")
 _INDEXER_BACKWARD_DIAGNOSTICS_ENV = "MAGI_DSA_INDEXER_BACKWARD_DIAGNOSTICS"
@@ -90,7 +88,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mode", choices=("diagnostic", "profile", "smoke"), required=True
     )
-    parser.add_argument("--plan", choices=tuple(_POLICY_BY_PLAN), default="sequential")
+    parser.add_argument("--plan", choices=_PLAN_LABELS, default="balanced")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--steps", type=int, default=5)
     parser.add_argument("--step-mode", choices=_STEP_MODES, default="forward")
@@ -385,15 +383,15 @@ def _install_backward_pipeline_diagnostics(
 
     dist_dsa_module = importlib.import_module("magi_attn_extensions.DSA.dist")
     dsa_comm_module = importlib.import_module("magi_attn_extensions.DSA.comm")
-    dsa_layer_module = importlib.import_module("magi_attn_extensions.DSA.layer")
+    dsa_layer_module = importlib.import_module("magi_attn_extensions.DSA.modeling")
     dsa_compressor_module = importlib.import_module(
         "magi_attn_extensions.DSA.kernels.triton.compressor"
     )
     dsa_rope_module = importlib.import_module(
         "magi_attn_extensions.DSA.kernels.triton.rope"
     )
-    original_copy_with_csr = dist_dsa_module.copy_dsa_tensor_with_csr
-    original_reverse_received_route = dsa_comm_module._reverse_received_route
+    original_support_gather = dist_dsa_module.gather_compressor_support
+    original_finish_reverse_route = dsa_comm_module.finish_dsa_reverse_route
     original_rms_norm = dsa_layer_module._apply_fused_rms_norm
     original_compressor_reduce = dsa_compressor_module.fused_csa_compressor_reduce
     original_rope_hadamard = dsa_rope_module.fused_dsa_rope_hadamard
@@ -404,40 +402,25 @@ def _install_backward_pipeline_diagnostics(
                 lambda grad: _queue_backward_pipeline_diagnostic(label, grad)
             )
 
-    def diagnostic_copy_with_csr(
-        source: torch.Tensor,
-        copy_map: Any,
-        reduce_map: Any,
-        nvtx_scope: str,
+    def diagnostic_support_gather(
+        overlap_x: torch.Tensor,
+        compression: Any,
+        support: int,
     ) -> torch.Tensor:
-        output = original_copy_with_csr(
-            source,
-            copy_map,
-            reduce_map,
-            nvtx_scope=nvtx_scope,
-        )
-        if nvtx_scope == "csa::indexer_key_support" and torch.is_grad_enabled():
-            attach_gradient(
-                "compressed_ki_grad_after_key_csr",
-                source,
-            )
-            attach_gradient(
-                "grouped_k_grad_before_key_csr",
-                output,
-            )
+        output = original_support_gather(overlap_x, compression, support)
+        if torch.is_grad_enabled():
+            attach_gradient("overlap_x_grad_after_support_gather", overlap_x)
+            attach_gradient("packed_support_grad_before_gather", output)
         return output
 
-    def diagnostic_reverse_received_route(
-        received_order: torch.Tensor,
-        route: Any,
-        group: dist.ProcessGroup | None,
-    ) -> torch.Tensor:
+    def diagnostic_finish_reverse_route(transfer: Any) -> torch.Tensor:
+        route = transfer.route
         if route.name == "COMPRESSED_KI":
             _queue_backward_pipeline_diagnostic(
                 "compressed_ki_route_grad_before_reverse_exchange",
-                received_order,
+                transfer.output,
             )
-        output = original_reverse_received_route(received_order, route, group)
+        output = original_finish_reverse_route(transfer)
         if route.name == "COMPRESSED_KI":
             _queue_backward_pipeline_diagnostic(
                 "compressed_ki_local_grad_after_reverse_owner_reduce",
@@ -510,11 +493,11 @@ def _install_backward_pipeline_diagnostics(
         attach_gradient("indexer_compressor_output_grad", output)
         attach_gradient("indexer_compressor_packed_input_grad", inputs[0])
 
-    setattr(dist_dsa_module, "copy_dsa_tensor_with_csr", diagnostic_copy_with_csr)
+    setattr(dist_dsa_module, "gather_compressor_support", diagnostic_support_gather)
     setattr(
         dsa_comm_module,
-        "_reverse_received_route",
-        diagnostic_reverse_received_route,
+        "finish_dsa_reverse_route",
+        diagnostic_finish_reverse_route,
     )
     setattr(dsa_layer_module, "_apply_fused_rms_norm", diagnostic_rms_norm)
     setattr(
@@ -635,6 +618,9 @@ def _make_inputs(
             "the profile token count must be positive and divisible by world size"
         )
     local_tokens = tokens // world_size
+    # The profile shards the source evenly, and the planner is told that split
+    # explicitly so no rank has to gather it.
+    source_counts = tuple(local_tokens for _ in range(world_size))
     shapes: dict[str, tuple[int, ...]] = {
         "x": (local_tokens, config.hidden_size),
         "sink": (config.num_query_heads,),
@@ -653,7 +639,7 @@ def _make_inputs(
     source = _ProfileSource(
         x=tensors["x"],
         sink=tensors["sink"],
-        packed_meta=MagiDSAPackedMeta((0, tokens), local_tokens),
+        packed_meta=MagiDSAPackedMeta((0, tokens), tuple(source_counts)),
     )
     identities = {
         name: (tensor.data_ptr(), tensor._version)
@@ -882,13 +868,12 @@ def _prepare_runtimes(
         runtime = MagiDSARuntimeMgr(
             layer.config,
             dist.group.WORLD,
-            policy=_POLICY_BY_PLAN[plan],
         )
         handle = runtime.prepare_execution(
             source.packed_meta,
             source.x.device,
             local_token_capacity=max(
-                source.packed_meta.local_token_count,
+                source.packed_meta.local_token_count(rank),
                 (source.packed_meta.cu_seqlens[-1] + dist.get_world_size() - 1)
                 // dist.get_world_size(),
             ),
@@ -1408,7 +1393,7 @@ def _rank_metadata(
         "indexer_k_packing": indexer_packing,
         "plan": plan,
         "plan_hash": handle.plan_hash,
-        "policy": handle.plan.policy,
+        "policy": "structural_balanced",
         "predicted_score_cost": rank_plan.predicted_score_cost,
         "predicted_topk_cost": rank_plan.predicted_topk_cost,
         "query_fragments": len(rank_plan.query_fragments),
@@ -2433,7 +2418,7 @@ def main() -> None:
             ),
             "input_sha256": input_sha256,
             "input_tensor_sha256": input_tensor_sha256,
-            "local_source_tokens": source.packed_meta.local_token_count,
+            "local_source_tokens": source.packed_meta.local_token_count(rank),
             "mode": args.mode,
             "backward_seed": (
                 "precomputed_global_mean_scaled_dout_and_unit_dkl"

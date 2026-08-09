@@ -64,13 +64,11 @@ from dsa_v4.profile_5step import (  # noqa: E402
     _wait_for_file,
 )
 from magi_attn_extensions.DSA.config import (  # noqa: E402
-    DsaPlanPolicy,
-    DsaSharedLayoutConfig,
     DsaStructuralLayoutConfig,
     MagiDSAConfig,
     MagiDSAProModelSpec,
 )
-from magi_attn_extensions.DSA.layer import MagiDSALayer  # noqa: E402
+from magi_attn_extensions.DSA.modeling import MagiDSALayer  # noqa: E402
 from magi_attn_extensions.DSA.nvtx import dsa_nvtx_range  # noqa: E402
 from magi_attn_extensions.DSA.pro_runtime import (  # noqa: E402
     MagiDSAProExecutionBundle,
@@ -96,14 +94,6 @@ class _CaptureSpec:
     representative_layer_ids: dict[str, int] | None = None
 
 
-_ATTENTION_SUITE_SPEC = _CaptureSpec(
-    step_mode="attention-suite",
-    forward_order=("w", "csa", "hca"),
-    outer_nvtx="$Magi_DSA/capture_five_attention_suite_steps",
-    module_scope="attention_suite",
-    merged_label="merged_w_csa_hca",
-    parameter_gradient_allreduce="one_unified_after_three_backwards",
-)
 _PRO_PAIR_SPEC = _CaptureSpec(
     step_mode="pro-pair",
     forward_order=("csa", "hca"),
@@ -113,33 +103,22 @@ _PRO_PAIR_SPEC = _CaptureSpec(
     parameter_gradient_allreduce="one_unified_after_two_backwards",
     representative_layer_ids={"csa": 2, "hca": 3},
 )
-_CAPTURE_SPEC = _ATTENTION_SUITE_SPEC
+_CAPTURE_SPEC = _PRO_PAIR_SPEC
 _FORWARD_ORDER = _CAPTURE_SPEC.forward_order
 _BACKWARD_ORDER = tuple(reversed(_FORWARD_ORDER))
-_RATIO_BY_MODE: dict[str, Literal[0, 4, 128]] = {
-    "w": 0,
+_RATIO_BY_MODE: dict[str, Literal[4, 128]] = {
     "csa": 4,
     "hca": 128,
 }
-_LEGACY_POLICY_BY_MODE: dict[str, DsaPlanPolicy] = {
-    "w": "sequential",
-    "csa": "indexer_balanced",
-    "hca": "sequential",
-}
-_SHARED_KI_MEMORY_BUDGET_BYTES = 1 << 30
-_SHARED_KI_WORKSPACE_RESERVE_BYTES = 256 << 20
 _EXPECTED_ACTIVATION_GRADIENTS = {
-    0: frozenset(("q", "latent_kv", "sink")),
     4: frozenset(("x", "qr", "q", "latent_kv", "sink")),
     128: frozenset(("x", "q", "latent_kv", "sink")),
 }
 _EXPECTED_SENDRECV = {
-    "w": {"forward": 1, "backward": 1},
     "csa": {"forward": 4, "backward": 4},
     "hca": {"forward": 3, "backward": 3},
 }
 _BACKWARD_INTERNAL_STREAM_FIELDS = {
-    "w": (),
     "csa": (
         "sparse_backward_stream",
         "csa_main_stream",
@@ -157,7 +136,6 @@ def _configure_capture(step_mode: str) -> None:
     global _BACKWARD_ORDER, _CAPTURE_SPEC, _FORWARD_ORDER
 
     specs = {
-        _ATTENTION_SUITE_SPEC.step_mode: _ATTENTION_SUITE_SPEC,
         _PRO_PAIR_SPEC.step_mode: _PRO_PAIR_SPEC,
     }
     try:
@@ -212,14 +190,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--steps", type=int, default=5)
     parser.add_argument(
         "--step-mode",
-        choices=("attention-suite", "pro-pair"),
+        choices=("pro-pair",),
         required=True,
     )
     parser.add_argument("--tokens", type=int, required=True)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument(
         "--layout-policy",
-        choices=("legacy", "shared-greedy", "structural-balanced"),
+        choices=("structural-balanced",),
         default="legacy",
     )
     parser.add_argument("--local-improvement-passes", type=int, default=4)
@@ -227,24 +205,12 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _shared_layout_config(
-    local_improvement_passes: int,
-) -> DsaSharedLayoutConfig:
-    return DsaSharedLayoutConfig(
-        ki_memory_budget_bytes=_SHARED_KI_MEMORY_BUDGET_BYTES,
-        ki_workspace_reserve_bytes=_SHARED_KI_WORKSPACE_RESERVE_BYTES,
-        local_improvement_passes=local_improvement_passes,
-    )
-
-
 def _prepare_runtime(
     config: MagiDSAConfig,
     source: _ProfileSource,
-    policy: DsaPlanPolicy,
     artifact_dir: Path,
     rank: int,
     label: str,
-    shared_layout_config: DsaSharedLayoutConfig | None = None,
     structural_layout_config: DsaStructuralLayoutConfig | None = None,
 ) -> tuple[MagiDSARuntimeMgr, Any, float]:
     _record(
@@ -252,35 +218,24 @@ def _prepare_runtime(
         "prepare_begin",
         rank,
         attention_mode=label,
-        policy=policy,
+        policy="structural_balanced",
     )
     started = time.perf_counter()
     runtime = MagiDSARuntimeMgr(
         config,
         dist.group.WORLD,
-        policy=policy,
-        shared_layout_config=shared_layout_config,
         structural_layout_config=structural_layout_config,
     )
-    if policy == "shared_greedy":
-        local_token_capacity = source.packed_meta.cu_seqlens[-1]
-    elif policy == "structural_balanced":
-        local_token_capacity = max(
-            source.packed_meta.local_token_count,
-            (source.packed_meta.cu_seqlens[-1] + dist.get_world_size() - 1)
-            // dist.get_world_size(),
-        )
-    else:
-        local_token_capacity = max(
-            source.packed_meta.local_token_count,
-            (source.packed_meta.cu_seqlens[-1] + dist.get_world_size() - 1)
-            // dist.get_world_size(),
-        )
+    local_token_capacity = max(
+        source.packed_meta.local_token_count(rank),
+        (source.packed_meta.cu_seqlens[-1] + dist.get_world_size() - 1)
+        // dist.get_world_size(),
+    )
     handle = runtime.prepare_execution(
         source.packed_meta,
         source.x.device,
         local_token_capacity=local_token_capacity,
-        health_check=True,
+        health_check=False,
     )
     elapsed_seconds = time.perf_counter() - started
     _record(
@@ -290,7 +245,7 @@ def _prepare_runtime(
         attention_mode=label,
         counters=_counter_dict(runtime),
         plan_hash=handle.plan_hash,
-        policy=policy,
+        policy="structural_balanced",
         elapsed_seconds=elapsed_seconds,
     )
     return runtime, handle, elapsed_seconds
@@ -319,7 +274,7 @@ def _prepare_pro_runtime_bundle(
         structural_layout_config=structural_layout_config,
     )
     local_token_capacity = max(
-        source.packed_meta.local_token_count,
+        source.packed_meta.local_token_count(rank),
         (source.packed_meta.cu_seqlens[-1] + dist.get_world_size() - 1)
         // dist.get_world_size(),
     )
@@ -327,7 +282,7 @@ def _prepare_pro_runtime_bundle(
         source.packed_meta,
         source.x.device,
         local_token_capacity=local_token_capacity,
-        health_check=True,
+        health_check=False,
     )
     elapsed_seconds = time.perf_counter() - started
     _record(
@@ -961,7 +916,7 @@ def _runtime_metadata(case: _AttentionProfileCase, rank: int) -> dict[str, objec
         "final_query_tokens": rank_plan.local_token_count,
         "layer_id": case.layer.layer_id,
         "plan_hash": case.handle.plan_hash,
-        "policy": case.handle.plan.policy,
+        "policy": "structural_balanced",
         "query_layout_hash": case.handle.plan.query_layout_hash,
         "layout_key": (
             None
@@ -1020,7 +975,7 @@ def _pro_bundle_contract(
             "declared_local_token_capacity": case.handle.local_token_capacity,
             "layer_id": case.layer.layer_id,
             "plan_hash": case.handle.plan_hash,
-            "policy": case.handle.plan.policy,
+            "policy": "structural_balanced",
             "query_layout_hash": case.handle.plan.query_layout_hash,
             "ratio": case.handle.plan.ratio,
         }
@@ -1314,11 +1269,6 @@ def _run_profile(
         "step_mode": _CAPTURE_SPEC.step_mode,
         "token_layout_capture": "pre_capture_once_per_attention",
         "layout_policy": args.layout_policy,
-        "local_improvement_passes": (
-            args.local_improvement_passes
-            if args.layout_policy == "shared-greedy"
-            else None
-        ),
     }
     if _CAPTURE_SPEC is _PRO_PAIR_SPEC:
         report.update(_pro_bundle_contract(cases))
@@ -1351,26 +1301,12 @@ def main() -> None:
             f"the {_CAPTURE_SPEC.step_mode} profile requires 128K, five steps, "
             "and three warmups"
         )
-    if args.local_improvement_passes not in (0, 1, 4, 8):
-        raise ValueError(
-            "the dispatch ablation supports local improvement passes 0, 1, 4, or 8"
-        )
     if not 0 <= args.profiler_attach_warmup_steps <= 8:
         raise ValueError("profiler-attach warmup steps must be between zero and eight")
-    if _CAPTURE_SPEC is _PRO_PAIR_SPEC:
-        if args.layout_policy != "structural-balanced":
-            raise ValueError("the Pro pair requires structural-balanced layout")
-        if args.local_improvement_passes != 4 or args.profiler_attach_warmup_steps != 0:
-            raise ValueError("the formal Pro pair does not enable dispatch ablation")
-    else:
-        if args.layout_policy == "structural-balanced":
-            raise ValueError("structural-balanced is reserved for the Pro pair")
-        if args.layout_policy != "shared-greedy" and (
-            args.local_improvement_passes != 4 or args.profiler_attach_warmup_steps != 0
-        ):
-            raise ValueError(
-                "dispatch-ablation controls require the shared-greedy layout policy"
-            )
+    if args.layout_policy != "structural-balanced":
+        raise ValueError("the Pro pair requires the structural-balanced layout")
+    if args.profiler_attach_warmup_steps != 0:
+        raise ValueError("the formal Pro pair does not enable the attach warmup")
 
     torch.cuda.set_device(local_rank)
     dist.init_process_group("nccl", timeout=timedelta(minutes=10))
@@ -1416,16 +1352,7 @@ def main() -> None:
         input_tensor_sha256: dict[str, dict[str, str]] = {}
         parameter_sha256: dict[str, str] = {}
         runtimes: dict[str, tuple[MagiDSARuntimeMgr, Any, float]] = {}
-        shared_layout_config = _shared_layout_config(args.local_improvement_passes)
         structural_layout_config = DsaStructuralLayoutConfig()
-        if args.layout_policy == "shared-greedy":
-            policies: dict[str, DsaPlanPolicy] = {
-                mode: "shared_greedy" for mode in _FORWARD_ORDER
-            }
-        elif args.layout_policy == "structural-balanced":
-            policies = {mode: "structural_balanced" for mode in _FORWARD_ORDER}
-        else:
-            policies = {mode: _LEGACY_POLICY_BY_MODE[mode] for mode in _FORWARD_ORDER}
 
         pro_runtime: MagiDSAProRuntimeMgr | None = None
         pro_bundle: MagiDSAProExecutionBundle | None = None
@@ -1509,20 +1436,10 @@ def main() -> None:
                 runtime, handle, prepare_seconds = _prepare_runtime(
                     configs[mode],
                     source,
-                    policies[mode],
                     args.artifact_dir,
                     rank,
                     mode,
-                    shared_layout_config=(
-                        shared_layout_config
-                        if policies[mode] == "shared_greedy"
-                        else None
-                    ),
-                    structural_layout_config=(
-                        structural_layout_config
-                        if policies[mode] == "structural_balanced"
-                        else None
-                    ),
+                    structural_layout_config=structural_layout_config,
                 )
                 runtimes[mode] = (runtime, handle, prepare_seconds)
 
@@ -1539,7 +1456,7 @@ def main() -> None:
                 "hca": (pro_runtime.hca_runtime, pro_bundle.hca, prepare_seconds),
             }
 
-        if args.layout_policy in ("shared-greedy", "structural-balanced"):
+        if True:
             layout_hashes = {
                 runtimes[mode][1].plan.query_layout_hash for mode in _FORWARD_ORDER
             }
@@ -1678,25 +1595,11 @@ def main() -> None:
             "independent_attention_graphs": True,
             "input_sha256": input_sha256,
             "input_tensor_sha256": input_tensor_sha256,
-            "local_source_tokens": sources["csa"].packed_meta.local_token_count,
+            "local_source_tokens": sources["csa"].packed_meta.local_token_count(rank),
             "loss_capture": "none",
             "layout_policy": args.layout_policy,
-            "local_improvement_passes": (
-                args.local_improvement_passes
-                if args.layout_policy == "shared-greedy"
-                else None
-            ),
             "profiler_attach_warmup_steps": args.profiler_attach_warmup_steps,
-            "shared_layout_config": (
-                asdict(shared_layout_config)
-                if args.layout_policy == "shared-greedy"
-                else None
-            ),
-            "structural_layout_config": (
-                asdict(structural_layout_config)
-                if args.layout_policy == "structural-balanced"
-                else None
-            ),
+            "structural_layout_config": asdict(structural_layout_config),
             "mode": args.mode,
             "mode_serialization": "cuda_event_happens_before",
             "mode_backward_completion_join": {

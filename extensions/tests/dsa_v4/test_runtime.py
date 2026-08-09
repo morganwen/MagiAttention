@@ -21,7 +21,7 @@ from typing import Any
 import pytest
 import torch
 from magi_attn_extensions.DSA.config import DsaRatio, MagiDSAConfig, MagiDSAProModelSpec
-from magi_attn_extensions.DSA.layer import MagiDSALayer, MagiDSAProLayerStack
+from magi_attn_extensions.DSA.modeling import MagiDSALayer, MagiDSAProLayerStack
 from magi_attn_extensions.DSA.model_adapter import (
     layout_and_project_dsa_input,
     layout_source_hidden_once,
@@ -111,7 +111,7 @@ def test_model_adapter_projects_only_after_one_hidden_layout() -> None:
 
     source_x = torch.randn(4, config.hidden_size, dtype=torch.bfloat16).requires_grad_()
     sink = torch.zeros(config.num_query_heads, dtype=torch.float32)
-    meta = MagiDSAPackedMeta((0, 4), 4)
+    meta = MagiDSAPackedMeta((0, 4), (4,))
     handle = SimpleNamespace(
         device=source_x.device,
         device_plan=SimpleNamespace(local_token_count=4),
@@ -168,7 +168,7 @@ def test_model_adapter_projects_only_after_one_hidden_layout() -> None:
     assert layout_calls == 2
 
 
-@pytest.mark.parametrize("ratio", [0, 4, 128])
+@pytest.mark.parametrize("ratio", [4, 128])
 def test_runtime_is_parameter_free_and_layer_owns_all_trainable_state(
     ratio: DsaRatio,
 ) -> None:
@@ -319,7 +319,7 @@ def test_pro_stack_requires_explicit_materialization_and_all_csa_aux_losses() ->
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_pro_prepare_shares_one_layout_and_routes_source_hidden_once() -> None:
     runtime = MagiDSAProRuntimeMgr()
-    packed_meta = MagiDSAPackedMeta((0, 257), 257)
+    packed_meta = MagiDSAPackedMeta((0, 257), (257,))
     bundle = runtime.prepare_execution(
         packed_meta,
         torch.device("cuda"),
@@ -348,12 +348,15 @@ def test_pro_prepare_shares_one_layout_and_routes_source_hidden_once() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_cp1_prepare_is_cold_cached_and_health_checked_once() -> None:
     config = _small_config(4)
-    runtime = MagiDSARuntimeMgr(config, policy="indexer_balanced", max_cached_handles=2)
-    packed_meta = MagiDSAPackedMeta((0, 17), 17)
+    runtime = MagiDSARuntimeMgr(config, max_cached_handles=2)
+    packed_meta = MagiDSAPackedMeta((0, 17), (17,))
+    # The health check is a debugging dry run and is off by default, so it has
+    # to be asked for explicitly.
     first = runtime.prepare_execution(
         packed_meta,
         torch.device("cuda"),
         local_token_capacity=32,
+        health_check=True,
     )
     first_counters = runtime.counters
     second = runtime.prepare_execution(
@@ -387,7 +390,7 @@ def test_hca_prepare_owns_distinct_overlap_streams() -> None:
     config = _small_config(128)
     runtime = MagiDSARuntimeMgr(config, max_cached_handles=2)
     handle = runtime.prepare_execution(
-        MagiDSAPackedMeta((0, 257), 257),
+        MagiDSAPackedMeta((0, 257), (257,)),
         torch.device("cuda"),
         local_token_capacity=257,
     )

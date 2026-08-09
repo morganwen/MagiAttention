@@ -25,9 +25,9 @@ from typing import Iterator, Protocol, cast
 import magi_attn_extensions.DSA.dist as dist_dsa_module
 import pytest
 import torch
-from magi_attn_extensions.DSA import layer as dsa_layer_module
+from magi_attn_extensions.DSA import modeling as dsa_layer_module
 from magi_attn_extensions.DSA.config import DsaRatio, MagiDSAConfig
-from magi_attn_extensions.DSA.layer import MagiDSALayer
+from magi_attn_extensions.DSA.modeling import MagiDSALayer
 from magi_attn_extensions.DSA.nvtx import (
     DSA_CUDNN_CALL_NVTX_PREFIX,
     DSA_MODULE_NVTX_PREFIX,
@@ -737,7 +737,7 @@ def test_model_gradient_allreduce_validates_before_any_collective(
     source = _ProfileSource(
         x=torch.empty(0, config.hidden_size, dtype=torch.bfloat16),
         sink=sink,
-        packed_meta=MagiDSAPackedMeta((0, 0), 0),
+        packed_meta=MagiDSAPackedMeta((0, 0), (0,)),
     )
     for parameter in layer.parameters():
         parameter.grad = torch.ones_like(parameter)
@@ -780,7 +780,7 @@ def test_forward_backward_profile_reuses_post_projection_dsa_input_leaves(
             dtype=torch.float32,
             requires_grad=True,
         ),
-        packed_meta=MagiDSAPackedMeta((0, tokens), tokens),
+        packed_meta=MagiDSAPackedMeta((0, tokens), (tokens,)),
     )
     tensors = {
         "x": torch.randn(
@@ -882,7 +882,7 @@ def test_profile_dsa_input_boundary_detaches_layout_and_projection_graphs(
             dtype=torch.float32,
             requires_grad=True,
         ),
-        packed_meta=MagiDSAPackedMeta((0, tokens), tokens),
+        packed_meta=MagiDSAPackedMeta((0, tokens), (tokens,)),
     )
     layout_calls = 0
 
@@ -943,7 +943,7 @@ def test_forward_backward_profile_uses_precomputed_dout_and_dkl(monkeypatch) -> 
             dtype=torch.float32,
             requires_grad=True,
         ),
-        packed_meta=MagiDSAPackedMeta((0, tokens), tokens),
+        packed_meta=MagiDSAPackedMeta((0, tokens), (tokens,)),
     )
     tensors = {
         "x": torch.randn(
@@ -1052,7 +1052,7 @@ def _fake_attention_suite_case(
             dtype=torch.float32,
             requires_grad=True,
         ),
-        packed_meta=MagiDSAPackedMeta((0, tokens), tokens),
+        packed_meta=MagiDSAPackedMeta((0, tokens), (tokens,)),
     )
     tensors = {
         "x": torch.randn(
@@ -1190,7 +1190,7 @@ def test_pro_pair_prepares_one_hidden_layout_and_independent_boundaries(
             del bundle
             return handles["csa" if layer_id == 2 else "hca"]
 
-    packed_meta = MagiDSAPackedMeta((0, 4), 2)
+    packed_meta = MagiDSAPackedMeta((0, 4), (2, 2))
     source_x = torch.randn(2, 8, dtype=torch.bfloat16)
     sources = {
         mode: _ProfileSource(
@@ -1296,7 +1296,7 @@ def test_pro_pair_model_side_gradient_reducer_uses_fp32_bucket(monkeypatch) -> N
     try:
         _all_reduce_attention_suite_gradients(cases)  # type: ignore[arg-type]
     finally:
-        attention_suite_module._configure_capture("attention-suite")
+        attention_suite_module._configure_capture("pro-pair")
 
     assert reduced_dtypes == [torch.float32]
     for sink, parameter in owners:
@@ -1311,7 +1311,6 @@ def test_attention_suite_runs_three_independent_graphs_in_frozen_order(
 ) -> None:
     events: list[str] = []
     ratio_cases: tuple[tuple[str, DsaRatio], ...] = (
-        ("w", 0),
         ("csa", 4),
         ("hca", 128),
     )
@@ -1336,15 +1335,13 @@ def test_attention_suite_runs_three_independent_graphs_in_frozen_order(
         fake_allreduce,
     )
     results, inputs = _run_attention_suite_step(cases, rank=0)
-    assert list(results) == ["w", "csa", "hca"]
-    assert list(inputs) == ["w", "csa", "hca"]
+    assert list(results) == ["csa", "hca"]
+    assert list(inputs) == ["csa", "hca"]
     assert events == [
-        "forward:w",
         "forward:csa",
         "forward:hca",
         "backward:hca",
         "backward:csa",
-        "backward:w",
         "allreduce",
     ]
 
@@ -1401,7 +1398,6 @@ def test_attention_suite_backward_completion_joins_before_mode_done(
                 events.append(("nvtx_pop", name))
 
     ratio_cases: tuple[tuple[str, DsaRatio], ...] = (
-        ("w", 0),
         ("csa", 4),
         ("hca", 128),
     )
@@ -1493,20 +1489,16 @@ def test_attention_suite_backward_completion_joins_before_mode_done(
         assert backward_index < min(wait_indices) <= max(wait_indices) < done_index
         done_event_ids[mode] = done_event[2]
 
+    # The Pro pair serializes HCA before CSA in backward, so CSA's stream must
+    # observe HCA's completion event before its own backward is submitted.
     csa_waits_for_hca = events.index(
         ("wait_event", "csa_execution", done_event_ids["hca"])
     )
     assert csa_waits_for_hca < events.index("backward:csa")
-    w_waits_for_csa = events.index(("wait_event", "w_execution", done_event_ids["csa"]))
-    assert w_waits_for_csa < events.index("backward:w")
     allreduce_index = events.index(("allreduce", True))
     for event_id in done_event_ids.values():
         caller_wait = events.index(("wait_event", "caller", event_id))
         assert caller_wait < allreduce_index
-    assert not any(
-        isinstance(event, tuple) and event[:2] == ("wait_stream", "w_execution")
-        for event in events
-    )
 
     pushed = [
         event[1]
@@ -1522,13 +1514,13 @@ def test_attention_suite_backward_completion_joins_before_mode_done(
         ),
         "hca": ("hca_main_stream", "hca_route_stream"),
     }.items():
-        parent = "attention_suite::stream_overlap::" f"backward_completion_join::{mode}"
+        parent = "pro_pair::stream_overlap::" f"backward_completion_join::{mode}"
         assert parent in pushed
         for field in fields:
             assert f"{parent}::{field}" in pushed
 
 
-@pytest.mark.parametrize("step_mode", ("attention-suite", "pro-pair"))
+@pytest.mark.parametrize("step_mode", ("pro-pair",))
 def test_backward_completion_join_nvtx_is_capture_mode_specific(
     monkeypatch,
     step_mode: str,
@@ -1571,7 +1563,7 @@ def test_backward_completion_join_nvtx_is_capture_mode_specific(
             cast(_AttentionProfileCase, case),
         )
     finally:
-        attention_suite_module._configure_capture("attention-suite")
+        attention_suite_module._configure_capture("pro-pair")
 
     module_scope = "attention_suite" if step_mode == "attention-suite" else "pro_pair"
     parent = f"{module_scope}::stream_overlap::backward_completion_join::csa"
@@ -1587,7 +1579,7 @@ def test_attention_suite_profiler_attach_warmup_is_counter_audited(
 ) -> None:
     cases = {
         mode: SimpleNamespace(runtime=SimpleNamespace(calls=0))
-        for mode in ("w", "csa", "hca")
+        for mode in ("csa", "hca")
     }
     nvtx_events: list[tuple[str, str | None]] = []
 
@@ -1645,21 +1637,25 @@ def test_attention_suite_profiler_attach_warmup_is_counter_audited(
 
 
 def test_attention_suite_gradient_schema_is_ratio_specific() -> None:
+    """HCA feeds x into its Compressor but has no Indexer, so qr stays dry."""
+
     events: list[str] = []
-    case = _fake_attention_suite_case("w", 0, events)
+    case = _fake_attention_suite_case("hca", 128, events)
     dsa_input = case.boundary.value
+    dsa_input.x.grad = torch.ones_like(dsa_input.x)
     dsa_input.q.grad = torch.ones_like(dsa_input.q)
     dsa_input.latent_kv.grad = torch.ones_like(dsa_input.latent_kv)
     case.source.sink.grad = torch.ones_like(case.source.sink)
     snapshot = _attention_gradient_snapshot(case, dsa_input)
     assert set(snapshot) == {
+        "input::x",
         "input::q",
         "input::latent_kv",
         "input::sink",
     }
 
-    dsa_input.x.grad = torch.ones_like(dsa_input.x)
-    with pytest.raises(AssertionError, match="unexpectedly produced gradient: x"):
+    dsa_input.qr.grad = torch.ones_like(dsa_input.qr)
+    with pytest.raises(AssertionError, match="unexpectedly produced gradient: qr"):
         _attention_gradient_snapshot(case, dsa_input)
 
 

@@ -150,7 +150,6 @@ PY
 
 {
     echo "bash scripts/image/build.sh --revision $revision --tag $image"
-    echo "MAGI_DSA_IMAGE=$image bash scripts/test/prewarm_cute.sh"
     if ((generate_artifacts == 1)); then
         echo "bash scripts/test/run_cp1.sh --image $image"
         echo "bash scripts/test/run_multigpu.sh --world-size 2 --case csa-natural-backward --image $image --installed-wheel"
@@ -178,10 +177,6 @@ if [[ ! "$release_image_id" =~ ^sha256:[0-9a-f]{64}$ ]]; then
     exit 1
 fi
 printf '%s\n' "$release_image_id" >"$artifact_dir/IMAGE_ID.txt"
-
-echo "release stage=cute-aot image=$image image_id=$release_image_id"
-MAGI_DSA_IMAGE="$image" bash "$repo_root/scripts/test/prewarm_cute.sh" \
-    2>&1 | tee "$artifact_dir/CUTE_AOT.log"
 
 if ((generate_artifacts == 1)); then
     echo "release stage=cp1 image=$image image_id=$release_image_id"

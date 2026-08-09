@@ -12,128 +12,122 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Route planning contract.
+
+Magi-DSA states routes as ranges and lets MagiAttention Core lower them. These
+tests pin that boundary: the extension must not re-derive splits, rank routes or
+row permutations of its own.
+"""
+
 from __future__ import annotations
 
 import inspect
 
 from magi_attn_extensions.DSA import comm as dsa_comm
+from magi_attn_extensions.DSA import packing as dsa_packing
 from magi_attn_extensions.DSA.config import MagiDSAConfig
 from magi_attn_extensions.DSA.solver import build_dsa_execution_plan
 
 
-def test_all_typed_routes_have_symmetric_counts_and_unique_rows() -> None:
-    plan = build_dsa_execution_plan(
-        MagiDSAConfig(ratio=4, indexer_atom_size=8),
+def _plan(**kwargs):
+    return build_dsa_execution_plan(**kwargs)
+
+
+def test_every_routed_row_has_exactly_one_producer() -> None:
+    plan = _plan(
+        config=MagiDSAConfig(ratio=4),
         cu_seqlens=(0, 17, 49, 90),
         source_token_counts=(0, 13, 27, 50),
-        policy="indexer_balanced",
     )
-    route_names = (
-        "window_route",
-        "overlap_x_route",
-        "compressed_kv_route",
-        "compressed_ki_route",
+    for route in plan.routes():
+        owned: list[tuple[int, int]] = []
+        for ranges in route.owner_ranges_per_rank:
+            owned.extend(ranges)
+        owned.sort()
+        for (_, end), (next_begin, _) in zip(owned, owned[1:]):
+            assert end <= next_begin, f"{route.name} owner ranges overlap"
+
+
+def test_consumer_ranges_are_covered_by_the_owner_ranges() -> None:
+    """A consumer may only ask for rows that some rank actually produces."""
+
+    plan = _plan(
+        config=MagiDSAConfig(ratio=4),
+        cu_seqlens=(0, 17, 49, 90),
+        source_token_counts=(0, 13, 27, 50),
     )
-    for route_name in route_names:
-        routes = [getattr(rank, route_name) for rank in plan.rank_plans]
-        assert all(route is not None for route in routes)
-        for source, source_route in enumerate(routes):
-            assert source_route is not None
-            group_arg = source_route.group_collective_arg
-            assert group_arg.rank == source
-            assert group_arg.world_size == plan.cp_size
-            assert (
-                sum(group_arg.input_split_size_list) == source_route.producer_row_count
-            )
-            assert sum(group_arg.output_split_size_list) == len(
-                source_route.consumer_global_rows
-            )
-
-            input_segments: list[tuple[int, int, tuple[int, ...]]] = []
-            local_begin = 0
-            for split_size, destinations in zip(
-                group_arg.input_split_size_list,
-                group_arg.dst_indices_list,
-            ):
-                local_end = local_begin + split_size
-                input_segments.append((local_begin, local_end, destinations))
-                local_begin = local_end
-            rebuilt_send_rows: list[int] = []
-            rebuilt_send_counts: list[int] = []
-            for destination in range(plan.cp_size):
-                destination_rows = [
-                    row
-                    for begin, end, destinations in input_segments
-                    if destination in destinations
-                    for row in range(begin, end)
-                ]
-                rebuilt_send_counts.append(len(destination_rows))
-                rebuilt_send_rows.extend(destination_rows)
-            assert tuple(rebuilt_send_counts) == source_route.send_counts
-            assert tuple(rebuilt_send_rows) == source_route.send_source_rows
-
-            rebuilt_recv_counts = tuple(
-                sum(
-                    split_size
-                    for split_size, split_source in zip(
-                        group_arg.output_split_size_list,
-                        group_arg.src_index_list,
-                    )
-                    if split_source == peer
-                )
-                for peer in range(plan.cp_size)
-            )
-            assert rebuilt_recv_counts == source_route.recv_counts
-            assert len(set(source_route.consumer_global_rows)) == len(
-                source_route.consumer_global_rows
-            )
-            for destination, destination_route in enumerate(routes):
-                assert destination_route is not None
-                assert (
-                    source_route.send_counts[destination]
-                    == destination_route.recv_counts[source]
-                )
+    for route in plan.routes():
+        produced = set()
+        for ranges in route.owner_ranges_per_rank:
+            for begin, end in ranges:
+                produced.update(range(begin, end))
+        for rank, ranges in enumerate(route.consumer_ranges_per_rank):
+            for begin, end in ranges:
+                missing = set(range(begin, end)) - produced
+                assert not missing, f"{route.name} rank {rank} wants unowned rows"
 
 
 def test_token_layout_route_is_a_global_bijection() -> None:
-    plan = build_dsa_execution_plan(
-        MagiDSAConfig(ratio=4, indexer_atom_size=4),
+    plan = _plan(
+        config=MagiDSAConfig(ratio=4),
         cu_seqlens=(0, 9, 21),
         source_token_counts=(7, 0, 5, 9),
-        policy="indexer_balanced",
     )
     consumed: list[int] = []
-    for rank_plan in plan.rank_plans:
-        route = rank_plan.token_layout_route
-        assert route is not None
-        consumed.extend(route.consumer_global_rows)
+    for ranges in plan.token_layout_route.consumer_ranges_per_rank:
+        for begin, end in ranges:
+            consumed.extend(range(begin, end))
     assert sorted(consumed) == list(range(plan.total_tokens))
 
 
-def test_zero_row_rank_still_has_every_collective_route() -> None:
-    plan = build_dsa_execution_plan(
-        MagiDSAConfig(ratio=4),
+def test_zero_row_rank_still_participates_in_every_route() -> None:
+    plan = _plan(
+        config=MagiDSAConfig(ratio=4),
         cu_seqlens=(0, 256),
         source_token_counts=(128, 0, 128),
-        policy="indexer_balanced",
     )
     empty = plan.rank_plans[1]
     assert empty.source_token_count == 0
+    # A rank with no source rows still receives Query rows after TOKEN_LAYOUT.
     assert empty.local_token_count > 0
-    assert empty.window_route is not None
-    assert empty.overlap_x_route is not None
-    assert empty.compressed_kv_route is not None
-    assert empty.compressed_ki_route is not None
-    assert empty.token_layout_route is not None
-    assert len(empty.window_route.send_counts) == 3
-    assert len(empty.window_route.recv_counts) == 3
-    assert empty.token_layout_route.group_collective_arg.input_split_size_list == ()
+    assert plan.token_layout_route.owner_ranges_per_rank[1] == ()
+    for route in plan.routes():
+        assert len(route.owner_ranges_per_rank) == plan.cp_size
+        assert len(route.consumer_ranges_per_rank) == plan.cp_size
+    assert plan.window_route.consumer_row_count(1) > 0
 
 
-def test_dsa_group_collective_data_plane_remains_direct_all2all_v() -> None:
-    source = inspect.getsource(dsa_comm)
+def test_dsa_routes_are_lowered_by_core_group_collectives() -> None:
+    """The extension must not carry its own collective or row-map machinery."""
 
-    assert "all2all_v(" in source
-    assert "group_cast(" not in source
-    assert "group_reduce(" not in source
-    assert "grpcoll" not in source
+    comm_source = inspect.getsource(dsa_comm)
+    assert "group_cast(" in comm_source
+    assert "group_reduce(" in comm_source
+    # The hand-rolled All2AllV data plane and its row permutations are gone.
+    assert "all2all_v(" not in comm_source
+    assert "send_pack" not in comm_source
+    assert "consumer_pack" not in comm_source
+    assert "owner_reduce" not in comm_source
+
+    packing_source = inspect.getsource(dsa_packing)
+    assert "_calc_group_collective_arg_from_ranges" in packing_source
+    assert "A2AVBasedGroupCollectiveArg" in packing_source
+
+
+def test_route_lowering_is_delegated_not_reimplemented() -> None:
+    """The solver states ranges only; it must not build splits or rank routes."""
+
+    from magi_attn_extensions.DSA import solver as dsa_solver
+
+    solver_source = inspect.getsource(dsa_solver)
+    for forbidden in (
+        "input_split_size_list",
+        "output_split_size_list",
+        "dst_indices_list",
+        "src_index_list",
+        "send_counts",
+        "recv_counts",
+    ):
+        assert forbidden not in solver_source, (
+            f"the planner re-derives {forbidden}, which belongs to Core"
+        )

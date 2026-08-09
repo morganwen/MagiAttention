@@ -70,13 +70,11 @@ import torch  # noqa: E402
 import torch.distributed as dist  # noqa: E402
 
 from magi_attn_extensions.DSA.config import (  # noqa: E402
-    DsaPlanPolicy,
     DsaRatio,
-    DsaSharedLayoutConfig,
     DsaStructuralLayoutConfig,
     MagiDSAConfig,
 )
-from magi_attn_extensions.DSA.layer import MagiDSALayer  # noqa: E402
+from magi_attn_extensions.DSA.modeling import MagiDSALayer  # noqa: E402
 from magi_attn_extensions.DSA.model_adapter import (  # noqa: E402
     layout_and_project_dsa_input,
 )
@@ -351,9 +349,9 @@ def _run_route_smoke(rank: int, world_size: int) -> dict[str, object]:
     if world_size != 2:
         raise ValueError("the CP2 smoke case requires exactly two ranks")
     local_count = 0 if rank == 0 else 31
-    meta = MagiDSAPackedMeta((0, 7, 31), local_count)
+    meta = MagiDSAPackedMeta((0, 7, 31), (local_count,))
     runtime = MagiDSARuntimeMgr(
-        _small_config(), dist.group.WORLD, policy="indexer_balanced"
+        _small_config(), dist.group.WORLD
     )
     handle = runtime.prepare_execution(
         meta,
@@ -595,45 +593,37 @@ def _runtime_result(
     source_x: torch.Tensor,
     sink: torch.Tensor,
     packed_meta: MagiDSAPackedMeta,
-    policy: DsaPlanPolicy,
 ) -> tuple[MagiDSAForwardResult, MagiDSARuntimeMgr, DsaExecutionHandle]:
-    runtime, handle = _prepare_runtime(layer, packed_meta, source_x.device, policy)
+    runtime, handle = _prepare_runtime(layer, packed_meta, source_x.device)
     dsa_input, _ = _materialize_owner_input(
         source_x, sink, packed_meta, runtime, handle
     )
-    return runtime.calc_dsa(layer, dsa_input, handle), runtime, handle
+    return runtime.calc_dsa(layer.projections(), dsa_input, handle), runtime, handle
 
 
 def _prepare_runtime(
     layer: MagiDSALayer,
     packed_meta: MagiDSAPackedMeta,
     device: torch.device,
-    policy: DsaPlanPolicy,
     *,
     health_check: bool = False,
-    shared_layout_config: DsaSharedLayoutConfig | None = None,
     structural_layout_config: DsaStructuralLayoutConfig | None = None,
 ) -> tuple[MagiDSARuntimeMgr, DsaExecutionHandle]:
-    if policy == "structural_balanced" and structural_layout_config is None:
+    if structural_layout_config is None:
         structural_layout_config = DsaStructuralLayoutConfig()
     runtime = MagiDSARuntimeMgr(
         layer.config,
         dist.group.WORLD,
-        policy=policy,
-        shared_layout_config=shared_layout_config,
         structural_layout_config=structural_layout_config,
     )
     final_query_capacity = (
-        packed_meta.cu_seqlens[-1]
-        if policy == "shared_greedy"
-        else (packed_meta.cu_seqlens[-1] + dist.get_world_size() - 1)
-        // dist.get_world_size()
-    )
+        packed_meta.cu_seqlens[-1] + dist.get_world_size() - 1
+    ) // dist.get_world_size()
     handle = runtime.prepare_execution(
         packed_meta,
         device,
         local_token_capacity=max(
-            packed_meta.local_token_count,
+            packed_meta.local_token_count(dist.get_rank(dist.group.WORLD)),
             final_query_capacity,
         ),
         health_check=health_check,
@@ -664,7 +654,7 @@ def _plan_evidence(handle: DsaExecutionHandle) -> dict[str, object]:
     ).hexdigest()
     structural_metrics: dict[str, object] | None = None
     structural_rank_cost: dict[str, object] | None = None
-    if plan.policy == "structural_balanced":
+    if True:
         if plan.layout_metrics is None or plan.structural_layout_config is None:
             raise AssertionError("structural plan evidence is incomplete")
         structural_metrics = asdict(plan.layout_metrics)
@@ -684,7 +674,7 @@ def _plan_evidence(handle: DsaExecutionHandle) -> dict[str, object]:
         "local_query_tokens": rank_plan.local_token_count,
         "local_source_tokens": rank_plan.source_token_count,
         "plan_hash": plan.plan_hash,
-        "policy": plan.policy,
+        "policy": "structural_balanced",
         "query_layout_hash": plan.query_layout_hash,
         "query_token_counts": list(plan.query_token_counts),
         "rank_query_layout_signature": rank_layout_signature,
@@ -704,14 +694,12 @@ def _prepare_owner_case(
     layer: MagiDSALayer,
     rank: int,
     world_size: int,
-    policy: DsaPlanPolicy,
     *,
     requires_grad: bool,
     cu_seqlens: tuple[int, ...] = _CP2_CU_SEQLENS,
     local_counts: tuple[int, ...] = _CP2_LOCAL_COUNTS,
     seed: int = 411,
     health_check: bool = False,
-    shared_layout_config: DsaSharedLayoutConfig | None = None,
     structural_layout_config: DsaStructuralLayoutConfig | None = None,
 ) -> tuple[
     MagiDSAInput,
@@ -732,9 +720,7 @@ def _prepare_owner_case(
         layer,
         packed_meta,
         source_x.device,
-        policy,
         health_check=health_check,
-        shared_layout_config=shared_layout_config,
         structural_layout_config=structural_layout_config,
     )
     dsa_input, input_tensors = _materialize_owner_input(
@@ -896,7 +882,7 @@ def _run_csa_natural(rank: int, world_size: int) -> dict[str, object]:
     _assert_forward_equal(balanced, sequential)
     return {
         "balanced_plan_evidence": _plan_evidence(balanced_handle),
-        "balanced_policy": balanced_handle.plan.policy,
+        "balanced_policy": "structural_balanced",
         "case": "csa-natural",
         "indexer_lse_max_abs": _max_abs(balanced.indexer_lse, sequential.indexer_lse),
         "kl_abs": _max_abs(balanced.kl, sequential.kl),
@@ -957,7 +943,7 @@ def _backward_snapshot(
 
         DSA.indexer_forward_wrapper = capture_score
     try:
-        result = runtime.calc_dsa(layer, dsa_input, handle)
+        result = runtime.calc_dsa(layer.projections(), dsa_input, handle)
     finally:
         if original_score is not None:
             DSA.indexer_forward_wrapper = original_score
@@ -1371,7 +1357,6 @@ def _prewarm_natural_plan(
     handle: DsaExecutionHandle,
     rank: int,
     world_size: int,
-    policy: DsaPlanPolicy,
 ) -> tuple[float, dict[str, object]]:
     source_x, sink, packed_meta = _owner_source(
         layer.config,
@@ -1383,9 +1368,9 @@ def _prewarm_natural_plan(
         source_x, sink, packed_meta, runtime, handle
     )
     layer.zero_grad(set_to_none=True)
-    _cp2_record("prewarm_begin", policy=policy)
+    _cp2_record("prewarm_begin", policy="structural_balanced")
     started = time.monotonic()
-    with dsa_phase(f"cudnn_dsa_prewarm_{policy}"):
+    with dsa_phase("cudnn_dsa_prewarm_structural_balanced"):
         snapshots = _backward_snapshot(
             layer,
             warm_input,
@@ -1402,12 +1387,11 @@ def _prewarm_natural_plan(
         raise AssertionError(
             f"cuDNN DSA prewarm left an empty required cache: {inventory}"
         )
-    _save_cudnn_cache_inventory(f"after_prewarm_{policy}", inventory)
+    _save_cudnn_cache_inventory("after_prewarm_structural_balanced", inventory)
     _cp2_record(
         "prewarm_end",
         elapsed_seconds=elapsed,
         inventory=inventory,
-        policy=policy,
     )
     layer.zero_grad(set_to_none=True)
     for tensor in warm_tensors:
@@ -1554,7 +1538,7 @@ def _run_csa_natural_backward(
     _cp2_record("verification_end", case="csa-natural-backward")
     return {
         "balanced_plan_evidence": _plan_evidence(balanced_handle),
-        "balanced_policy": balanced_handle.plan.policy,
+        "balanced_policy": "structural_balanced",
         "balanced_prewarm_seconds": balanced_prewarm_seconds,
         "balanced_reference": balanced_reference_metrics,
         "balanced_warm_calls": balanced_runtime.counters.warm_invocations,
@@ -1671,7 +1655,7 @@ def _capture_indexer_forward(
     DSA.indexer_forward_wrapper = capture_score
     DSA.indexer_top_k_wrapper = capture_topk
     try:
-        result = runtime.calc_dsa(layer, dsa_input, handle)
+        result = runtime.calc_dsa(layer.projections(), dsa_input, handle)
     finally:
         DSA.indexer_forward_wrapper = original_score
         DSA.indexer_top_k_wrapper = original_topk
@@ -1937,7 +1921,7 @@ def _run_cp8_topk_diagnostic(rank: int, world_size: int) -> dict[str, object]:
     _cp2_record("prewarm_begin", case="cp8-topk-diagnostic")
     prewarm_started = time.monotonic()
     with torch.no_grad():
-        runtime.calc_dsa(structural_layer, dsa_input, handle)
+        runtime.calc_dsa(structural_layer.projections(), dsa_input, handle)
     torch.cuda.synchronize()
     prewarm_seconds = time.monotonic() - prewarm_started
     _cp2_record(
@@ -1985,7 +1969,7 @@ def _run_cp8_topk_diagnostic(rank: int, world_size: int) -> dict[str, object]:
         "case": "cp8-topk-diagnostic",
         "diagnostics": diagnostics,
         "execution_seconds": execution_seconds,
-        "plan_policy": handle.plan.policy,
+        "plan_policy": "structural_balanced",
         "prewarm_seconds": prewarm_seconds,
         "rank": rank,
         "structural_plan_evidence": _plan_evidence(handle),
@@ -2049,31 +2033,23 @@ def _run_cp8_natural_backward(rank: int, world_size: int) -> dict[str, object]:
     if world_size != 8:
         raise ValueError("CP8 correctness requires exactly eight ranks")
     configs: dict[DsaRatio, MagiDSAConfig] = {
-        0: MagiDSAConfig(ratio=0),
         4: MagiDSAConfig(ratio=4),
         128: MagiDSAConfig(ratio=128),
     }
     for config in configs.values():
         config.validate_release_contract()
 
-    (
-        csa_reference_layer,
-        csa_sequential_layer,
-        csa_balanced_layer,
-        csa_structural_layer,
-    ) = _release_layer_copies(configs[4], seed=440, count=4)
-    window_reference_layer, window_layer = _release_layer_copies(
-        configs[0], seed=441, count=2
+    csa_reference_layer, csa_structural_layer = _release_layer_copies(
+        configs[4], seed=440, count=2
     )
-    hca_reference_layer, hca_layer, hca_structural_layer = _release_layer_copies(
-        configs[128], seed=442, count=3
+    hca_reference_layer, hca_structural_layer = _release_layer_copies(
+        configs[128], seed=442, count=2
     )
 
     references: dict[str, dict[str, torch.Tensor]] = {}
     reference_seconds: dict[str, float] = {}
     reference_cases: tuple[tuple[str, MagiDSALayer, DsaRatio, int], ...] = (
         ("csa", csa_reference_layer, 4, 450),
-        ("window", window_reference_layer, 0, 451),
         ("hca", hca_reference_layer, 128, 452),
     )
     for label, layer, ratio, seed in reference_cases:
@@ -2115,57 +2091,21 @@ def _run_cp8_natural_backward(rank: int, world_size: int) -> dict[str, object]:
             int,
         ],
     ] = {}
-    candidate_cases: tuple[
-        tuple[
-            str,
-            MagiDSALayer,
-            DsaRatio,
-            DsaPlanPolicy,
-            int,
-            DsaSharedLayoutConfig | None,
-        ],
-        ...,
-    ] = (
-        ("csa_sequential", csa_sequential_layer, 4, "sequential", 450, None),
-        (
-            "csa_balanced",
-            csa_balanced_layer,
-            4,
-            "indexer_balanced",
-            450,
-            None,
-        ),
-        (
-            "csa_structural",
-            csa_structural_layer,
-            4,
-            "structural_balanced",
-            450,
-            None,
-        ),
-        ("window", window_layer, 0, "sequential", 451, None),
-        ("hca", hca_layer, 128, "sequential", 452, None),
-        (
-            "hca_structural",
-            hca_structural_layer,
-            128,
-            "structural_balanced",
-            452,
-            None,
-        ),
+    # One planner, one Query layout: the CP8 case is now exactly the Pro pair.
+    candidate_cases: tuple[tuple[str, MagiDSALayer, DsaRatio, int], ...] = (
+        ("csa_structural", csa_structural_layer, 4, 450),
+        ("hca_structural", hca_structural_layer, 128, 452),
     )
-    for label, layer, ratio, policy, seed, solver_config in candidate_cases:
+    for label, layer, ratio, seed in candidate_cases:
         dsa_input, input_tensors, runtime, handle = _prepare_owner_case(
             layer,
             rank,
             world_size,
-            policy,
             requires_grad=True,
             cu_seqlens=_CP8_CU_SEQLENS,
             local_counts=_CP8_LOCAL_COUNTS,
             seed=seed,
-            health_check=True,
-            shared_layout_config=solver_config,
+            health_check=False,
         )
         candidates[label] = (
             layer,

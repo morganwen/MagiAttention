@@ -228,19 +228,8 @@ image_flashmla_pro_patch_revision="$(image_label \
     "org.magi-dsa.flashmla-pro-h128-patch-revision")"
 image_flashmla_pro_patch_sha256="$(image_label \
     "org.magi-dsa.flashmla-pro-h128-patch-sha256")"
-pack_sha="$(sha256sum "$repo_root/extensions/magi_attn_extensions/DSA/kernels/cutedsl/pack.py" | cut -c1-16)"
-aot_dir="${MAGI_DSA_CUTE_AOT:-$repo_root/.cache/magi-dsa-v4/aot-cutlass-4.5.0-sm103-$pack_sha}"
 cudnn_cache_dir="${MAGI_DSA_CUDNN_CACHE:-$repo_root/.cache/magi-dsa-v4/cudnn-dsa-9.24.0.43-frontend-35fd7b0d-cutlass-4.5.0-sm103}"
 msa_reference_report="${MAGI_DSA_MSA_REFERENCE_REPORT:-not-configured}"
-mapfile -t required_aot_objects < <(
-    python3 "$repo_root/scripts/test/dsa_pack_aot_manifest.py"
-)
-for object_name in "${required_aot_objects[@]}"; do
-    if [[ ! -f "$aot_dir/$object_name" ]]; then
-        echo "missing CuTe AOT object $object_name; run bash scripts/test/prewarm_cute.sh" >&2
-        exit 1
-    fi
-done
 
 gpu_count="$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)"
 non_b300_count="$(nvidia-smi --query-gpu=name --format=csv,noheader | rg -v '^NVIDIA B300([[:space:]]|$)' | wc -l || true)"
@@ -428,7 +417,6 @@ trap 'handle_signal 143' TERM
     echo "$command_line"
     echo "run_id=$run_id"
     echo "artifact_dir=$artifact_dir"
-    echo "aot_dir=$aot_dir"
     echo "cudnn_cache_dir=$cudnn_cache_dir"
     echo "flashmla_base_revision=$flashmla_base_revision"
     echo "cudnn_frontend_source=official-unmodified"
@@ -806,14 +794,11 @@ common_docker_args=(
     --env XDG_CACHE_HOME=/cudnn-dsa-cache/xdg-cache
     --env TORCH_HOME=/cudnn-dsa-cache/torch
     --env TRITON_CACHE_DIR=/cudnn-dsa-cache/triton
-    --env MAGI_DSA_CUTE_AOT_DIR=/dsa-pack-aot
-    --env MAGI_DSA_CUTE_AOT_REQUIRED=1
     --env MAGI_DSA_PHASE_LOG=0
     --env NCCL_DEBUG=WARN
     --env PYTHONSAFEPATH=1
     --env PYTHONUNBUFFERED=1
     --env TORCH_DISTRIBUTED_DEBUG=INFO
-    --volume "$aot_dir:/dsa-pack-aot:ro"
     --volume "$artifact_dir:/profile-artifact"
     --volume "$cudnn_cache_dir:/cudnn-dsa-cache"
     --volume "$repo_root/scripts/profile:/workspace/MagiAttention/scripts/profile:ro"

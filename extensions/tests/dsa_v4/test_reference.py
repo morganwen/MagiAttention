@@ -17,7 +17,7 @@ from __future__ import annotations
 import pytest
 import torch
 from magi_attn_extensions.DSA.config import DsaRatio, MagiDSAConfig
-from magi_attn_extensions.DSA.layer import (
+from magi_attn_extensions.DSA.modeling import (
     MagiDSALayer,
     _yarn_inverse_frequencies,
     apply_dsa_rope,
@@ -153,7 +153,7 @@ def test_cpu_rope_formula_and_backward_use_opposite_rotation(inverse: bool) -> N
     )
 
 
-@pytest.mark.parametrize("ratio", [0, 4, 128])
+@pytest.mark.parametrize("ratio", [4, 128])
 def test_layer_output_rope_frequencies_are_nonpersistent(ratio: DsaRatio) -> None:
     config = _config(ratio)
     layer = MagiDSALayer(config)
@@ -237,7 +237,7 @@ def test_reference_applies_official_inverse_rope_output_contract(
     )
 
 
-@pytest.mark.parametrize("ratio", [0, 4, 128])
+@pytest.mark.parametrize("ratio", [4, 128])
 def test_reference_forward_backward_for_all_layer_forms(ratio: DsaRatio) -> None:
     config = _config(ratio)
     layer = MagiDSALayer(config)

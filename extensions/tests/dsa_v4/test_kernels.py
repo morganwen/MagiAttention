@@ -20,10 +20,9 @@ import pytest
 import torch
 from magi_attn_extensions.DSA import comm as dsa_comm_module
 from magi_attn_extensions.DSA import dist as dist_dsa_module
-from magi_attn_extensions.DSA import layer as dsa_layer_module
+from magi_attn_extensions.DSA import modeling as dsa_layer_module
 from magi_attn_extensions.DSA.backend import DsaIndexerSelection
 from magi_attn_extensions.DSA.comm import (
-    copy_dsa_tensor_with_csr,
     finish_dsa_reverse_route,
     finish_dsa_tensor_route,
     route_dsa_tensor,
@@ -31,7 +30,6 @@ from magi_attn_extensions.DSA.comm import (
     start_dsa_tensor_route,
 )
 from magi_attn_extensions.DSA.config import DsaRatio, MagiDSAConfig
-from magi_attn_extensions.DSA.kernels.cutedsl.pack import copy_dsa_rows, reduce_dsa_rows
 from magi_attn_extensions.DSA.kernels.triton import rope as dsa_rope_module
 from magi_attn_extensions.DSA.kernels.triton.compressor import (
     fused_csa_compressor_reduce,
@@ -52,7 +50,7 @@ from magi_attn_extensions.DSA.kernels.triton.rope import (
     fused_dsa_rope,
     fused_dsa_rope_hadamard,
 )
-from magi_attn_extensions.DSA.layer import (
+from magi_attn_extensions.DSA.modeling import (
     DsaIndexer,
     DsaRMSNorm,
     MagiDSALayer,
@@ -60,16 +58,11 @@ from magi_attn_extensions.DSA.layer import (
     apply_dsa_rope,
     apply_normalized_hadamard,
 )
-from magi_attn_extensions.DSA.packing import (
-    DsaDeviceCopyMap,
-    DsaDeviceReduceMap,
-    make_dsa_device_rank_plan,
-)
+from magi_attn_extensions.DSA.packing import make_dsa_device_rank_plan
 from magi_attn_extensions.DSA.runtime import MagiDSARuntimeMgr
 from magi_attn_extensions.DSA.solver import build_dsa_execution_plan
 from magi_attn_extensions.DSA.types import MagiDSAInput, MagiDSAPackedMeta
 
-from scripts.test.dsa_pack_aot_manifest import required_object_names
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA is required"
@@ -101,11 +94,8 @@ def test_fused_csa_index_builder_preserves_independent_ki_kv_maps() -> None:
     topk_lengths = torch.tensor([3, 2, 0], dtype=torch.int32, device="cuda")
     attention_map = torch.tensor([5, 0, 4, 2, 1, 3], dtype=torch.int32, device="cuda")
     indexer_map = torch.tensor([1, 4, 0, 5, 3, 2], dtype=torch.int32, device="cuda")
-    window_rows = torch.tensor(
-        [[7, 8, 9], [4, 5, -1], [2, -1, -1]],
-        dtype=torch.int32,
-        device="cuda",
-    )
+    # A raw window is a contiguous run, so it is a base plus a length.
+    window_base = torch.tensor([7, 4, 2], dtype=torch.int32, device="cuda")
     window_lengths = torch.tensor([3, 2, 1], dtype=torch.int32, device="cuda")
 
     attention, lengths, indexer, compressed = build_csa_index_tensors(
@@ -113,8 +103,9 @@ def test_fused_csa_index_builder_preserves_independent_ki_kv_maps() -> None:
         topk_lengths,
         attention_map,
         indexer_map,
-        window_rows,
+        window_base,
         window_lengths,
+        3,
         raw_bank_rows=10,
     )
 
@@ -150,19 +141,23 @@ def test_fused_csa_index_builder_handles_an_empty_compressed_domain() -> None:
     topk_ids = torch.full((2, 4), -1, dtype=torch.int32, device="cuda")
     topk_lengths = torch.zeros(2, dtype=torch.int32, device="cuda")
     empty_map = torch.empty(0, dtype=torch.int32, device="cuda")
-    window_rows = torch.tensor([[3, 4], [5, -1]], dtype=torch.int32, device="cuda")
+    window_base = torch.tensor([3, 5], dtype=torch.int32, device="cuda")
     window_lengths = torch.tensor([2, 1], dtype=torch.int32, device="cuda")
+    expected_window = torch.tensor(
+        [[3, 4], [5, -1]], dtype=torch.int32, device="cuda"
+    )
     attention, lengths, indexer, compressed = build_csa_index_tensors(
         topk_ids,
         topk_lengths,
         empty_map,
         empty_map,
-        window_rows,
+        window_base,
         window_lengths,
+        2,
         raw_bank_rows=6,
     )
     assert torch.equal(attention[:, :4], topk_ids)
-    assert torch.equal(attention[:, 4:], window_rows)
+    assert torch.equal(attention[:, 4:], expected_window)
     assert torch.equal(lengths, window_lengths)
     assert torch.equal(indexer, topk_ids)
     assert torch.equal(compressed, topk_ids)
@@ -186,6 +181,7 @@ def test_fused_csa_index_builder_supports_pro_1024_plus_128_width() -> None:
     indexer_map = torch.arange(map_rows, dtype=torch.int32, device="cuda").flip(0)
     window_columns = torch.arange(window_width, dtype=torch.int32, device="cuda")
     window_lengths = torch.tensor([128, 17, 0], dtype=torch.int32, device="cuda")
+    window_base = torch.full((rows,), 23, dtype=torch.int32, device="cuda")
     window_rows = (window_columns.unsqueeze(0) + 23).expand(rows, -1).clone()
     window_rows.masked_fill_(
         window_columns.unsqueeze(0) >= window_lengths.unsqueeze(1), -1
@@ -196,8 +192,9 @@ def test_fused_csa_index_builder_supports_pro_1024_plus_128_width() -> None:
         topk_lengths,
         attention_map,
         indexer_map,
-        window_rows,
+        window_base,
         window_lengths,
+        window_width,
         raw_bank_rows=raw_bank_rows,
     )
 
@@ -860,73 +857,9 @@ def test_cuda_indexer_query_projection_dispatches_fused_v4_rotation(
     assert weights.shape == (tokens, config.indexer_heads)
 
 
-def test_cute_copy_and_csr_match_torch_with_empty_destination_row() -> None:
-    source = (
-        torch.arange(128, device="cuda", dtype=torch.float32)
-        .reshape(8, 16)
-        .to(torch.bfloat16)
-    )
-    copy_rows = torch.tensor([7, 1, 1, 3], device="cuda", dtype=torch.int32)
-    copied = copy_dsa_rows(source, copy_rows)
-    assert torch.equal(copied, source[copy_rows.long()])
-
-    offsets = torch.tensor([0, 1, 3, 3, 4], device="cuda", dtype=torch.int32)
-    reduce_rows = torch.tensor([0, 1, 2, 3], device="cuda", dtype=torch.int32)
-    reduced = reduce_dsa_rows(copied, offsets, reduce_rows)
-    expected = torch.stack(
-        (copied[0], copied[1] + copied[2], torch.zeros_like(copied[0]), copied[3])
-    )
-    torch.testing.assert_close(reduced.float(), expected.float(), atol=0.0, rtol=0.0)
-
-
-def test_duplicate_pack_backward_uses_csr_and_supports_retain_graph() -> None:
-    source = torch.randn(5, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    copy_map = DsaDeviceCopyMap(
-        torch.tensor([4, 1, 1, 3], device="cuda", dtype=torch.int32)
-    )
-    reduce_map = DsaDeviceReduceMap(
-        row_offsets=torch.tensor([0, 0, 2, 2, 3, 4], device="cuda", dtype=torch.int32),
-        source_rows=torch.tensor([1, 2, 3, 0], device="cuda", dtype=torch.int32),
-    )
-    packed = copy_dsa_tensor_with_csr(source, copy_map, reduce_map)
-    first = torch.autograd.grad(packed.float().sum(), source, retain_graph=True)[0]
-    second = torch.autograd.grad(packed.float().sum(), source)[0]
-    expected = (
-        torch.tensor([0, 2, 0, 1, 1], device="cuda", dtype=torch.bfloat16)
-        .unsqueeze(1)
-        .expand(-1, 16)
-    )
-    assert torch.equal(first, expected)
-    assert torch.equal(second, expected)
-
-
-def test_dsa_pack_aot_manifest_covers_current_profile_diagnostics() -> None:
-    names = set(required_object_names())
-    assert len(names) == 24
-    assert {
-        "copy_sm103_bf16_w16.o",
-        "copy_sm103_bf16_w32.o",
-        "copy_sm103_bf16_w1024.o",
-        "copy_sm103_bf16_w1536.o",
-        "copy_sm103_bf16_w7168.o",
-        "copy_sm103_bf16_w32768.o",
-        "copy_sm103_bf16_w65536.o",
-        "copy_sm103_f32_w4.o",
-        "copy_sm103_f32_w64.o",
-        "copy_sm103_f32_w128.o",
-        "copy_sm103_i32_w512.o",
-        "copy_sm103_i32_w1024.o",
-        "reduce_sm103_bf16_w16.o",
-        "reduce_sm103_bf16_w32.o",
-        "reduce_sm103_bf16_w7168.o",
-    } <= names
-    assert "copy_sm103_bf16_w8256.o" not in names
-    assert "copy_sm103_i32_w516.o" not in names
-
-
 def test_cp1_token_layout_route_is_identity_and_reentrant() -> None:
     config = _small_config(4)
-    plan = build_dsa_execution_plan(config, (0, 17), (17,), policy="indexer_balanced")
+    plan = build_dsa_execution_plan(config, (0, 17), (17,))
     device_plan = make_dsa_device_rank_plan(plan, 0, config, torch.device("cuda"))
     route = device_plan.token_layout_route
     assert route is not None
@@ -945,7 +878,7 @@ def test_cp1_token_layout_route_is_identity_and_reentrant() -> None:
 
 def test_cp1_typed_route_supports_two_private_inflight_transfers() -> None:
     config = _small_config(4)
-    plan = build_dsa_execution_plan(config, (0, 17), (17,), policy="indexer_balanced")
+    plan = build_dsa_execution_plan(config, (0, 17), (17,))
     device_plan = make_dsa_device_rank_plan(plan, 0, config, torch.device("cuda"))
     route = device_plan.token_layout_route
     assert route is not None
@@ -958,10 +891,7 @@ def test_cp1_typed_route_supports_two_private_inflight_transfers() -> None:
 
     first_transfer = start_dsa_tensor_route(first_source, route, None)
     second_transfer = start_dsa_tensor_route(second_source, route, None)
-    assert first_transfer.exchange.send_buffer.data_ptr() != (
-        second_transfer.exchange.send_buffer.data_ptr()
-    )
-    assert first_transfer.received.data_ptr() != second_transfer.received.data_ptr()
+    assert first_transfer.output.data_ptr() != second_transfer.output.data_ptr()
 
     first = finish_dsa_tensor_route(first_transfer)
     second = finish_dsa_tensor_route(second_transfer)
@@ -988,7 +918,7 @@ def test_cp1_typed_route_supports_two_private_inflight_transfers() -> None:
 
 def test_cp1_reverse_route_supports_two_private_inflight_transfers() -> None:
     config = _small_config(4)
-    plan = build_dsa_execution_plan(config, (0, 17), (17,), policy="indexer_balanced")
+    plan = build_dsa_execution_plan(config, (0, 17), (17,))
     device_plan = make_dsa_device_rank_plan(plan, 0, config, torch.device("cuda"))
     route = device_plan.token_layout_route
     assert route is not None
@@ -997,12 +927,7 @@ def test_cp1_reverse_route_supports_two_private_inflight_transfers() -> None:
 
     first_transfer = start_dsa_reverse_route(first_consumer, route, None)
     second_transfer = start_dsa_reverse_route(second_consumer, route, None)
-    assert first_transfer.exchange.send_buffer.data_ptr() != (
-        second_transfer.exchange.send_buffer.data_ptr()
-    )
-    assert first_transfer.exchange.output.data_ptr() != (
-        second_transfer.exchange.output.data_ptr()
-    )
+    assert first_transfer.output.data_ptr() != second_transfer.output.data_ptr()
 
     first = finish_dsa_reverse_route(first_transfer)
     second = finish_dsa_reverse_route(second_transfer)
@@ -1016,7 +941,7 @@ def test_unused_typed_route_edge_does_not_materialize_a_reverse(
     monkeypatch,
 ) -> None:
     config = _small_config(4)
-    plan = build_dsa_execution_plan(config, (0, 17), (17,), policy="indexer_balanced")
+    plan = build_dsa_execution_plan(config, (0, 17), (17,))
     device_plan = make_dsa_device_rank_plan(plan, 0, config, torch.device("cuda"))
     route = device_plan.token_layout_route
     assert route is not None
@@ -1045,7 +970,7 @@ def test_unused_typed_route_edge_does_not_materialize_a_reverse(
         del args, kwargs
         raise AssertionError("an unused route edge launched a reverse transfer")
 
-    monkeypatch.setattr(dsa_comm_module, "_reverse_received_route", reject_reverse)
+    monkeypatch.setattr(dsa_comm_module, "_launch_group_reduce", reject_reverse)
     output = _IgnoreConsumerFunction.apply(source, consumer)
     gradient = torch.autograd.grad(output.float().sum(), source)[0]
     assert torch.equal(gradient, torch.ones_like(source))
@@ -1059,8 +984,8 @@ def test_csa_orchestration_projects_queries_between_initial_start_and_finish(
     layer = MagiDSALayer(config).cuda()
     assert layer.indexer is not None
     tokens = 17
-    meta = MagiDSAPackedMeta((0, tokens), tokens)
-    runtime = MagiDSARuntimeMgr(config, policy="indexer_balanced")
+    meta = MagiDSAPackedMeta((0, tokens), (tokens,))
+    runtime = MagiDSARuntimeMgr(config)
     handle = runtime.prepare_execution(
         meta,
         torch.device("cuda"),
@@ -1169,7 +1094,7 @@ def test_csa_orchestration_projects_queries_between_initial_start_and_finish(
         lambda _module, _inputs: events.append("compressor:main")
     )
 
-    result = runtime.calc_dsa(layer, dsa_input, handle)
+    result = runtime.calc_dsa(layer.projections(), dsa_input, handle)
 
     assert result.output.shape == dsa_input.q.shape
     expected_events = {
@@ -1203,13 +1128,13 @@ def test_csa_orchestration_projects_queries_between_initial_start_and_finish(
     assert events.index("attention") < events.index("kl")
 
 
-@pytest.mark.parametrize("ratio", [0, 4, 128])
+@pytest.mark.parametrize("ratio", [4, 128])
 def test_all_ratio_device_plans_materialize_static_attention_maps(
     ratio: DsaRatio,
 ) -> None:
     config = _small_config(ratio)
     plan = build_dsa_execution_plan(
-        config, (0, 17, 278), (31, 0, 100, 147), policy="indexer_balanced"
+        config, (0, 17, 278), (31, 0, 100, 147)
     )
     for rank in range(plan.cp_size):
         device_plan = make_dsa_device_rank_plan(
@@ -1218,13 +1143,13 @@ def test_all_ratio_device_plans_materialize_static_attention_maps(
         assert device_plan.local_q_positions.shape == (
             plan.rank_plans[rank].local_token_count,
         )
-        assert device_plan.attention.window_rows.shape == (
+        # The window is a base and a length per query, not a padded matrix.
+        assert device_plan.attention.window_base.shape == (
             plan.rank_plans[rank].local_token_count,
-            config.window_size,
         )
         assert (
-            device_plan.attention.window_lengths.numel()
+            device_plan.attention.window_length.numel()
             == plan.rank_plans[rank].local_token_count
         )
-        assert (device_plan.compression is None) == (ratio == 0)
+        assert device_plan.compression is not None
         assert (device_plan.indexer is not None) == (ratio == 4)
