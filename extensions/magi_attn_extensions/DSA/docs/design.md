@@ -2,14 +2,31 @@
 
 > 状态：当前权威设计，实现与验收中。
 >
-> 更新：2026-08-06（DeepSeek-V4-Pro 61 层、`structural_balanced`、官方
+> 更新：2026-08-09（Core 复用重构：route 改为 range 加 Core group-collective、
+> plan 去掉逐行索引表与 object collective、参数移出到模型侧 callback、
+> policy 收敛到 `structural_balanced` 一种、`ratio=0` 与 CuTe pack kernel 删除）。
+>
+> 上一版：2026-08-06（DeepSeek-V4-Pro 61 层、`structural_balanced`、官方
 > FlashMLA Pro ABI 与代表性 CSA+HCA profile 合同）。
 >
 > 范围：官方
 > `DeepSeek-V4-Pro@b5968e9190ef611bbf34a7229255be88a0e937c1` 主干 61 层：
 > 31 个 HCA（`ratio=128`）与 30 个 CSA（`ratio=4`），BF16 causal
-> packed/varlen training。独立 MTP 的 window-only `ratio=0` 仅保留兼容边界，
-> 不进入本次主干实现或正式性能验收。
+> packed/varlen training。主干不含 window-only 层，`ratio=0` 已从 `DsaRatio`、
+> planner、runtime 和测试中删除；独立 MTP 的 window-only 语义只在
+> `DSV4_PRO_MTP_COMPRESS_RATIO` 里作为出处记录保留。
+
+2026-08-09 的重构把下列能力交还给 MagiAttention Core，DSA 侧不再有对应实现：
+
+- route 的 split、rank route 与稳定 output 顺序，来自
+  `DynamicAttnSolver._calc_group_collective_arg_from_ranges`；
+- 通信本身，来自 Core 的 `group_cast` 与对偶的 `group_reduce`；
+- 行 gather 与区间归约，来自 Core `range_gather` / `range_reduce` 与 `index_select`；
+- chunk 分配与 chunk×sample 拆分，来自 native dispatch meta 与 `AttnBucket`。
+
+随之删除的有：`kernels/cutedsl/pack.py` 及其 AOT manifest 与 prewarm 脚本、
+`packing.py` 的六份逐行索引表、`solver.py` 的 `_build_route` 与大部分 route 校验、
+`DsaGroupCollectiveArg` 与 `DsaTypedRoutePlan` 两层中间结构。
 
 2026-08-06 以前本文中的 Flash-Base `4096/1024/64/512`、compressed Top-K 512
 以及 `shared_greedy` 记录，只能作为历史实现/profile 审计证据。它们不得覆盖本文
@@ -117,9 +134,8 @@ O_model[..., 448:512] = RoPE^-1(
 )
 ```
 
-`layer_yarn_frequencies` 与本层 Q/K 使用同一组非持久 FP32 frequency buffer，ratio 0/4/128
-共用该语义；Pro 61 层正式范围仍只含 ratio 4/128，ratio 0 仅是 MTP/window-only
-兼容边界。这个 inverse RoPE 必须 out-of-place，不得改写 sparse-attention backward 保存的
+`layer_yarn_frequencies` 与本层 Q/K 使用同一组非持久 FP32 frequency buffer，ratio 4/128
+共用该语义。这个 inverse RoPE 必须 out-of-place，不得改写 sparse-attention backward 保存的
 `O_rot`；其 backward 是相反方向的正向 RoPE，LSE、Top-K 和 selected-KL 状态都不随输出旋转。
 
 ### 2.2 DSA 内只区分 local 和 remote
@@ -127,8 +143,8 @@ O_model[..., 448:512] = RoPE^-1(
 前置 `TOKEN_LAYOUT` 完成后，当前 rank 上的 Query 就是 local Query，DSA 内不再移动它。
 对 Query 需要的 KI/KV：
 
-- 本 rank 生成的是 **local K**；
-- 其他 rank 生成、通过 All2AllV 取回的是 **remote K**。
+- 本 rank 生成的是 local K；
+- 其他 rank 生成、通过 group-cast 取回的是 remote K。
 
 实现上不需要四张 ownership 表。cold plan 只需下列信息：
 
@@ -147,7 +163,7 @@ typed_routes      # WINDOW / OVERLAP_X / COMPRESSED_KI / COMPRESSED_KV 的收发
 flowchart TB
     META["Global packed metadata and source layout"]
     PLAN["Indexer cost-aware planner"]
-    DISP["TOKEN_LAYOUT All2AllV before DSA"]
+    DISP["TOKEN_LAYOUT group-cast before DSA"]
     INPUT["local x qr q latent_kv"]
 
     PROJ["local Indexer Q and weights"]
@@ -187,9 +203,15 @@ flowchart TB
 
 ### 4.1 一期 cost：原生 causal area + MinHeap
 
-`structural_balanced` 不用 CSA 或 HCA 的专用经验权重。planner 以 packed-global
-坐标把 Query 切成 chunk；对每个 chunk，按它与各 packed sample 的交集求原生 causal
-attention slice area：
+`structural_balanced` 是唯一的 layout policy，`sequential`、`indexer_balanced` 和
+`shared_greedy` 已从代码里删除，只在 4.5 节保留历史记录。
+
+planner 不用 CSA 或 HCA 的专用经验权重，也不自己切 chunk。它把 packed sample 交给
+native `make_dispatch_meta_from_qk_ranges` 加 `MinHeapDispatchAlg` 做 chunk 分配，再从
+native `make_bucket_per_rank_from_qk_ranges` 拿回每个 rank 的 `AttnBucket`，直接把
+`AttnSlice` 改写成 sample-relative fragment。chunk 与 sample 的求交、causal area 的计算
+都在 Core 里，DSA 不再重算一遍。一个 causal self-attention slice 的 K 一定从 sample
+起点开始，所以 sample 原点直接从 `k_range.start` 读出：
 
 ```text
 chunk_cost = sum(
@@ -297,9 +319,10 @@ All2AllV。这条 route 属于 DSA 输入边界，不计入下文“DSA 内部 c
 
 ### 4.5 历史：2026-08-03 Base `shared_greedy` 实验
 
-> 本节只保留 Flash-Base W/CSA/HCA attention-suite 的历史算法与 artifact。
-> `shared_greedy`、B300 proxy 权重、128-token band 与四轮 local improvement 均不是
-> 当前 Pro 生产合同，不得覆盖 4.1–4.2 节的 `structural_balanced`。
+> 本节只是历史记录。`shared_greedy` 的实现、`DsaSharedLayoutConfig`、B300 proxy 权重、
+> 128-token band 和 local improvement 循环都已从代码中删除，`--local-improvement-passes`
+> 入口也一并删除。下面的描述仅用于解释 `artifacts/profile/20260803T*` 那几份产物是怎么
+> 得到的，不得作为当前合同，也不能据此重新引入第二个 policy。
 
 `shared_greedy` 实现 `README_cp_dispatch_balancing.md` 的唯一选型“确定性贪心 + 4 轮局部改善上限
 （无改善时提前收敛）”，并冻结以下
@@ -490,21 +513,30 @@ V1 在 Top-K 前静态获取 causal-visible compressed-KV prefix。Top-K 减少 
 
 #### 5.2.1 consumer 物理行序与 D2D 边界
 
-`structural_balanced` cold plan 以 producer/owner-major 顺序固定 CSA 的 `WINDOW_KV`、
-`OVERLAP_X`、`COMPRESSED_KI`、`COMPRESSED_KV` receive rows，使它们的
-`consumer_from_received/received_from_consumer` 都是 identity，因而删除 forward NCCL
-之后的 consumer unpermute 和 backward NCCL 之前的 inverse pack。HCA 的
-`WINDOW_KV/COMPRESSED_KV` 同样使用 owner-major；HCA `OVERLAP_X` 则保持可被
-128-row Compressor 直接消费的 global block order。把它强改为 owner-major 只会把一次
-route reorder 后移成 Compressor gather，反向还会引入 CSR，不属于 D2D 消除。
+route 不再自己排 receive row。四条 route 现在只声明 owner ranges 和 consumer ranges，
+交给 Core 的 `_calc_group_collective_arg_from_ranges` 求交、切 split、算 rank route。
+group-cast 返回的 consumer bank 天然按全局行升序排列，所以 forward 之后没有 consumer
+unpermute，backward 之前也没有 inverse pack，这两步不是被优化掉的，而是根本不存在。
 
-在当前官方 backend ABI 下，以下 D2D 不能仅通过改通信 row order 删除：发送侧
-route pack、CSA compression-support gather、KV bank assembly/cat，以及把 unique KI bank
-展开成 cuDNN grouped Indexer 连续 fragment-prefix 的一次 grouped K pack。最后一项是
-cuDNN 当前没有 Magi-MSA `fragment_indices` prefix-reuse ABI 造成的必要 forward copy；
-Indexer scorer/Top-K 是 `no_grad`，所以不存在对应 grouped-K backward CSR。后续是否
-fusion 必须以 8.0 节 D2D/route/kernel 分账证据为准，不允许用隐藏 copy NVTX 的方式
-声称已消除。
+由此消失的还有整套逐行索引表。以前每条 route 要存 `send_source_rows`、
+`received_global_rows`、`consumer_global_rows`、`consumer_from_received`、
+`received_from_consumer`、`reverse_source_rows` 六份，host 侧是 Python int tuple，
+device 侧是常驻 int32 tensor，规模是 O(行数 × cp_size)。现在只存 range，规模是
+O(range 数)，128K/CP8 下每 rank 十几个 range。
+
+在当前官方 backend ABI 下，以下 D2D 仍然存在：CSA compression-support gather、
+KV bank assembly/cat，以及把 unique KI bank 展开成 cuDNN grouped Indexer 连续
+fragment-prefix 的一次 grouped K pack。最后一项是 cuDNN 当前没有 Magi-MSA
+`fragment_indices` prefix-reuse ABI 造成的必要 forward copy；Indexer scorer/Top-K 是
+`no_grad`，所以不存在对应 grouped-K backward reduce。support gather 用
+`index_select`，它的 backward 自带 scatter-add，所以 CSA overlap 的重复行不需要另写
+CSR。prefix gather 是 Core `range_gather`。后续是否 fusion 必须以 8.0 节
+D2D/route/kernel 分账证据为准，不允许用隐藏 copy NVTX 的方式声称已消除。
+
+per-query 的 window 和 compressed 索引也不再常驻。两者在各自 consumer bank 里都是连续
+run，因此只存一个 base 和一个 length；`[Tlocal, 128]` 的 window 表和 HCA 那张
+`[Tlocal, max_visible]` 的 compressed 表都已删除，后者在 128K/CP8 下原本是每个 handle
+六十多 MB。
 
 ### 5.3 Forward collective 对账
 
@@ -515,13 +547,20 @@ fusion 必须以 8.0 节 D2D/route/kernel 分账证据为准，不允许用隐�
 | 3 | `COMPRESSED_KI` | 128 BF16 | 获取 remote Indexer K |
 | 4 | `COMPRESSED_KV` | 512 BF16 | 获取 remote compressed attention KV |
 
-ratio=4 的当前 DSA forward 为 **4 次 All2AllV**。合同中：
+ratio=4 的当前 DSA forward 为 4 次 group-cast。合同中：
 
-- 删除 `INDEXER_QW [8256]` All2AllV；
-- 删除 `Top-K auxiliary [516]` 逆向 All2AllV；
-- 没有 AllGather。
+- 删除 `INDEXER_QW [8256]`；
+- 删除 `Top-K auxiliary [516]` 逆向；
+- 没有 AllGather；
+- 没有 object collective。cold plan 是 caller metadata 的纯函数，每个 rank 各自算出
+  同一份，既不 `all_gather_object` 收集 owner layout，也不 `broadcast_object_list`
+  广播 plan。
 
-前置 `TOKEN_LAYOUT` All2AllV 单独记账，不能隐藏在 DSA forward 的 4 次中。
+这里的 group-cast 是 Core 的 `magi_attention.comm.primitive.grpcoll.group_cast`，底层
+仍是 A2AV，但 split、rank route 和稳定 output 顺序由 Core 负责，DSA 不再自己拼
+`all2all_v`。反向是同一个 `GroupCollectiveArg` 的 `group_reduce`，两者严格对偶。
+
+前置 `TOKEN_LAYOUT` 单独记账，不能隐藏在 DSA forward 的 4 次中。
 
 ### 5.4 推荐 overlap
 
@@ -547,9 +586,11 @@ sequenceDiagram
     Q->>K: run cuDNN KL recompute and gradient precompute
 ```
 
-当前实现已经复用 MSA 的生命周期模式，并将 route 拆成两个 autograd stage：`start` 持有每次调用
-私有的 send/output buffer 和 `async_op=True` work，`finish` 在 caller stream 等待后执行 consumer
-permutation；backward 对应拆成 received permutation 与 reverse All2AllV/owner CSR。该结构不在
+当前实现复用 MSA 的生命周期模式，并把 route 拆成 launch 与 wait 两步：`start` 以
+`async_op=True` 发起 Core group-cast 并持有每次调用私有的 output buffer 和 work，
+`finish` 在 caller stream 等待并把梯度边接回 producer；backward 是同一个
+`GroupCollectiveArg` 的 group-reduce。consumer permutation 与 owner CSR 都由 Core 承担，
+DSA 侧没有对应代码。该结构不在
 execution handle 中复用 activation buffer，已覆盖 two-inflight、retain-graph、reentrant backward 和
 gradient accumulation。这里的 two-inflight 指同一 host 线程按所有 rank 完全相同的 invocation 顺序
 提交多张 graph；同一 handle 不支持多个 host 线程无序并发注册 collective。若后续需要该能力，必须
@@ -571,7 +612,7 @@ Compressor 遮挡，CKV 可继续与 grouped Indexer 计算重叠。跨 stream �
 backward 新增一个不改变数值的 multi-output autograd late join：它同时等待
 `dQIndexer/dWeights` 和两条 Compressor 对 `dPackedX` 的梯度，再一次释放 projection 与
 compression-support 两侧梯度。随后 Q/weight projection backward 在 Indexer stream 入队，
-local support CSR 与 `OVERLAP_X` reverse 在 caller/support-route stream 入队；同一 projection
+local support scatter-add 与 `OVERLAP_X` reverse 在 caller/support-route stream 入队；同一 projection
 计算窗口继续覆盖 `WINDOW_KV` reverse。另一个 CSA branch-order autograd gate 持有提前就绪的
 Window consumer gradient，直到 compression-support 分支产生 `dOverlapX`；该 gate 在同一
 support-route stream 上显式先 start `OVERLAP_X` reverse、再 start `WINDOW_KV` reverse，并把两个
@@ -627,7 +668,7 @@ H128/D512/total-topk-1152 组合下同时保存 full 与 prefix running LSE。
 ABI 按 ratio 严格分派：
 
 - CSA `ratio=4` 必须传 `indexer_topk=1024` 并严格接收四输出；
-- window/HCA `ratio=0/128` 不传 `indexer_topk`，继续传实际 `topk_length` 并严格接收三输出；
+- HCA `ratio=128` 不传 `indexer_topk`，继续传实际 `topk_length` 并严格接收三输出；
 - 不允许在四输出缺失时退回完整 LSE teacher，也不允许根据返回 tuple 长度静默 fallback。
 
 三个 LSE 状态的职责为：
@@ -685,7 +726,7 @@ selected score recompute、KL reduction，以及 cuDNN
 `dQIndexer/dWeights/dSelectedCompressedKI`；真正 autograd backward 只乘实际 `grad_kl`。
 Indexer score/Top-K 所需的 full score 在 Top-K 和诊断 `indexer_lse` 完成后不进入 custom autograd
 saved tensors；不再分配同形 dense teacher workspace。selected K gradient 直接回到 unique KI
-consumer bank，再由 `COMPRESSED_KI` reverse route/CSR 回到 producer。effective Top-K length 为 0
+consumer bank，再由 `COMPRESSED_KI` reverse group-reduce 回到 producer。effective Top-K length 为 0
 的 Query 对 KL 没有贡献，三路 sparse Indexer gradient 必须为 0。
 
 单位梯度是 scalar KL output 生成后的 side-produced saved state，因此 custom autograd 不能假设
@@ -706,7 +747,7 @@ autograd 节点的两个可微输出。backward 固定执行：
 scale saved Indexer unit gradients
 start COMPRESSED_KI reverse
 launch cuDNN sparse attention backward on the handle-owned CUDA stream
-finish COMPRESSED_KI reverse and owner CSR on the caller stream
+finish COMPRESSED_KI reverse group-reduce on the caller stream
 wait sparse-backward completion event
 return local dKI and sparse dQ/dKV/dSink to the outer autograd graph
 ```
@@ -747,21 +788,21 @@ flowchart TB
     DW["local dWeights"]
     DCKI["consumer dCompressedKI"]
 
-    RWIN["CSR and reverse WINDOW_KV All2AllV"]
-    RCKV["CSR and reverse COMPRESSED_KV All2AllV"]
-    RCKI["CSR and reverse COMPRESSED_KI All2AllV"]
+    RWIN["reverse WINDOW_KV group-reduce"]
+    RCKV["reverse COMPRESSED_KV group-reduce"]
+    RCKI["reverse COMPRESSED_KI group-reduce"]
     MCB["main Compressor backward"]
     ICB["Indexer Compressor backward"]
     JOIN["late projection/support gradient join"]
     QPB["Indexer Q projection backward"]
     WPB["Indexer weight projection backward"]
-    ROVL["CSR and reverse OVERLAP_X All2AllV"]
+    ROVL["reverse OVERLAP_X group-reduce"]
 
     LOCAL["local dQ dQR dX dLatentKV"]
     PARAM["local Compressor and Indexer parameter gradients"]
     AR["model-side CP AllReduce for parameters and sink"]
     MODEL["model-side projection backward and dx merge"]
-    LAYOUT["reverse TOKEN_LAYOUT All2AllV outside DSA"]
+    LAYOUT["reverse TOKEN_LAYOUT group-reduce outside DSA"]
 
     DO --> SAB
     DKL --> KLS
@@ -789,10 +830,10 @@ flowchart TB
 
 - Top-K 和 ID mapping 不可微，没有 Top-K backward；
 - Query 一直 local，`dQ` 不在 DSA 内部通信；
-- packed prefix 中的重复 dKI/dKV 先用 consumer CSR 合并为 unique rows；
-- reverse All2AllV 后，block/token owner 再用 owner CSR 合并多个 consumer 的梯度；
+- packed prefix 中的重复 dKI/dKV 先在 consumer 侧合并为 unique rows；
+- reverse group-reduce 直接在 owner 侧合并多个 consumer 的梯度，DSA 不再自己做 CSR；
 - CSA 先异步 start `COMPRESSED_KI` reverse，再在 handle-owned 非 default stream 上提交 sparse
-  attention backward；caller stream 的 KI wait/owner CSR 与 sparse kernels 可并行。两侧通过
+  attention backward；caller stream 的 KI wait 与 sparse kernels 可并行。两侧通过
   caller-ready/sparse-done events 建立依赖，不插入 host synchronize；
 - `COMPRESSED_KV` reverse 在 Main stream 同步 finish，但该 stream 的 wait 不阻塞 Indexer 分支，
   因此可由 Indexer Compressor backward 遮挡；Main Compressor backward 仍严格等待本 route
@@ -802,7 +843,7 @@ flowchart TB
   CSA branch-order gate 随后显式按 `OVERLAP_X → WINDOW_KV` 注册两条 reverse，并将其
   owner-local gradient 直接接回原始 source；两条 route 因而可与 Q/weight projection backward
   并行。route finish
-  仍在各自 stream 上完成 owner CSR，任何 consumer 都必须通过 stream dependency 等待其结果；
+  仍在各自 stream 上完成 owner 归约，任何 consumer 都必须通过 stream dependency 等待其结果；
 - 四条 reverse 共用同一 communicator，通信彼此不并行；优化只让
   `ncclDevKernel_SendRecv` 与独立计算重叠。固定提交顺序为
   `COMPRESSED_KI → COMPRESSED_KV → OVERLAP_X → WINDOW_KV`，不得为了局部 overlap 在不同 rank
@@ -843,7 +884,7 @@ AllGather。模型参数和 sink 的 CP AllReduce 另行报告，不能伪装成
 `ratio=0` 的 W 只有 `WINDOW_KV` route，没有与其独立的 Compressor/Indexer 计算。
 该路径在当前 Pro 中只是 MTP/window-only 兼容边界，不进入主干或正式 Pro-pair
 profile。在历史 W-first attention-suite 中，`WINDOW_KV.forward` 不具备单图内部完全遮挡条件；
-不得通过延迟 NVTX、删掉通信或把 route copy/CSR 计作计算伪造 overlap。W reverse 必须先由
+不得通过延迟 NVTX、删掉通信或把 route pack/归约计作计算伪造 overlap。reverse 必须先由
 sparse-attention backward 产生 dKV，随后才可发起 `WINDOW_KV.backward`；该 reverse 是 W 的末端
 route，之后也没有 W 自身计算，所以同样不具备 mode-local 遮挡条件。
 
@@ -905,13 +946,13 @@ backward 并行。HCA `OVERLAP_X.forward` 是 Main Compressor 的前置依赖，
 
 | 来源 | 直接复用 | 不照搬的部分 |
 | --- | --- | --- |
-| Magi-MSA | sample-relative fragments、unique K receive、prefix pack、reverse CSR、async transfer lifetime | global-input dispatch/AllGather；MSA 的 Degree-0 API |
-| Magi 通用通信 | `all2all_v`、typed route、device copy map | Query/QW worker route |
+| Magi-MSA | sample-relative fragments、unique K receive、prefix pack、range 化 route、参数交给模型侧的 callback 边界、async transfer lifetime | global-input dispatch/AllGather；MSA 的 Degree-0 API |
+| Magi 通用通信 | `AttnRanges`、`_calc_group_collective_arg_from_ranges`、`group_cast`/`group_reduce`、`range_gather`/`range_reduce`、`AttnBucket` | Query/QW worker route |
 | Megatron | Compressor/Indexer 数学、RoPE、Hadamard、selected-only predictor/teacher、clipping、loss scale 和 unit-gradient 预计算调度 | `FusedIndexerSparseAttnFromTopkFunc`、Megatron CP full AllGather、共享 KI/KV local-row 假设 |
 | Quack 0.4.1 | CUDA Compressor RMSNorm forward/backward；BF16 activation、FP32 scale 和 FP32 accumulation | CPU reference 路径、Compressor gate/softmax 或 RoPE 数学 |
 | cuDNN | grouped Indexer score/Top-K、selected recompute、sparse Indexer backward、sparse attention backward | 在 Magi 中重写同类 kernel |
 | FlashMLA | 924 sparse attention forward 依次加官方 13d dual-LSE 与 b764 Pro-H128/prefix-1024 增量，同次返回完整 LSE 与 compressed-prefix LSE | 新增第二次 attention pass、追踪浮动 revision 或通过 Megatron 私有 wrapper 间接调用 |
-| Magi-DSA 现有代码 | `DsaRowCopy`、`DsaRowCsrReduce`、Compressor route、KV bank mapping | `DsaIndexerFragment` worker 语义、`INDEXER_QW`、aux restore |
+| Magi-DSA 现有代码 | Compressor route、KV bank mapping、typed route 命名 | `DsaIndexerFragment` worker 语义、`INDEXER_QW`、aux restore、自建 All2AllV 与逐行 copy/CSR kernel |
 
 Magi 可以参考固定 Megatron revision 的 Python 实现和测试，但 production backend 不 import 其
 underscore helper 或 autograd class；否则外部 Python ABI 会重新成为部署依赖。
@@ -1215,17 +1256,17 @@ artifact 的 117 项 SHA-256 manifest 已全量校验。
 
 ### 8.2 Packing 和 collective
 
+自建的 `DsaRowCopy` / `DsaRowCsrReduce` AOT kernel 已经删除，route 的搬运现在由 Core
+承担，所以 NSYS 里看到的名字也换了一批：
+
 | NSYS kernel substring | 对应 op | 如何消歧 |
 | --- | --- | --- |
-| `DsaRowCopy...o7168` | Pro `TOKEN_LAYOUT(x)`、`OVERLAP_X`，也可能是 compression-support 本地 pack | 用 `module::route` 与 `module::packing` NVTX 区分，不能只看宽度 |
-| `DsaRowCopy...o512` | `WINDOW_KV`、`COMPRESSED_KV` 或 KV 本地 pack | 查看对应 route/packing NVTX |
-| `DsaRowCopy...o128` | `COMPRESSED_KI` 或 KI prefix pack | 查看 `module::route::COMPRESSED_KI` 与 `module::packing::indexer_key` |
-| `DsaRowCsrReduce...o7168` | Pro reverse `OVERLAP_X` 或 compression-support 本地 gradient reduce | 查看 route/packing NVTX 和是否包含 NCCL |
-| `DsaRowCsrReduce...o512` | reverse window/compressed-KV 或本地 KV gradient reduce | 查看 route/packing NVTX |
-| `DsaRowCsrReduce...o128` | reverse compressed-KI 或本地 KI gradient reduce | 查看 route/packing NVTX |
-| `ncclDevKernel_SendRecv` | All2AllV 数据面 | 必须用 enclosing route NVTX 区分 payload |
+| `range_gather_per_range_kernel` / `range_gather_per_row_kernel` | Core group-cast 的 send pack 与 stable-order post-process，或 KI grouped prefix gather | 用 `module::route` 与 `module::packing` NVTX 区分，不能只看名字 |
+| `range_sum_reduce_*_kernel` | Core group-reduce 的 owner 归约，或 CP1 反向的本地区间归约 | 查看 route NVTX 和是否包含 NCCL |
+| `index_select` / `index_add` 系列 | CSA compression-support gather 及其 backward scatter-add | 位于 `module::packing::<mode>::compression_support` |
+| `ncclDevKernel_SendRecv` | group-cast/group-reduce 数据面 | 必须用 enclosing route NVTX 区分 payload |
 | `ncclDevKernel_AllReduce_*` | replicated Compressor/Indexer/sink 参数梯度 | 位于 `magi_dsa::parameter_gradient_allreduce`，不计入 4F+4B |
-| `DsaRowCopy...o4096` | 历史 Flash-Base hidden/OX | Pro 正式 trace 中不得把它归因为 hidden/OX |
+| `DsaRowCopy...` / `DsaRowCsrReduce...` | 历史 Base/Pro AOT pack kernel | 当前实现中必须完全消失 |
 | `DsaRowCopy...o8256` | 历史 `INDEXER_QW` | 当前 Pro 设计中必须消失 |
 | `DsaRowCopy...o516` | 历史 Top-K auxiliary restore | 当前 Pro 设计中必须消失 |
 

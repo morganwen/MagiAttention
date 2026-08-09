@@ -14,6 +14,10 @@
 
 """Compute kernels backing the Magi-DSA runtime.
 
-Both kernel families are imported lazily by their functional wrappers so that
-CPU plan/reference paths do not require the CuTe or Triton toolchains.
+Only fused elementwise and index kernels live here. Row gathers and reductions
+are MagiAttention Core range ops, and the collectives are Core group
+collectives, so this package carries no packing or communication kernel.
+
+The Triton wrappers import lazily so CPU plan and reference paths do not
+require the Triton toolchain.
 """

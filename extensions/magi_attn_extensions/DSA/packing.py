@@ -12,119 +12,92 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Cold materialization of one rank's device metadata.
+
+The host plan is range shaped, so everything here is either a small range table
+or a per-query base/length pair. Nothing materializes a padded per-query index
+matrix: a raw window and a causal-visible compressed prefix are both contiguous
+runs in their consumer bank, so a base and a length describe them exactly.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 import torch
 
+from magi_attention import env
+from magi_attention.meta.collection.comm_meta import (
+    A2AVBasedGroupCollectiveArg,
+    GroupCollectiveArg,
+)
+from magi_attention.meta.solver.dynamic_attn_solver import DynamicAttnSolver
+from magi_attention.utils.general import _make_device_tensor
+
 from .config import MagiDSAConfig
-from .meta import DsaExecutionPlan, DsaRankPlan, DsaRouteRankPlan
-from .nvtx import dsa_nvtx_range
-
-
-@dataclass(frozen=True)
-class DsaHostCopyMap:
-    """Validated destination-row to source-row map."""
-
-    source_rows: tuple[int, ...]
-
-
-@dataclass(frozen=True)
-class DsaHostReduceMap:
-    """Validated destination-row CSR reduction map."""
-
-    row_offsets: tuple[int, ...]
-    source_rows: tuple[int, ...]
-
-
-@dataclass(frozen=True)
-class DsaHostRouteMaps:
-    """All row permutations used by a typed unique-row route."""
-
-    send_pack: DsaHostCopyMap
-    consumer_pack: DsaHostCopyMap
-    received_pack: DsaHostCopyMap
-    owner_reduce: DsaHostReduceMap
-
-
-@dataclass(frozen=True)
-class DsaDeviceCopyMap:
-    """CUDA-resident destination-row to source-row map."""
-
-    source_rows: torch.Tensor
-    is_identity: bool = False
-
-
-@dataclass(frozen=True)
-class DsaDeviceReduceMap:
-    """CUDA-resident destination-row CSR reduction map."""
-
-    row_offsets: torch.Tensor
-    source_rows: torch.Tensor
-    is_identity: bool = False
+from .meta import DsaExecutionPlan, DsaRankPlan, DsaRoutePlan
 
 
 @dataclass(frozen=True)
 class DsaDeviceRoutePlan:
-    """One rank's static maps and split sizes for a typed All2AllV route."""
+    """One rank's lowered group-collective plan for a typed payload route."""
 
     name: str
     rank: int
+    cp_size: int
     producer_row_count: int
-    send_counts: tuple[int, ...]
-    recv_counts: tuple[int, ...]
-    send_pack: DsaDeviceCopyMap
-    consumer_pack: DsaDeviceCopyMap
-    received_pack: DsaDeviceCopyMap
-    owner_reduce: DsaDeviceReduceMap
-    owner_restore: DsaDeviceCopyMap | None
-    consumer_global_rows: torch.Tensor
-
-    @property
-    def send_row_count(self) -> int:
-        return sum(self.send_counts)
-
-    @property
-    def received_row_count(self) -> int:
-        return sum(self.recv_counts)
-
-    @property
-    def consumer_row_count(self) -> int:
-        return self.consumer_global_rows.numel()
+    consumer_row_count: int
+    # ``None`` only for a one-rank CP group, which needs no collective.
+    group_collective_arg: GroupCollectiveArg | None
+    # One-rank fallback. A one-rank route is not always the identity: a sample
+    # tail shorter than the compression ratio produces no block, so OVERLAP_X
+    # consumes fewer rows than the Query buffer holds. These are the consumer
+    # ranges in producer-local coordinates.
+    local_gather_ranges: torch.Tensor | None
+    # Maps a global row id to its consumer-local row, or -1 when this rank does
+    # not receive that row. Sized by the route's global row domain, not by the
+    # number of received rows.
+    global_to_consumer: torch.Tensor
 
 
 @dataclass(frozen=True)
 class DsaDeviceCompressionMap:
-    """Padded compression support rows and a matching validity mask."""
+    """Compressor support rows as one contiguous run per produced block."""
 
-    source_pack: DsaDeviceCopyMap
-    source_unpack: DsaDeviceReduceMap
+    # Consumer row that support column 0 maps to; leading columns of a
+    # sample-initial CSA block are masked instead of read.
+    support_offset: torch.Tensor
     valid_rows: torch.Tensor
     block_positions: torch.Tensor
 
 
 @dataclass(frozen=True)
 class DsaDeviceAttentionMap:
-    """Device-generated padded raw-window/HCA rows into unique KV banks."""
+    """Per-query base and length of the raw window and compressed prefix."""
 
-    window_rows: torch.Tensor
-    window_lengths: torch.Tensor
-    compressed_rows: torch.Tensor
-    compressed_lengths: torch.Tensor
+    window_base: torch.Tensor
+    window_length: torch.Tensor
+    compressed_base: torch.Tensor
+    compressed_length: torch.Tensor
     compressed_global_to_consumer: torch.Tensor
+    # Plan-time bound on the causal-visible compressed prefix, so the warm path
+    # can size its index matrix without a device reduction.
+    max_compressed_length: int
 
 
 @dataclass(frozen=True)
 class DsaDeviceIndexerMap:
-    """Grouped Indexer metadata and its forward-only duplicate-prefix map."""
+    """Grouped Indexer varlen metadata and its forward-only prefix gather."""
 
     q_cu_seqlens: torch.Tensor
     k_cu_seqlens: torch.Tensor
     q_causal_offsets: torch.Tensor
     q_sample_block_offsets: torch.Tensor
     seq_lens: torch.Tensor
-    k_pack: DsaDeviceCopyMap
+    # One [begin, end) consumer-row run per fragment; a range gather expands the
+    # unique KI bank into the grouped per-fragment prefixes cuDNN expects.
+    k_gather_ranges: torch.Tensor
+    packed_k_rows: int
     ki_global_to_consumer: torch.Tensor
     max_seqlen_q: int
     logical_max_seqlen_k: int
@@ -140,367 +113,351 @@ class DsaDeviceRankPlan:
     local_token_count: int
     local_q_sample_ids: torch.Tensor
     local_q_positions: torch.Tensor
-    compression: DsaDeviceCompressionMap | None
+    compression: DsaDeviceCompressionMap
     attention: DsaDeviceAttentionMap
     indexer: DsaDeviceIndexerMap | None
-    token_layout_route: DsaDeviceRoutePlan | None
+    token_layout_route: DsaDeviceRoutePlan
     window_route: DsaDeviceRoutePlan
-    overlap_x_route: DsaDeviceRoutePlan | None
-    compressed_kv_route: DsaDeviceRoutePlan | None
+    overlap_x_route: DsaDeviceRoutePlan
+    compressed_kv_route: DsaDeviceRoutePlan
     compressed_ki_route: DsaDeviceRoutePlan | None
 
 
-def make_dsa_copy_map(
-    source_rows: tuple[int, ...],
-    source_row_count: int,
-) -> DsaHostCopyMap:
-    """Validate an arbitrary row gather without imposing uniqueness."""
-
-    if source_row_count < 0:
-        raise ValueError("source_row_count must be non-negative")
-    normalized = tuple(int(row) for row in source_rows)
-    if any(row < 0 or row >= source_row_count for row in normalized):
-        raise ValueError("copy map contains a row outside its source")
-    return DsaHostCopyMap(source_rows=normalized)
-
-
-def make_dsa_reduce_map(
-    destination_for_source: tuple[int, ...],
-    destination_row_count: int,
-) -> DsaHostReduceMap:
-    """Build a destination-row CSR from a source-row destination table."""
-
-    if destination_row_count < 0:
-        raise ValueError("destination_row_count must be non-negative")
-    normalized = tuple(int(row) for row in destination_for_source)
-    if any(row < 0 or row >= destination_row_count for row in normalized):
-        raise ValueError("reduce map contains a row outside its destination")
-    occurrences: list[list[int]] = [[] for _ in range(destination_row_count)]
-    for source_row, destination_row in enumerate(normalized):
-        occurrences[destination_row].append(source_row)
-    row_offsets = [0]
-    source_rows: list[int] = []
-    for rows in occurrences:
-        source_rows.extend(rows)
-        row_offsets.append(len(source_rows))
-    return DsaHostReduceMap(tuple(row_offsets), tuple(source_rows))
-
-
-def validate_dsa_reduce_map(
-    mapping: DsaHostReduceMap,
-    source_row_count: int,
-    destination_row_count: int,
-) -> None:
-    """Validate CSR bounds and require every source contribution exactly once."""
-
-    if len(mapping.row_offsets) != destination_row_count + 1:
-        raise ValueError("CSR offset count does not match destination rows")
-    if not mapping.row_offsets or mapping.row_offsets[0] != 0:
-        raise ValueError("CSR offsets must start at zero")
-    if any(
-        end < begin for begin, end in zip(mapping.row_offsets, mapping.row_offsets[1:])
-    ):
-        raise ValueError("CSR offsets must be nondecreasing")
-    if mapping.row_offsets[-1] != len(mapping.source_rows):
-        raise ValueError("CSR terminal offset does not match its item count")
-    if sorted(mapping.source_rows) != list(range(source_row_count)):
-        raise ValueError("CSR must consume every source row exactly once")
-
-
-def make_dsa_route_maps(route: DsaRouteRankPlan) -> DsaHostRouteMaps:
-    """Convert solver metadata into four independently validated row maps."""
-
-    if len(route.send_counts) != len(route.recv_counts):
-        raise ValueError("route split tables have different world sizes")
-    if sum(route.send_counts) != len(route.send_source_rows):
-        raise ValueError("route send splits do not cover the packed send rows")
-    if sum(route.recv_counts) != len(route.received_global_rows):
-        raise ValueError("route receive splits do not cover the received rows")
-    if len(route.consumer_from_received) != len(route.consumer_global_rows):
-        raise ValueError("route consumer permutation has the wrong length")
-    if len(route.received_from_consumer) != len(route.received_global_rows):
-        raise ValueError("route received permutation has the wrong length")
-
-    send_pack = make_dsa_copy_map(route.send_source_rows, route.producer_row_count)
-    consumer_pack = make_dsa_copy_map(
-        route.consumer_from_received, len(route.received_global_rows)
-    )
-    received_pack = make_dsa_copy_map(
-        route.received_from_consumer, len(route.consumer_global_rows)
-    )
-    for consumer_row, received_row in enumerate(route.consumer_from_received):
-        if route.received_from_consumer[received_row] != consumer_row:
-            raise ValueError("route consumer and received maps are not inverses")
-
-    owner_reduce = DsaHostReduceMap(
-        route.reverse_row_offsets, route.reverse_source_rows
-    )
-    validate_dsa_reduce_map(
-        owner_reduce, len(route.send_source_rows), route.producer_row_count
-    )
-    return DsaHostRouteMaps(send_pack, consumer_pack, received_pack, owner_reduce)
-
-
-def copy_dsa_rows_reference(
-    source: torch.Tensor, mapping: DsaHostCopyMap
-) -> torch.Tensor:
-    """PyTorch oracle for a destination-to-source row gather."""
-
-    rows = torch.tensor(mapping.source_rows, dtype=torch.int64, device=source.device)
-    return source.index_select(0, rows)
-
-
-def reduce_dsa_rows_reference(
-    source: torch.Tensor,
-    mapping: DsaHostReduceMap,
-) -> torch.Tensor:
-    """PyTorch oracle for static CSR sum reduction."""
-
-    output_rows = len(mapping.row_offsets) - 1
-    result = torch.zeros(
-        (output_rows, *source.shape[1:]), dtype=source.dtype, device=source.device
-    )
-    if mapping.source_rows:
-        source_rows = torch.tensor(
-            mapping.source_rows, dtype=torch.int64, device=source.device
-        )
-        destination_rows = torch.repeat_interleave(
-            torch.arange(output_rows, dtype=torch.int64, device=source.device),
-            torch.tensor(
-                [
-                    end - begin
-                    for begin, end in zip(mapping.row_offsets, mapping.row_offsets[1:])
-                ],
-                dtype=torch.int64,
-                device=source.device,
-            ),
-        )
-        result.index_add_(0, destination_rows, source.index_select(0, source_rows))
-    return result
-
-
-def _to_int32(
-    values: tuple[int, ...] | list[int], device: torch.device
-) -> torch.Tensor:
-    return torch.tensor(values, dtype=torch.int32, device=device)
-
-
-def _device_copy_map(
-    mapping: DsaHostCopyMap,
-    source_row_count: int,
+def _make_global_to_consumer(
+    route: DsaRoutePlan,
+    rank: int,
+    row_domain: int,
     device: torch.device,
-) -> DsaDeviceCopyMap:
-    return DsaDeviceCopyMap(
-        _to_int32(mapping.source_rows, device),
-        len(mapping.source_rows) == source_row_count
-        and mapping.source_rows == tuple(range(source_row_count)),
-    )
+) -> torch.Tensor:
+    """Build the global-row to consumer-row lookup for one received bank."""
 
-
-def _device_reduce_map(
-    mapping: DsaHostReduceMap, device: torch.device
-) -> DsaDeviceReduceMap:
-    return DsaDeviceReduceMap(
-        row_offsets=_to_int32(mapping.row_offsets, device),
-        source_rows=_to_int32(mapping.source_rows, device),
-        is_identity=(
-            mapping.row_offsets == tuple(range(len(mapping.row_offsets)))
-            and mapping.source_rows == tuple(range(len(mapping.source_rows)))
-        ),
-    )
+    table = torch.full((row_domain,), -1, dtype=torch.int32, device=device)
+    cursor = 0
+    for begin, end in route.consumer_ranges_per_rank[rank]:
+        length = end - begin
+        table[begin:end] = torch.arange(
+            cursor, cursor + length, dtype=torch.int32, device=device
+        )
+        cursor += length
+    return table
 
 
 def make_dsa_device_route_plan(
-    name: str,
-    route: DsaRouteRankPlan,
+    route: DsaRoutePlan,
+    rank: int,
+    row_domain: int,
     device: torch.device,
+    *,
+    cp_group,
+    deterministic: bool,
 ) -> DsaDeviceRoutePlan:
-    """Upload one typed route once during cold plan materialization."""
+    """Lower one range-shaped route to a Core group-collective plan."""
 
-    maps = make_dsa_route_maps(route)
-    owner_restore = None
-    if all(
-        end - begin == 1
-        for begin, end in zip(
-            maps.owner_reduce.row_offsets, maps.owner_reduce.row_offsets[1:]
+    cp_size = route.cp_size
+    arg: GroupCollectiveArg | None = None
+    if cp_size > 1:
+        if env.comm.is_native_grpcoll_enable():
+            raise RuntimeError("Magi-DSA routes do not support native grpcoll")
+        host_arg = DynamicAttnSolver._calc_group_collective_arg_from_ranges(
+            host_ranges=route.owner_attn_ranges(),
+            calc_ranges_per_rank=route.consumer_attn_ranges(),
+            cp_rank=rank,
+            cp_size=cp_size,
+            cp_group=cp_group,
+            cp_mesh=None,
+            deterministic=deterministic,
+            split_alignment=1,
+            calc_local_range=True,
         )
-    ):
-        owner_restore = _device_copy_map(
-            DsaHostCopyMap(maps.owner_reduce.source_rows),
-            len(route.send_source_rows),
-            device,
+        if sum(host_arg.input_split_size_list) != route.owner_row_count(rank):
+            raise ValueError(f"{route.name}: group-cast input does not match the owner")
+        if sum(host_arg.output_split_size_list) != route.consumer_row_count(rank):
+            raise ValueError(
+                f"{route.name}: group-cast output does not match the consumer"
+            )
+        # Each route owns an independent device handle so its forward group-cast
+        # and backward group-reduce never share buffers with a sibling route.
+        arg = A2AVBasedGroupCollectiveArg(
+            input_split_size_list=list(host_arg.input_split_size_list),
+            output_split_size_list=list(host_arg.output_split_size_list),
+            dst_indices_list=[list(indices) for indices in host_arg.dst_indices_list],
+            src_index_list=list(host_arg.src_index_list),
+            rank=host_arg.rank,
+            world_size=host_arg.world_size,
+            group=host_arg.group,
+            device_mesh=host_arg.device_mesh,
+            deterministic=host_arg.deterministic,
+            split_alignment=host_arg.split_alignment,
+            packed_times=1,
+            reduce_op="sum",
+            init_group_reduce=True,
+        )
+    local_gather_ranges = None
+    if cp_size == 1:
+        local_gather_ranges = _make_device_tensor(
+            _local_gather_ranges(route, rank) or [[0, 0]],
+            dtype=torch.int32,
+            device=device,
         )
     return DsaDeviceRoutePlan(
-        name=name,
-        rank=route.rank,
-        producer_row_count=route.producer_row_count,
-        send_counts=route.send_counts,
-        recv_counts=route.recv_counts,
-        send_pack=_device_copy_map(maps.send_pack, route.producer_row_count, device),
-        consumer_pack=_device_copy_map(
-            maps.consumer_pack, len(route.received_global_rows), device
-        ),
-        received_pack=_device_copy_map(
-            maps.received_pack, len(route.consumer_global_rows), device
-        ),
-        owner_reduce=_device_reduce_map(maps.owner_reduce, device),
-        owner_restore=owner_restore,
-        consumer_global_rows=_to_int32(route.consumer_global_rows, device),
+        name=route.name,
+        rank=rank,
+        cp_size=cp_size,
+        producer_row_count=route.owner_row_count(rank),
+        consumer_row_count=route.consumer_row_count(rank),
+        group_collective_arg=arg,
+        local_gather_ranges=local_gather_ranges,
+        global_to_consumer=_make_global_to_consumer(route, rank, row_domain, device),
     )
+
+
+def _local_gather_ranges(route: DsaRoutePlan, rank: int) -> list[list[int]]:
+    """Express the consumer ranges in this rank's producer-local coordinates.
+
+    A consumer range is merged across samples while owner ranges are split at
+    sample boundaries, so one consumer range can cover several owner ranges and
+    has to be intersected rather than matched whole.
+    """
+
+    owner = route.owner_ranges_per_rank[rank]
+    bases: list[int] = []
+    cursor = 0
+    for begin, end in owner:
+        bases.append(cursor)
+        cursor += end - begin
+    ranges: list[list[int]] = []
+    for begin, end in route.consumer_ranges_per_rank[rank]:
+        covered = 0
+        for index, (owner_begin, owner_end) in enumerate(owner):
+            lo = max(begin, owner_begin)
+            hi = min(end, owner_end)
+            if lo >= hi:
+                continue
+            offset = bases[index] - owner_begin
+            ranges.append([lo + offset, hi + offset])
+            covered += hi - lo
+        if covered != end - begin:
+            raise ValueError(
+                f"{route.name}: a one-rank consumer range is not owned locally"
+            )
+    return ranges
+
+
+def _expand_query_metadata(
+    rank_plan: DsaRankPlan,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Expand fragment bounds into per-query sample ids and positions.
+
+    The host plan only stores fragments, so the two per-token tables are built
+    here with one arange and one repeat_interleave instead of being shipped as
+    Python tuples.
+    """
+
+    fragments = rank_plan.query_fragments
+    if not fragments:
+        empty = torch.empty((0,), dtype=torch.int32, device=device)
+        return empty, empty.clone()
+    lengths = _make_device_tensor(
+        [fragment.length for fragment in fragments], dtype=torch.int64, device=device
+    )
+    sample_ids = _make_device_tensor(
+        [fragment.sample_id for fragment in fragments],
+        dtype=torch.int32,
+        device=device,
+    )
+    q_begins = _make_device_tensor(
+        [fragment.q_begin for fragment in fragments], dtype=torch.int32, device=device
+    )
+    local_sample_ids = torch.repeat_interleave(sample_ids, lengths)
+    fragment_begin = torch.repeat_interleave(
+        torch.cumsum(lengths, dim=0) - lengths, lengths
+    )
+    within = (
+        torch.arange(int(lengths.sum().item()), device=device, dtype=torch.int64)
+        - fragment_begin
+    )
+    local_positions = (
+        torch.repeat_interleave(q_begins, lengths) + within.to(torch.int32)
+    ).to(torch.int32)
+    return local_sample_ids.contiguous(), local_positions.contiguous()
 
 
 def _make_compression_map(
     config: MagiDSAConfig,
+    plan: DsaExecutionPlan,
     rank_plan: DsaRankPlan,
+    overlap_route: DsaDeviceRoutePlan,
     device: torch.device,
-) -> DsaDeviceCompressionMap | None:
-    if not config.ratio:
-        return None
+) -> DsaDeviceCompressionMap:
+    """Locate each produced block's support run inside the OVERLAP_X bank."""
+
+    ratio = config.ratio
     support = config.compressor_support
-    expected = len(rank_plan.produced_blocks) * support
-    if len(rank_plan.compression_source_from_overlap) != expected:
-        raise ValueError("compression support map has an invalid row count")
-    source_rows = [max(row, 0) for row in rank_plan.compression_source_from_overlap]
-    valid_rows = [row >= 0 for row in rank_plan.compression_source_from_overlap]
-    overlap_row_count = (
-        0
-        if rank_plan.overlap_x_route is None
-        else len(rank_plan.overlap_x_route.consumer_global_rows)
+    overlap = ratio == 4
+    # ``anchor`` is the global row that support column ``leading`` maps to, so
+    # the run is ``consumer(anchor) - leading + column``. A CSA block that opens
+    # a sample has no previous group: its first ``ratio`` columns are masked and
+    # the anchor becomes the current group.
+    anchors: list[int] = []
+    leadings: list[int] = []
+    valid: list[list[bool]] = []
+    positions: list[int] = []
+    cu_seqlens = plan.cu_seqlens
+    lookup = overlap_route.global_to_consumer
+    for block_begin, block_end in rank_plan.produced_block_ranges:
+        # Sound because a produced block range never straddles a sample.
+        sample_id = _sample_of_block(rank_plan.sample_block_offsets, block_begin)
+        sample_global_begin = cu_seqlens[sample_id]
+        sample_block_begin = rank_plan.sample_block_offsets[sample_id]
+        for global_block in range(block_begin, block_end):
+            sample_block_id = global_block - sample_block_begin
+            group_begin = sample_global_begin + sample_block_id * ratio
+            positions.append(sample_block_id * ratio)
+            if overlap and sample_block_id == 0:
+                anchors.append(group_begin)
+                leadings.append(ratio)
+                valid.append([False] * ratio + [True] * ratio)
+            else:
+                anchors.append(group_begin - (ratio if overlap else 0))
+                leadings.append(0)
+                valid.append([True] * support)
+    if not anchors:
+        return DsaDeviceCompressionMap(
+            support_offset=torch.empty((0,), dtype=torch.int32, device=device),
+            valid_rows=torch.empty((0, support), dtype=torch.bool, device=device),
+            block_positions=torch.empty((0,), dtype=torch.int32, device=device),
+        )
+    anchor_consumer = lookup[
+        _make_device_tensor(anchors, dtype=torch.int64, device=device)
+    ].to(torch.int32)
+    if bool((anchor_consumer < 0).any().item()):
+        raise ValueError("OVERLAP_X consumer bank misses a compressor support row")
+    support_offset = anchor_consumer - _make_device_tensor(
+        leadings, dtype=torch.int32, device=device
     )
-    source_pack = make_dsa_copy_map(tuple(source_rows), overlap_row_count)
-    source_unpack = make_dsa_reduce_map(tuple(source_rows), overlap_row_count)
-    validate_dsa_reduce_map(source_unpack, len(source_rows), overlap_row_count)
     return DsaDeviceCompressionMap(
-        source_pack=_device_copy_map(source_pack, overlap_row_count, device),
-        source_unpack=_device_reduce_map(source_unpack, device),
-        valid_rows=torch.tensor(valid_rows, dtype=torch.bool, device=device),
-        block_positions=_to_int32(
-            [block.position for block in rank_plan.produced_blocks], device
+        support_offset=support_offset.contiguous(),
+        valid_rows=_make_device_tensor(valid, dtype=torch.bool, device=device),
+        block_positions=_make_device_tensor(
+            positions, dtype=torch.int32, device=device
         ),
     )
+
+
+def _sample_of_block(sample_block_offsets: tuple[int, ...], global_block: int) -> int:
+    import bisect
+
+    return bisect.bisect_right(sample_block_offsets, global_block) - 1
 
 
 def _make_attention_map(
     plan: DsaExecutionPlan,
     rank_plan: DsaRankPlan,
     config: MagiDSAConfig,
+    window_route: DsaDeviceRoutePlan,
+    compressed_kv_route: DsaDeviceRoutePlan,
+    local_q_sample_ids: torch.Tensor,
+    local_q_positions: torch.Tensor,
     device: torch.device,
 ) -> DsaDeviceAttentionMap:
-    window_position = {
-        global_row: position
-        for position, global_row in enumerate(
-            rank_plan.window_route.consumer_global_rows
-        )
-    }
-    compressed_rows = (
-        ()
-        if rank_plan.compressed_kv_route is None
-        else rank_plan.compressed_kv_route.consumer_global_rows
-    )
-    total_tokens = plan.total_tokens
-    token_global_to_consumer = torch.full(
-        (total_tokens,), -1, dtype=torch.int32, device=device
-    )
-    if window_position:
-        window_globals = _to_int32(list(window_position), device)
-        token_global_to_consumer[window_globals.long()] = torch.arange(
-            len(window_position), dtype=torch.int32, device=device
-        )
-    sample_ids = _to_int32(rank_plan.local_q_sample_ids, device).long()
-    positions = _to_int32(rank_plan.local_q_positions, device)
-    sample_begins = _to_int32(list(plan.cu_seqlens[:-1]), device)
-    window_lengths = (positions + 1).clamp(max=config.window_size)
-    window_columns = torch.arange(
-        config.window_size, dtype=torch.int32, device=device
-    ).unsqueeze(0)
-    window_valid = window_columns < window_lengths.unsqueeze(1)
-    window_positions = (
-        positions.unsqueeze(1) - window_lengths.unsqueeze(1) + 1 + window_columns
-    )
-    window_globals = sample_begins[sample_ids].unsqueeze(1) + window_positions
-    safe_window_globals = window_globals.masked_fill(~window_valid, 0)
-    window_rows = token_global_to_consumer[safe_window_globals.long()].masked_fill(
-        ~window_valid, -1
-    )
-    if bool((window_rows[window_valid] < 0).any().item()):
-        raise ValueError("WINDOW_KV consumer union does not cover a local raw window")
+    """Reduce both attention banks to one base and one length per query."""
 
-    global_to_consumer = [-1] * plan.total_compressed_blocks
-    for consumer_row, global_block in enumerate(compressed_rows):
-        global_to_consumer[global_block] = consumer_row
-    compressed_global_to_consumer = _to_int32(global_to_consumer, device)
-    if config.ratio == 128:
-        compressed_lengths = torch.div(
-            positions + 1, config.ratio, rounding_mode="floor"
-        )
-        max_visible = (
-            int(compressed_lengths.max().item()) if compressed_lengths.numel() else 0
-        )
-        compressed_columns = torch.arange(
-            max_visible, dtype=torch.int32, device=device
-        ).unsqueeze(0)
-        compressed_valid = compressed_columns < compressed_lengths.unsqueeze(1)
-        sample_block_offsets = _to_int32(list(rank_plan.sample_block_offsets), device)
-        compressed_globals = (
-            sample_block_offsets[sample_ids].unsqueeze(1) + compressed_columns
-        )
-        safe_compressed_globals = compressed_globals.masked_fill(~compressed_valid, 0)
-        local_compressed = compressed_global_to_consumer[safe_compressed_globals.long()]
-        local_compressed = local_compressed.masked_fill(~compressed_valid, -1)
-        if bool((local_compressed[compressed_valid] < 0).any().item()):
-            raise ValueError(
-                "COMPRESSED_KV consumer union does not cover an HCA causal prefix"
-            )
-    else:
-        compressed_lengths = torch.zeros_like(positions)
-        local_compressed = torch.empty(
-            (positions.numel(), 0), dtype=torch.int32, device=device
-        )
+    sample_ids = local_q_sample_ids.to(torch.int64)
+    positions = local_q_positions
+    sample_begins = _make_device_tensor(
+        list(plan.cu_seqlens[:-1]), dtype=torch.int32, device=device
+    )
+    sample_block_offsets = _make_device_tensor(
+        list(rank_plan.sample_block_offsets), dtype=torch.int32, device=device
+    )
+
+    window_length = (positions + 1).clamp(max=config.window_size)
+    window_global_begin = (
+        sample_begins[sample_ids] + positions - window_length + 1
+    ).to(torch.int64)
+    window_base = window_route.global_to_consumer[window_global_begin]
+    if positions.numel() and bool((window_base < 0).any().item()):
+        raise ValueError("WINDOW_KV consumer bank does not cover a local raw window")
+
+    compressed_length = torch.div(
+        positions + 1, config.ratio, rounding_mode="floor"
+    ).to(torch.int32)
+    sample_block_begin = sample_block_offsets[sample_ids].to(torch.int64)
+    compressed_base = compressed_kv_route.global_to_consumer[sample_block_begin]
+    # A query whose causal prefix is empty never reads the bank, so a -1 base is
+    # only a defect when that query actually has visible compressed rows.
+    if positions.numel() and bool(
+        ((compressed_base < 0) & (compressed_length > 0)).any().item()
+    ):
+        raise ValueError("COMPRESSED_KV consumer bank misses a causal prefix")
+
+    max_compressed_length = max(
+        (
+            fragment.q_end // config.ratio
+            for fragment in rank_plan.query_fragments
+        ),
+        default=0,
+    )
     return DsaDeviceAttentionMap(
-        window_rows=window_rows.contiguous(),
-        window_lengths=window_lengths.contiguous(),
-        compressed_rows=local_compressed.contiguous(),
-        compressed_lengths=compressed_lengths.contiguous(),
-        compressed_global_to_consumer=compressed_global_to_consumer,
+        window_base=window_base.to(torch.int32).contiguous(),
+        window_length=window_length.contiguous(),
+        compressed_base=compressed_base.to(torch.int32).contiguous(),
+        compressed_length=compressed_length.contiguous(),
+        compressed_global_to_consumer=compressed_kv_route.global_to_consumer,
+        max_compressed_length=max_compressed_length,
     )
 
 
 def _make_indexer_map(
+    plan: DsaExecutionPlan,
     rank_plan: DsaRankPlan,
+    config: MagiDSAConfig,
+    compressed_ki_route: DsaDeviceRoutePlan,
+    local_q_sample_ids: torch.Tensor,
+    local_q_positions: torch.Tensor,
     device: torch.device,
-) -> DsaDeviceIndexerMap | None:
-    if rank_plan.compressed_ki_route is None:
-        return None
-    compressed_position = {
-        global_row: position
-        for position, global_row in enumerate(
-            rank_plan.compressed_ki_route.consumer_global_rows
-        )
-    }
-    k_pack_rows: list[int] = []
+) -> DsaDeviceIndexerMap:
+    """Build grouped Indexer metadata and the per-fragment prefix gather."""
+
+    ranges: list[list[int]] = []
     for fragment in rank_plan.query_fragments:
         block_begin = rank_plan.sample_block_offsets[fragment.sample_id]
-        k_pack_rows.extend(
-            compressed_position[block_begin + block_offset]
-            for block_offset in range(fragment.q_end // 4)
-        )
-    if len(k_pack_rows) != rank_plan.packed_indexer_k_count:
-        raise ValueError("Indexer K pack rows do not match grouped cu_seqlens")
-    k_pack = make_dsa_copy_map(tuple(k_pack_rows), len(compressed_position))
-    total_compressed_blocks = sum(rank_plan.sample_block_counts)
-    global_to_consumer = [-1] * total_compressed_blocks
-    for global_block, consumer_row in compressed_position.items():
-        global_to_consumer[global_block] = consumer_row
+        length = fragment.q_end // config.ratio
+        base = int(compressed_ki_route.global_to_consumer[block_begin].item())
+        if length and base < 0:
+            raise ValueError("COMPRESSED_KI consumer bank misses a fragment prefix")
+        ranges.append([max(base, 0), max(base, 0) + length])
+    packed_k_rows = sum(end - begin for begin, end in ranges)
+    if packed_k_rows != rank_plan.packed_indexer_k_count:
+        raise ValueError("Indexer K gather rows do not match grouped cu_seqlens")
+
+    sample_ids = local_q_sample_ids.to(torch.int64)
+    sample_block_offsets = _make_device_tensor(
+        list(rank_plan.sample_block_offsets), dtype=torch.int32, device=device
+    )
+    seq_lens = torch.div(
+        local_q_positions + 1, config.ratio, rounding_mode="floor"
+    ).to(torch.int32)
     return DsaDeviceIndexerMap(
-        q_cu_seqlens=_to_int32(rank_plan.indexer_q_cu_seqlens, device),
-        k_cu_seqlens=_to_int32(rank_plan.indexer_k_cu_seqlens, device),
-        q_causal_offsets=_to_int32(rank_plan.indexer_q_causal_offsets, device),
-        q_sample_block_offsets=_to_int32(
-            rank_plan.indexer_q_sample_block_offsets, device
+        q_cu_seqlens=_make_device_tensor(
+            list(rank_plan.indexer_q_cu_seqlens), dtype=torch.int32, device=device
         ),
-        seq_lens=_to_int32(rank_plan.indexer_seq_lens, device),
-        k_pack=_device_copy_map(k_pack, len(compressed_position), device),
-        ki_global_to_consumer=_to_int32(global_to_consumer, device),
+        k_cu_seqlens=_make_device_tensor(
+            list(rank_plan.indexer_k_cu_seqlens), dtype=torch.int32, device=device
+        ),
+        q_causal_offsets=_make_device_tensor(
+            list(rank_plan.indexer_q_causal_offsets), dtype=torch.int32, device=device
+        ),
+        q_sample_block_offsets=sample_block_offsets[sample_ids]
+        .to(torch.int32)
+        .contiguous(),
+        seq_lens=seq_lens.contiguous(),
+        k_gather_ranges=_make_device_tensor(
+            ranges if ranges else [[0, 0]], dtype=torch.int32, device=device
+        ),
+        packed_k_rows=packed_k_rows,
+        ki_global_to_consumer=compressed_ki_route.global_to_consumer,
         max_seqlen_q=rank_plan.indexer_max_seqlen_q,
         logical_max_seqlen_k=rank_plan.indexer_logical_max_seqlen_k,
         backend_max_seqlen_k=rank_plan.indexer_backend_max_seqlen_k,
@@ -512,6 +469,9 @@ def make_dsa_device_rank_plan(
     rank: int,
     config: MagiDSAConfig,
     device: torch.device,
+    *,
+    cp_group=None,
+    deterministic: bool = False,
 ) -> DsaDeviceRankPlan:
     """Materialize every host layout needed by one warm execution handle."""
 
@@ -523,76 +483,95 @@ def make_dsa_device_rank_plan(
         raise ValueError("production DSA device plans require CUDA")
     rank_plan = plan.rank_plans[rank]
 
-    def route(name: str, value: DsaRouteRankPlan | None) -> DsaDeviceRoutePlan | None:
-        return (
-            None if value is None else make_dsa_device_route_plan(name, value, device)
+    def lower(route: DsaRoutePlan, row_domain: int) -> DsaDeviceRoutePlan:
+        return make_dsa_device_route_plan(
+            route,
+            rank,
+            row_domain,
+            device,
+            cp_group=cp_group,
+            deterministic=deterministic,
         )
 
-    window = make_dsa_device_route_plan("WINDOW_KV", rank_plan.window_route, device)
+    tokens = plan.total_tokens
+    blocks = plan.total_compressed_blocks
+    token_layout_route = lower(plan.token_layout_route, tokens)
+    window_route = lower(plan.window_route, tokens)
+    overlap_x_route = lower(plan.overlap_x_route, tokens)
+    compressed_kv_route = lower(plan.compressed_kv_route, blocks)
+    compressed_ki_route = (
+        None
+        if plan.compressed_ki_route is None
+        else lower(plan.compressed_ki_route, blocks)
+    )
+
+    local_q_sample_ids, local_q_positions = _expand_query_metadata(rank_plan, device)
     return DsaDeviceRankPlan(
         rank=rank,
         source_token_count=rank_plan.source_token_count,
         local_token_count=rank_plan.local_token_count,
-        local_q_sample_ids=_to_int32(rank_plan.local_q_sample_ids, device),
-        local_q_positions=_to_int32(rank_plan.local_q_positions, device),
-        compression=_make_compression_map(config, rank_plan, device),
-        attention=_make_attention_map(plan, rank_plan, config, device),
-        indexer=_make_indexer_map(rank_plan, device),
-        token_layout_route=route("TOKEN_LAYOUT", rank_plan.token_layout_route),
-        window_route=window,
-        overlap_x_route=route("OVERLAP_X", rank_plan.overlap_x_route),
-        compressed_kv_route=route("COMPRESSED_KV", rank_plan.compressed_kv_route),
-        compressed_ki_route=route("COMPRESSED_KI", rank_plan.compressed_ki_route),
+        local_q_sample_ids=local_q_sample_ids,
+        local_q_positions=local_q_positions,
+        compression=_make_compression_map(
+            config, plan, rank_plan, overlap_x_route, device
+        ),
+        attention=_make_attention_map(
+            plan,
+            rank_plan,
+            config,
+            window_route,
+            compressed_kv_route,
+            local_q_sample_ids,
+            local_q_positions,
+            device,
+        ),
+        indexer=(
+            None
+            if compressed_ki_route is None
+            else _make_indexer_map(
+                plan,
+                rank_plan,
+                config,
+                compressed_ki_route,
+                local_q_sample_ids,
+                local_q_positions,
+                device,
+            )
+        ),
+        token_layout_route=token_layout_route,
+        window_route=window_route,
+        overlap_x_route=overlap_x_route,
+        compressed_kv_route=compressed_kv_route,
+        compressed_ki_route=compressed_ki_route,
     )
 
 
-def copy_dsa_device_map(
-    source: torch.Tensor, mapping: DsaDeviceCopyMap
+def gather_compressor_support(
+    overlap_x: torch.Tensor,
+    compression: DsaDeviceCompressionMap,
+    support: int,
 ) -> torch.Tensor:
-    """Run the CuTe row gather using device-resident metadata."""
+    """Gather each block's support run, keeping the gradient path differentiable.
 
-    if mapping.is_identity:
-        return source
+    ``index_select`` already accumulates duplicate source rows in backward, so
+    the CSA overlap needs no separate CSR reduction.
+    """
 
-    from .kernels.cutedsl.pack import copy_dsa_rows
-
-    with dsa_nvtx_range("packing::cute_row_copy", enabled=source.is_cuda):
-        return copy_dsa_rows(source, mapping.source_rows)
-
-
-def reduce_dsa_device_map(
-    source: torch.Tensor, mapping: DsaDeviceReduceMap
-) -> torch.Tensor:
-    """Run the CuTe FP32-accumulating CSR reduction."""
-
-    if mapping.is_identity:
-        return source
-
-    from .kernels.cutedsl.pack import reduce_dsa_rows
-
-    with dsa_nvtx_range("packing::cute_csr_reduce", enabled=source.is_cuda):
-        return reduce_dsa_rows(source, mapping.row_offsets, mapping.source_rows)
+    if compression.support_offset.numel() == 0:
+        return overlap_x.new_empty((0, support, overlap_x.shape[-1]))
+    columns = torch.arange(support, device=overlap_x.device, dtype=torch.int32)
+    rows = compression.support_offset.unsqueeze(1) + columns.unsqueeze(0)
+    rows = rows.clamp_(0, overlap_x.shape[0] - 1).reshape(-1).to(torch.int64)
+    return overlap_x.index_select(0, rows).view(-1, support, overlap_x.shape[-1])
 
 
 __all__ = [
     "DsaDeviceAttentionMap",
     "DsaDeviceCompressionMap",
-    "DsaDeviceCopyMap",
     "DsaDeviceIndexerMap",
     "DsaDeviceRankPlan",
-    "DsaDeviceReduceMap",
     "DsaDeviceRoutePlan",
-    "DsaHostCopyMap",
-    "DsaHostReduceMap",
-    "DsaHostRouteMaps",
-    "copy_dsa_device_map",
-    "copy_dsa_rows_reference",
-    "make_dsa_copy_map",
+    "gather_compressor_support",
     "make_dsa_device_rank_plan",
     "make_dsa_device_route_plan",
-    "make_dsa_reduce_map",
-    "make_dsa_route_maps",
-    "reduce_dsa_device_map",
-    "reduce_dsa_rows_reference",
-    "validate_dsa_reduce_map",
 ]

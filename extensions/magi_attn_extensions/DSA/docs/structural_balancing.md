@@ -1,10 +1,13 @@
 # Magi-DSA CP 负载均衡设计
 
-> 通信部分的结构照 `extensions/magi_attn_extensions/MSA` 的已落地实现设计（required-K 前缀 + consumer 内去重 + 复用 `DynamicAttnSolver` range planner），本文标注 DSA 与 MSA 的差异处。
+> 通信部分照 `extensions/magi_attn_extensions/MSA` 的已落地实现设计：required-K 前缀、
+> consumer 内去重，并且和 MSA 一样直接复用 `DynamicAttnSolver` 的 range planner 与 Core 的
+> group collective。2026-08-09 之前 DSA 自己实现了这条链路，现已删除；本文标注 DSA 与 MSA
+> 仍然存在的差异处。
 >
 > 当前冻结范围是官方 `DeepSeek-V4-Pro@b5968e9190ef611bbf34a7229255be88a0e937c1`：
-> 主干 61 层包含 31 个 HCA 与 30 个 CSA，另一个 `ratio=0` 的 MTP attention 只保留接口边界，
-> 不进入本次主干实现或正式性能验收。训练 attention ABI 使用 BF16 activation/gradient、FP32
+> 主干 61 层包含 31 个 HCA 与 30 个 CSA。window-only 的 MTP attention 不在主干内，
+> `ratio=0` 已从实现中删除，不进入本次主干实现或正式性能验收。训练 attention ABI 使用 BF16 activation/gradient、FP32
 > score/LSE/sink/accumulator 和 INT32 index。主干支持 61 份相互独立的层参数；正式性能验收使用
 > 代表性 CSA+HCA 连续执行 5 轮 forward/backward，不用两层代表权重冒充 61 层参数支持。
 
@@ -228,14 +231,16 @@ cost 校准依据。
 
 ```
 source/query-layout token
-  → required-row 去重与 destination-major pack
-  → NCCL All2AllV
-  → consumer physical layout（优先直接作为 backend 输入）
-  → reverse All2AllV + CSR reduction
+  → owner ranges 与 consumer ranges
+  → Core group_cast（内部 A2AV，输出按全局行升序）
+  → consumer physical layout（直接作为 backend 输入）
+  → 对偶的 Core group_reduce
 ```
 
-每条 route 都有独立 global-to-local map、device collective state 和反向 CSR；KI/KV 不要求拥有相同
-physical row order。固定 route 集合和发起顺序为：
+route 自己不做 pack、不排 receive row、不建反向 CSR，这些都由 Core 的 group collective
+承担。每条 route 只持有自己的 `GroupCollectiveArg` device handle 和一张
+global-to-consumer 查表；KI/KV 不要求拥有相同 physical row order。固定 route 集合和发起
+顺序为：
 
 ```text
 CSA forward:  WINDOW_KV → OVERLAP_X → COMPRESSED_KI → COMPRESSED_KV
@@ -282,11 +287,11 @@ projection/support 梯度，随后 branch-order gate 在同一 route stream 上�
 | 场景 | 布局 | $E$ | 计算 ms | 通信 ms | 占比 | 耗时 ms |
 |---|---|---|---|---|---|---|
 | 单条 1M | zigzag / min-heap | 1.0001 | 3532 | 13.2 | 0.4% | **3532** |
-| | sequential | 1.8925 | 6684 | 13.2 | 0.2% | 6684 |
+| | sequential（历史，已删除） | 1.8925 | 6684 | 13.2 | 0.2% | 6684 |
 | lognormal $\sigma{=}1.5$ | **min-heap** | **1.0017** | **501** | 8.2 | 1.6% | **501** |
 | | min-heap $g{=}4$ | 1.0127 | 507 | 4.0 | 0.8% | 507 |
 | | zigzag | 1.6867 | 844 | 2.5 | 0.3% | 844 |
-| | sequential | 2.3931 | 1197 | 2.4 | 0.2% | 1197 |
+| | sequential（历史，已删除） | 2.3931 | 1197 | 2.4 | 0.2% | 1197 |
 | $1{\times}512\text{K}{+}\cdots$ | **min-heap** | **1.0006** | **1150** | 9.8 | 0.8% | **1150** |
 | | zigzag | 1.6812 | 1932 | 6.9 | 0.4% | 1932 |
 
@@ -340,7 +345,7 @@ E=\frac{\max_p\sum_{c\in\Pi_p}w_c}{\overline{\textstyle\sum_{c\in\Pi_p}w_c}}\ \g
 
 $T=1\text{M}$，$b=512$，$P=64$：
 
-| batch 构成 | sequential | 全局 zigzag | 逐 doc zigzag | min-heap |
+| batch 构成 | sequential（历史） | 全局 zigzag | 逐 doc zigzag | min-heap |
 |---|---|---|---|---|
 | 单条 1M | 1.8925 | 1.0001 | 1.0001 | 1.0001 |
 | $2048\times512$ 等长 | 1.0000 | 1.0000 | 1.1106 | 1.0000 |

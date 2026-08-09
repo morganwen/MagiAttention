@@ -60,7 +60,7 @@ def _build_csa_indices_kernel(
     topk_lengths_ptr,
     attention_map_ptr,
     indexer_map_ptr,
-    window_rows_ptr,
+    window_base_ptr,
     window_lengths_ptr,
     attention_indices_ptr,
     attention_lengths_ptr,
@@ -122,20 +122,24 @@ def _build_csa_indices_kernel(
         attention_rows + raw_bank_rows,
         -1,
     )
+    # A raw window is a contiguous run in the WINDOW_KV consumer bank, so its
+    # rows are computed from one base instead of read out of a resident table.
     window_columns = columns - TOPK_WIDTH
-    window_mask = (columns >= TOPK_WIDTH) & (columns < ATTENTION_WIDTH)
-    window = tl.load(
-        window_rows_ptr + row * WINDOW_WIDTH + window_columns,
-        mask=window_mask,
-        other=-1,
+    window_length = tl.load(window_lengths_ptr + row)
+    window_base = tl.load(window_base_ptr + row)
+    window_valid = (
+        (columns >= TOPK_WIDTH)
+        & (columns < ATTENTION_WIDTH)
+        & (window_columns < window_length)
+        & (window_base >= 0)
     )
+    window = tl.where(window_valid, window_base + window_columns, -1)
     attention = tl.where(topk_mask, compressed_attention, window)
     tl.store(
         attention_indices_ptr + row * ATTENTION_WIDTH + columns,
         attention,
         mask=columns < ATTENTION_WIDTH,
     )
-    window_length = tl.load(window_lengths_ptr + row)
     tl.store(attention_lengths_ptr + row, effective_topk + window_length)
 
 
@@ -194,18 +198,20 @@ def build_csa_index_tensors(
     topk_lengths: torch.Tensor,
     attention_global_to_consumer: torch.Tensor,
     indexer_global_to_consumer: torch.Tensor,
-    window_rows: torch.Tensor,
+    window_base: torch.Tensor,
     window_lengths: torch.Tensor,
+    window_width: int,
     raw_bank_rows: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build FlashMLA and dual selected-KL indices in one CUDA launch."""
 
-    if topk_global_ids.ndim != 2 or window_rows.ndim != 2:
-        raise ValueError("CSA Top-K and window rows must be rank 2")
+    if topk_global_ids.ndim != 2:
+        raise ValueError("CSA Top-K ids must be rank 2")
     rows, topk_width = topk_global_ids.shape
-    if window_rows.shape[0] != rows:
-        raise ValueError("CSA Top-K and window row counts differ")
-    window_width = window_rows.shape[1]
+    if window_base.shape != (rows,):
+        raise ValueError("CSA window base has an invalid shape")
+    if window_width <= 0:
+        raise ValueError("CSA window width must be positive")
     attention_width = topk_width + window_width
     if attention_width <= 0 or attention_width > 2048:
         raise ValueError("CSA attention index width must fit one 2048-column block")
@@ -222,7 +228,7 @@ def build_csa_index_tensors(
         ("topk_lengths", topk_lengths),
         ("attention_global_to_consumer", attention_global_to_consumer),
         ("indexer_global_to_consumer", indexer_global_to_consumer),
-        ("window_rows", window_rows),
+        ("window_base", window_base),
         ("window_lengths", window_lengths),
     )
     for name, tensor in tensors:
@@ -246,7 +252,7 @@ def build_csa_index_tensors(
             topk_lengths,
             attention_global_to_consumer,
             indexer_global_to_consumer,
-            window_rows,
+            window_base,
             window_lengths,
             attention_indices,
             attention_lengths,

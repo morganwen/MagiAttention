@@ -71,14 +71,12 @@ class MagiDSAProRuntimeMgr:
         self.csa_runtime = MagiDSARuntimeMgr(
             self.model_spec.make_layer_config(self.model_spec.csa_layer_ids[0]),
             cp_group,
-            policy="structural_balanced",
             structural_layout_config=self.structural_layout_config,
             max_cached_handles=max_cached_handles,
         )
         self.hca_runtime = MagiDSARuntimeMgr(
             self.model_spec.make_layer_config(self.model_spec.hca_layer_ids[0]),
             cp_group,
-            policy="structural_balanced",
             structural_layout_config=self.structural_layout_config,
             max_cached_handles=max_cached_handles,
         )
@@ -115,7 +113,7 @@ class MagiDSAProRuntimeMgr:
         device: torch.device | str,
         *,
         local_token_capacity: int,
-        health_check: bool = True,
+        health_check: bool = False,
     ) -> MagiDSAProExecutionBundle:
         csa = self.csa_runtime.prepare_execution(
             packed_meta,
@@ -164,21 +162,15 @@ class MagiDSAProRuntimeMgr:
             raise RuntimeError("CSA and HCA plans do not share one Query layout")
         csa_rank = csa.plan.rank_plans[csa.rank]
         hca_rank = hca.plan.rank_plans[hca.rank]
-        if (
-            csa_rank.query_fragments != hca_rank.query_fragments
-            or csa_rank.local_query_global_rows != hca_rank.local_query_global_rows
-            or csa_rank.local_q_sample_ids != hca_rank.local_q_sample_ids
-            or csa_rank.local_q_positions != hca_rank.local_q_positions
-            or csa_rank.token_layout_route != hca_rank.token_layout_route
-        ):
+        if csa_rank.query_fragments != hca_rank.query_fragments:
             raise RuntimeError("CSA and HCA rank metadata disagree on Query layout")
+        if csa.plan.token_layout_route != hca.plan.token_layout_route:
+            raise RuntimeError("CSA and HCA disagree on the TOKEN_LAYOUT route")
 
     def runtime_for_ratio(self, ratio: DsaRatio) -> MagiDSARuntimeMgr:
         if ratio == 4:
             return self.csa_runtime
-        if ratio == 128:
-            return self.hca_runtime
-        raise ValueError("the Pro main stack contains no window-only layer")
+        return self.hca_runtime
 
     def handle_for_layer(
         self,
@@ -246,7 +238,7 @@ class MagiDSAProRuntimeMgr:
         dsa_input: MagiDSAInput,
         bundle: MagiDSAProExecutionBundle,
     ) -> MagiDSAForwardResult:
-        from .layer import MagiDSALayer
+        from .modeling import MagiDSALayer
 
         if not isinstance(layer, MagiDSALayer):
             raise TypeError("layer must be a MagiDSALayer")
@@ -257,7 +249,7 @@ class MagiDSAProRuntimeMgr:
             raise ValueError("layer_id does not match the bound Pro parameter owner")
         runtime = self.runtime_for_ratio(expected.ratio)
         handle = self.handle_for_layer(layer_id, bundle)
-        return runtime.calc_dsa(layer, dsa_input, handle)
+        return runtime.calc_dsa(layer.projections(), dsa_input, handle)
 
 
 __all__ = ["MagiDSAProExecutionBundle", "MagiDSAProRuntimeMgr"]

@@ -15,6 +15,10 @@
 # Every interface below is optional: importing this root package must not force
 # an unrelated backend dependency on a consumer. In particular, importing the
 # ``magi_attn_extensions.DSA`` subpackage must not require any FA backend.
+# ``__all__`` is therefore built incrementally, so it never advertises a symbol
+# whose backend failed to import.
+__all__: list[str] = []
+
 try:
     from .fa2_interface_with_sink import (
         fa2_func_with_sink,
@@ -26,11 +30,22 @@ try:
     )
 except ImportError:
     pass
+else:
+    __all__ += [
+        "fa2_func_with_sink",
+        "fa2_qkvpacked_func_with_sink",
+        "fa2_kvpacked_func_with_sink",
+        "fa2_varlen_func_with_sink",
+        "fa2_varlen_qkvpacked_func_with_sink",
+        "fa2_varlen_kvpacked_func_with_sink",
+    ]
 
 try:
     from .fa4_interface_with_sink import fa4_func_with_sink, fa4_varlen_func_with_sink
 except ImportError:
     pass
+else:
+    __all__ += ["fa4_func_with_sink", "fa4_varlen_func_with_sink"]
 
 try:
     from .fa3_interface_with_sink import (
@@ -40,25 +55,18 @@ try:
     )
 except ImportError:
     pass
+else:
+    __all__ += [
+        "fa3_func_with_sink",
+        "fa3_varlen_func_with_sink",
+        "fa3_qkvpacked_func_with_sink",
+    ]
 
 try:
     from .dsa_interface import dsa_attn_func
 except ImportError:
     pass
-
-__all__ = [
-    "fa2_func_with_sink",
-    "fa2_qkvpacked_func_with_sink",
-    "fa2_kvpacked_func_with_sink",
-    "fa2_varlen_func_with_sink",
-    "fa2_varlen_qkvpacked_func_with_sink",
-    "fa2_varlen_kvpacked_func_with_sink",
-    "fa3_func_with_sink",
-    "fa3_varlen_func_with_sink",
-    "fa3_qkvpacked_func_with_sink",
-    "fa4_func_with_sink",
-    "fa4_varlen_func_with_sink",
-    "dsa_attn_func",
-]
+else:
+    __all__.append("dsa_attn_func")
 
 __version__ = "1.1.0"

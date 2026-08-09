@@ -24,28 +24,26 @@ reached through their own submodules (``.solver``, ``.packing``, ``.backend``,
 from __future__ import annotations
 
 from .config import (
-    DsaPlanPolicy,
     DsaRatio,
-    DsaSharedLayoutConfig,
     DsaStructuralLayoutConfig,
     MagiDSAConfig,
     MagiDSAProModelSpec,
 )
-from .layer import MagiDSALayer, MagiDSAProLayerStack
+from .modeling import MagiDSALayer, MagiDSAProLayerStack
 from .model_adapter import (
     MagiDSAProjector,
     layout_and_project_dsa_input,
     layout_source_hidden_once,
     project_local_dsa_input,
 )
+from .projection import DsaProjections
 from .pro_runtime import MagiDSAProExecutionBundle, MagiDSAProRuntimeMgr
 from .runtime import MagiDSARuntimeMgr
 from .types import MagiDSAForwardResult, MagiDSAInput, MagiDSAPackedMeta
 
 __all__ = [
-    "DsaPlanPolicy",
+    "DsaProjections",
     "DsaRatio",
-    "DsaSharedLayoutConfig",
     "DsaStructuralLayoutConfig",
     "MagiDSAConfig",
     "MagiDSAForwardResult",

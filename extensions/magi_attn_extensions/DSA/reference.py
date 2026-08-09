@@ -18,7 +18,7 @@ import math
 
 import torch
 
-from .layer import DsaCompressor, MagiDSALayer
+from .modeling import DsaCompressor, MagiDSALayer
 from .types import MagiDSAForwardResult
 
 

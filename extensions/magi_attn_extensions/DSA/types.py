@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
@@ -21,33 +22,56 @@ import torch
 
 @dataclass(frozen=True)
 class MagiDSAPackedMeta:
-    """Global packed metadata plus this rank's pre-layout source-row count.
+    """Global packed metadata and the pre-layout source split of every rank.
 
-    ``local_token_count`` describes the contiguous source-owner input passed to
-    ``MagiDSARuntimeMgr.layout_hidden``.  It can differ from the final Query-row
-    count carried by an execution handle after ``TOKEN_LAYOUT``.
+    ``source_token_counts`` describes the contiguous source-owner input each
+    rank passes to ``MagiDSARuntimeMgr.layout_hidden``. The caller already owns
+    that sharding, so stating it here makes the whole execution plan a pure
+    function of caller metadata. Every rank then rebuilds a bit-identical plan
+    locally, which is why preparing an execution runs no object collective.
+    A rank's source count can differ from its final Query-row count after
+    ``TOKEN_LAYOUT``.
     """
 
     cu_seqlens: tuple[int, ...]
-    local_token_count: int
+    source_token_counts: tuple[int, ...]
 
     def __post_init__(self) -> None:
         values = tuple(int(value) for value in self.cu_seqlens)
         object.__setattr__(self, "cu_seqlens", values)
+        counts = tuple(int(value) for value in self.source_token_counts)
+        object.__setattr__(self, "source_token_counts", counts)
         if len(values) < 2 or values[0] != 0:
             raise ValueError(
                 "cu_seqlens must start at zero and describe at least one sample"
             )
         if any(end < begin for begin, end in zip(values, values[1:])):
             raise ValueError("cu_seqlens must be nondecreasing")
-        if self.local_token_count < 0:
-            raise ValueError("local_token_count must be non-negative")
+        if not counts:
+            raise ValueError("source_token_counts must contain at least one rank")
+        if any(count < 0 for count in counts):
+            raise ValueError("source token counts must be non-negative")
+        if sum(counts) != values[-1]:
+            raise ValueError(
+                f"source token counts sum to {sum(counts)}, expected {values[-1]}"
+            )
+
+    @property
+    def cp_size(self) -> int:
+        return len(self.source_token_counts)
+
+    def local_token_count(self, rank: int) -> int:
+        """Return the pre-layout source-row count owned by ``rank``."""
+
+        if not 0 <= rank < len(self.source_token_counts):
+            raise IndexError("rank is outside the source layout")
+        return self.source_token_counts[rank]
 
     @classmethod
     def from_tensor(
         cls,
         cu_seqlens: torch.Tensor,
-        local_token_count: int,
+        source_token_counts: Sequence[int],
     ) -> MagiDSAPackedMeta:
         if cu_seqlens.ndim != 1 or cu_seqlens.dtype not in (torch.int32, torch.int64):
             raise ValueError("cu_seqlens must be a one-dimensional integer tensor")
@@ -56,7 +80,8 @@ class MagiDSAPackedMeta:
                 "construct packed metadata from a CPU cu_seqlens tensor on the cold path"
             )
         return cls(
-            tuple(int(value) for value in cu_seqlens.tolist()), local_token_count
+            tuple(int(value) for value in cu_seqlens.tolist()),
+            tuple(int(value) for value in source_token_counts),
         )
 
 
@@ -65,8 +90,8 @@ class MagiDSAInput:
     """Parameter-free final-Query-local boundary consumed by MagiDSALayer.
 
     All four token activations are produced from the same hidden state *after*
-    the model-boundary ``TOKEN_LAYOUT``.  ``packed_meta.local_token_count``
-    intentionally remains the pre-layout source-row count used to identify the
+    the model-boundary ``TOKEN_LAYOUT``. ``packed_meta`` intentionally keeps
+    describing the pre-layout source split, since that is what identifies the
     frozen execution plan.
     """
 

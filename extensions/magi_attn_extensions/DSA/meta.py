@@ -12,16 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Cold-plan data model for Magi-DSA.
+
+Every structure here is sized by fragments and samples, never by tokens or
+compressed rows. A route is a pair of range tables, and MagiAttention Core
+lowers those ranges to concrete splits and rank routes through
+``DynamicAttnSolver._calc_group_collective_arg_from_ranges``. Keeping the plan
+range-shaped is what lets each rank rebuild it deterministically instead of
+receiving it over an object collective.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .config import (
-    DsaPlanPolicy,
-    DsaRatio,
-    DsaSharedLayoutConfig,
-    DsaStructuralLayoutConfig,
-)
+from magi_attention.common import AttnRanges
+
+from .config import DsaRatio, DsaStructuralLayoutConfig
+
+# One global half-open interval, kept as a plain tuple so a plan stays trivially
+# hashable, comparable and serializable without importing torch.
+DsaInterval = tuple[int, int]
 
 
 @dataclass(frozen=True)
@@ -49,8 +60,6 @@ class DsaQueryFragment:
     global_end: int
     local_begin: int
     sample_global_begin: int
-    score_cost: int
-    topk_cost: int
 
     @property
     def length(self) -> int:
@@ -58,27 +67,8 @@ class DsaQueryFragment:
 
 
 @dataclass(frozen=True)
-class DsaCompressionBlock:
-    """One complete sample-local compression block and its unique producer."""
-
-    global_block_id: int
-    sample_id: int
-    sample_block_id: int
-    global_begin: int
-    global_end: int
-    producer_rank: int
-    producer_local_index: int
-    position: int
-    source_global_rows: tuple[int, ...]
-
-    @property
-    def length(self) -> int:
-        return self.global_end - self.global_begin
-
-
-@dataclass(frozen=True)
 class DsaRequiredKRange:
-    """One consumer/doc longest compressed-K prefix in global block order."""
+    """One consumer/sample longest compressed-K prefix in global block order."""
 
     sample_id: int
     global_begin: int
@@ -90,92 +80,60 @@ class DsaRequiredKRange:
 
 
 @dataclass(frozen=True)
-class DsaGroupCollectiveArg:
-    """Serializable planner contract lowered to typed All2AllV plus local CSR.
+class DsaRoutePlan:
+    """One typed payload route expressed purely as owner and consumer ranges.
 
-    This mirrors the four layout fields of Magi-MSA ``GroupCollectiveArg`` but
-    intentionally owns no process group and selects no communication primitive.
+    ``owner_ranges_per_rank[r]`` are the global rows rank ``r`` produces, in
+    ascending order, which is also its producer-buffer order.
+    ``consumer_ranges_per_rank[r]`` are the global rows rank ``r`` needs; the
+    Core group-cast delivers them in that same ascending order, so no consumer
+    unpermute is needed on either side of the collective.
     """
 
-    rank: int
-    world_size: int
-    input_split_size_list: tuple[int, ...]
-    output_split_size_list: tuple[int, ...]
-    dst_indices_list: tuple[tuple[int, ...], ...]
-    src_index_list: tuple[int, ...]
-    deterministic: bool = False
-    split_alignment: int = 1
-
-
-@dataclass(frozen=True)
-class DsaRouteRankPlan:
-    """Static unique-row All2AllV and reverse-CSR metadata for one rank."""
-
-    rank: int
-    producer_row_count: int
-    group_collective_arg: DsaGroupCollectiveArg
-    send_counts: tuple[int, ...]
-    recv_counts: tuple[int, ...]
-    send_source_rows: tuple[int, ...]
-    received_global_rows: tuple[int, ...]
-    consumer_global_rows: tuple[int, ...]
-    consumer_from_received: tuple[int, ...]
-    received_from_consumer: tuple[int, ...]
-    reverse_row_offsets: tuple[int, ...]
-    reverse_source_rows: tuple[int, ...]
-
-    @property
-    def send_row_count(self) -> int:
-        return sum(self.send_counts)
-
-    @property
-    def received_row_count(self) -> int:
-        return sum(self.recv_counts)
-
-
-@dataclass(frozen=True)
-class DsaTypedRoutePlan:
-    """All-rank metadata for one typed payload collective."""
-
     name: str
-    rank_plans: tuple[DsaRouteRankPlan, ...]
+    owner_ranges_per_rank: tuple[tuple[DsaInterval, ...], ...]
+    consumer_ranges_per_rank: tuple[tuple[DsaInterval, ...], ...]
+
+    def __post_init__(self) -> None:
+        if len(self.owner_ranges_per_rank) != len(self.consumer_ranges_per_rank):
+            raise ValueError(f"{self.name}: route range tables have different CP sizes")
+        for kind, table in (
+            ("owner", self.owner_ranges_per_rank),
+            ("consumer", self.consumer_ranges_per_rank),
+        ):
+            for rank, ranges in enumerate(table):
+                cursor = -1
+                for begin, end in ranges:
+                    if begin >= end:
+                        raise ValueError(f"{self.name}: empty {kind} range on {rank}")
+                    if begin < cursor:
+                        raise ValueError(
+                            f"{self.name}: {kind} ranges on {rank} are not sorted "
+                            "and merged"
+                        )
+                    cursor = end
 
     @property
     def cp_size(self) -> int:
-        return len(self.rank_plans)
+        return len(self.owner_ranges_per_rank)
 
+    def owner_row_count(self, rank: int) -> int:
+        return sum(end - begin for begin, end in self.owner_ranges_per_rank[rank])
 
-@dataclass(frozen=True)
-class DsaLayoutRankCost:
-    """Deterministic structural cost assigned to one final Query owner."""
+    def consumer_row_count(self, rank: int) -> int:
+        return sum(end - begin for begin, end in self.consumer_ranges_per_rank[rank])
 
-    rank: int
-    indexer_score_cost: int
-    indexer_topk_cost: int
-    packed_ki_rows: int
-    unique_ki_rows: int
-    modeled_ki_bytes: int
-    indexer_cost: int
-    hca_query_cost: int
-    hca_send_rows: int
-    hca_recv_rows: int
-    hca_max_peer_rows: int
-    hca_cost: int
-    token_layout_remote_rows: int
-    fragment_count: int
+    def owner_attn_ranges(self) -> list[AttnRanges]:
+        return [
+            AttnRanges.from_ranges([list(interval) for interval in ranges])
+            for ranges in self.owner_ranges_per_rank
+        ]
 
-
-@dataclass(frozen=True)
-class DsaLayoutMetrics:
-    """Global lexicographic key and per-rank costs for one Query layout."""
-
-    solver_scheme: str
-    cost_model_version: str
-    key: tuple[int, int, int, int]
-    rank_costs: tuple[DsaLayoutRankCost, ...]
-    candidate_evaluations: int
-    improvement_steps: int
-    stop_reason: str
+    def consumer_attn_ranges(self) -> list[AttnRanges]:
+        return [
+            AttnRanges.from_ranges([list(interval) for interval in ranges])
+            for ranges in self.consumer_ranges_per_rank
+        ]
 
 
 @dataclass(frozen=True)
@@ -206,37 +164,29 @@ class DsaStructuralLayoutMetrics:
 
 @dataclass(frozen=True)
 class DsaRankPlan:
-    """Compact cold-plan metadata materialized once by a CP rank."""
+    """Cold-plan metadata for one CP rank, sized by fragments and samples.
+
+    Nothing here grows with the token count. Per-token device metadata such as
+    positions, sample ids and Indexer sequence lengths is expanded on the device
+    from ``query_fragments`` during cold materialization.
+    """
 
     rank: int
     source_token_count: int
     local_token_count: int
-    source_global_begin: int
-    source_global_end: int
     query_fragments: tuple[DsaQueryFragment, ...]
-    local_query_global_rows: tuple[int, ...]
-    produced_blocks: tuple[DsaCompressionBlock, ...]
-    local_q_sample_ids: tuple[int, ...]
-    local_q_positions: tuple[int, ...]
+    # Global compressed-block ids this rank produces, ascending, which is also
+    # its Compressor output-buffer order.
+    produced_block_ranges: tuple[DsaInterval, ...]
     sample_block_offsets: tuple[int, ...]
     sample_block_counts: tuple[int, ...]
     indexer_required_k_ranges: tuple[DsaRequiredKRange, ...]
-    compression_source_from_overlap: tuple[int, ...]
     indexer_q_cu_seqlens: tuple[int, ...]
     indexer_k_cu_seqlens: tuple[int, ...]
     indexer_q_causal_offsets: tuple[int, ...]
-    indexer_q_sample_block_offsets: tuple[int, ...]
-    indexer_seq_lens: tuple[int, ...]
     indexer_max_seqlen_q: int
     indexer_logical_max_seqlen_k: int
     indexer_backend_max_seqlen_k: int
-    token_layout_route: DsaRouteRankPlan | None
-    window_route: DsaRouteRankPlan
-    overlap_x_route: DsaRouteRankPlan | None
-    compressed_kv_route: DsaRouteRankPlan | None
-    compressed_ki_route: DsaRouteRankPlan | None
-    predicted_score_cost: int
-    predicted_topk_cost: int
 
     @property
     def indexer_token_count(self) -> int:
@@ -246,24 +196,31 @@ class DsaRankPlan:
     def packed_indexer_k_count(self) -> int:
         return self.indexer_k_cu_seqlens[-1] if self.indexer_k_cu_seqlens else 0
 
+    @property
+    def produced_block_count(self) -> int:
+        return sum(end - begin for begin, end in self.produced_block_ranges)
+
 
 @dataclass(frozen=True)
 class DsaExecutionPlan:
-    """Immutable global plan shared by sequential and balanced execution."""
+    """Immutable global plan every CP rank rebuilds deterministically."""
 
     cu_seqlens: tuple[int, ...]
     source_token_counts: tuple[int, ...]
     query_token_counts: tuple[int, ...]
     ratio: DsaRatio
-    policy: DsaPlanPolicy
-    compressed_blocks: tuple[DsaCompressionBlock, ...]
+    total_compressed_blocks: int
     rank_plans: tuple[DsaRankPlan, ...]
+    token_layout_route: DsaRoutePlan
+    window_route: DsaRoutePlan
+    overlap_x_route: DsaRoutePlan
+    compressed_kv_route: DsaRoutePlan
+    compressed_ki_route: DsaRoutePlan | None
     collective_order: tuple[str, ...]
     boundary_collective_order: tuple[str, ...]
     query_layout_hash: str
-    layout_metrics: DsaLayoutMetrics | DsaStructuralLayoutMetrics | None
-    shared_layout_config: DsaSharedLayoutConfig | None
-    structural_layout_config: DsaStructuralLayoutConfig | None
+    layout_metrics: DsaStructuralLayoutMetrics
+    structural_layout_config: DsaStructuralLayoutConfig
     plan_hash: str
 
     @property
@@ -274,23 +231,25 @@ class DsaExecutionPlan:
     def total_tokens(self) -> int:
         return self.cu_seqlens[-1]
 
-    @property
-    def total_compressed_blocks(self) -> int:
-        return len(self.compressed_blocks)
+    def routes(self) -> tuple[DsaRoutePlan, ...]:
+        ordered = (
+            self.token_layout_route,
+            self.window_route,
+            self.overlap_x_route,
+            self.compressed_kv_route,
+            self.compressed_ki_route,
+        )
+        return tuple(route for route in ordered if route is not None)
 
 
 __all__ = [
-    "DsaCompressionBlock",
     "DsaExecutionPlan",
     "DsaFragmentSpec",
-    "DsaGroupCollectiveArg",
-    "DsaLayoutMetrics",
-    "DsaLayoutRankCost",
-    "DsaStructuralLayoutMetrics",
-    "DsaStructuralRankCost",
+    "DsaInterval",
     "DsaQueryFragment",
     "DsaRankPlan",
     "DsaRequiredKRange",
-    "DsaRouteRankPlan",
-    "DsaTypedRoutePlan",
+    "DsaRoutePlan",
+    "DsaStructuralLayoutMetrics",
+    "DsaStructuralRankCost",
 ]

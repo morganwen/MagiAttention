@@ -189,7 +189,7 @@ def run_grouped_dsa_indexer(
         raise ValueError("grouped Indexer Q has an invalid shape")
     if weights.shape != (q_indexer.shape[0], config.indexer_heads):
         raise ValueError("grouped Indexer weights have an invalid shape")
-    if k_indexer.shape != (mapping.k_pack.source_rows.numel(), config.indexer_head_dim):
+    if k_indexer.shape != (mapping.packed_k_rows, config.indexer_head_dim):
         raise ValueError("grouped Indexer K has an invalid shape")
     if mapping.backend_max_seqlen_k < mapping.logical_max_seqlen_k:
         raise ValueError("Indexer backend K width is smaller than its logical width")

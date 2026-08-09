@@ -17,13 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-DsaRatio = Literal[0, 4, 128]
-DsaPlanPolicy = Literal[
-    "sequential",
-    "indexer_balanced",
-    "shared_greedy",
-    "structural_balanced",
-]
+DsaRatio = Literal[4, 128]
 
 DSV4_PRO_REVISION = "b5968e9190ef611bbf34a7229255be88a0e937c1"
 DSV4_PRO_INDEXER_SCORE_ROW_ALIGNMENT = 8
@@ -34,29 +28,10 @@ DSV4_PRO_MAIN_COMPRESS_RATIOS: tuple[DsaRatio, ...] = (
     *tuple(ratio for _ in range(29) for ratio in _DSV4_PRO_CSA_HCA_PAIR),
     4,
 )
-DSV4_PRO_MTP_COMPRESS_RATIO: DsaRatio = 0
-
-
-@dataclass(frozen=True)
-class DsaSharedLayoutConfig:
-    """Explicit cold-solver limits for the opt-in shared Query layout."""
-
-    ki_memory_budget_bytes: int
-    ki_workspace_reserve_bytes: int
-    local_improvement_passes: int = 4
-
-    def __post_init__(self) -> None:
-        if self.ki_memory_budget_bytes <= 0:
-            raise ValueError("ki_memory_budget_bytes must be positive")
-        if self.ki_workspace_reserve_bytes < 0:
-            raise ValueError("ki_workspace_reserve_bytes must be non-negative")
-        if self.ki_workspace_reserve_bytes >= self.ki_memory_budget_bytes:
-            raise ValueError(
-                "ki_workspace_reserve_bytes must be smaller than "
-                "ki_memory_budget_bytes"
-            )
-        if self.local_improvement_passes < 0:
-            raise ValueError("local_improvement_passes must be non-negative")
+# The separate MTP block is window-only in the official model. The main stack
+# this extension implements contains no window-only layer, so ``DsaRatio`` has
+# no 0 member and the MTP ratio is carried as a plain int for provenance only.
+DSV4_PRO_MTP_COMPRESS_RATIO: int = 0
 
 
 @dataclass(frozen=True)
@@ -108,8 +83,8 @@ class MagiDSAConfig:
     accumulator_dtype: Literal["float32"] = "float32"
 
     def __post_init__(self) -> None:
-        if self.ratio not in (0, 4, 128):
-            raise ValueError("ratio must be one of 0, 4, or 128")
+        if self.ratio not in (4, 128):
+            raise ValueError("ratio must be either 4 (CSA) or 128 (HCA)")
         positive = {
             "hidden_size": self.hidden_size,
             "q_lora_rank": self.q_lora_rank,
@@ -141,17 +116,13 @@ class MagiDSAConfig:
             raise ValueError("DSV4-Pro reductions must accumulate in FP32")
 
     @property
-    def has_compressor(self) -> bool:
-        return self.ratio != 0
-
-    @property
     def has_indexer(self) -> bool:
         return self.ratio == 4
 
     @property
     def compressor_support(self) -> int:
-        if self.ratio == 0:
-            return 0
+        """Rows one compressed block reads: CSA reads B and A, HCA reads A."""
+
         return self.ratio * (2 if self.ratio == 4 else 1)
 
     @property
@@ -260,9 +231,7 @@ __all__ = [
     "DSV4_PRO_INDEXER_SCORE_ROW_ALIGNMENT",
     "DSV4_PRO_MTP_COMPRESS_RATIO",
     "DSV4_PRO_REVISION",
-    "DsaPlanPolicy",
     "DsaRatio",
-    "DsaSharedLayoutConfig",
     "DsaStructuralLayoutConfig",
     "MagiDSAConfig",
     "MagiDSAProModelSpec",

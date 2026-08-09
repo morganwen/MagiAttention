@@ -12,6 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Reference DeepSeek-V4 model modules for Magi-DSA.
+
+These modules own every trainable weight a DSA layer needs. They are model-side
+code: nothing in the Magi-DSA execution path (``runtime``, ``dist``, ``comm``,
+``solver``, ``packing``, ``backend``) imports this module. The runtime only ever
+sees the callbacks returned by :meth:`MagiDSALayer.projections`, which is the
+same parameter boundary Magi-MSA draws with ``MsaScheduleOps``.
+
+A different model may replace this file entirely as long as it supplies a
+:class:`~magi_attn_extensions.DSA.projection.DsaProjections` bundle.
+"""
+
 from __future__ import annotations
 
 import math
@@ -24,6 +36,7 @@ from torch import nn
 
 from .config import MagiDSAConfig, MagiDSAProModelSpec
 from .nvtx import dsa_nvtx_range
+from .projection import DsaProjections
 from .types import MagiDSAInput
 
 if TYPE_CHECKING:
@@ -459,15 +472,13 @@ class MagiDSALayer(nn.Module):
             raise ValueError("layer_id must be non-negative")
         self.config = config
         self._layer_id = layer_id
-        self.compressor = (
-            DsaCompressor(
-                config,
-                config.head_dim,
-                overlap=config.ratio == 4,
-                nvtx_scope="main",
-            )
-            if config.has_compressor
-            else None
+        # Both main-stack ratios compress, so the main Compressor is always
+        # present; only CSA additionally owns an Indexer.
+        self.compressor = DsaCompressor(
+            config,
+            config.head_dim,
+            overlap=config.ratio == 4,
+            nvtx_scope="main",
         )
         self.indexer = DsaIndexer(config) if config.has_indexer else None
         self.register_buffer(
@@ -479,6 +490,24 @@ class MagiDSALayer(nn.Module):
     @property
     def layer_id(self) -> int | None:
         return self._layer_id
+
+    def projections(self) -> DsaProjections:
+        """Bundle this layer's parameterized callbacks for the DSA runtime.
+
+        This is the whole parameter boundary: the runtime receives functions,
+        never this module, and therefore never touches its weights.
+        """
+
+        return DsaProjections(
+            main_compress=self.compressor,
+            inverse_output_rope=self.inverse_output_rope,
+            indexer_project=(
+                None if self.indexer is None else self.indexer.project_queries
+            ),
+            indexer_compress=(
+                None if self.indexer is None else self.indexer.compressor
+            ),
+        )
 
     def inverse_output_rope(
         self,
@@ -525,7 +554,7 @@ class MagiDSALayer(nn.Module):
         runtime: MagiDSARuntimeMgr,
         handle: DsaExecutionHandle,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        result = runtime.calc_dsa(self, dsa_input, handle)
+        result = runtime.calc_dsa(self.projections(), dsa_input, handle)
         return result.output, result.kl
 
 

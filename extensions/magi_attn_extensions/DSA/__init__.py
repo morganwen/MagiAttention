@@ -66,9 +66,8 @@ if _missing:
 del inspect, make_dispatch_meta_from_qk_ranges, _missing
 
 from .api import (  # noqa: E402
-    DsaPlanPolicy,
+    DsaProjections,
     DsaRatio,
-    DsaSharedLayoutConfig,
     DsaStructuralLayoutConfig,
     MagiDSAConfig,
     MagiDSAForwardResult,
@@ -87,9 +86,8 @@ from .api import (  # noqa: E402
 )
 
 __all__ = [
-    "DsaPlanPolicy",
+    "DsaProjections",
     "DsaRatio",
-    "DsaSharedLayoutConfig",
     "DsaStructuralLayoutConfig",
     "MagiDSAConfig",
     "MagiDSAForwardResult",

@@ -19,23 +19,25 @@ from typing import TYPE_CHECKING
 import torch
 import torch.distributed as dist
 
+from magi_attention.common.range_op import range_gather
+
 from .backend import dsa_csa_attention_kl, dsa_sparse_attention, run_grouped_dsa_indexer
 from .comm import (
     DsaRouteTransfer,
-    copy_dsa_tensor_with_csr,
     finish_dsa_reverse_route,
     finish_dsa_tensor_route,
     start_dsa_reverse_route,
     start_dsa_tensor_route,
 )
+from .config import MagiDSAConfig
 from .kernels.triton.indices import build_csa_index_tensors
 from .nvtx import dsa_nvtx_range
-from .packing import copy_dsa_device_map
+from .packing import gather_compressor_support
+from .projection import DsaProjections
 from .types import MagiDSAForwardResult, MagiDSAInput
 
 if TYPE_CHECKING:
-    from .dsa_packing import DsaDeviceRoutePlan
-    from .layer import MagiDSALayer
+    from .packing import DsaDeviceRoutePlan
     from .runtime import DsaExecutionHandle
 
 
@@ -218,9 +220,8 @@ class _HcaBackwardBranchOrderFunction(torch.autograd.Function):
 
 
 def _validate_inputs(
-    layer: MagiDSALayer, dsa_input: MagiDSAInput, handle: DsaExecutionHandle
+    config: MagiDSAConfig, dsa_input: MagiDSAInput, handle: DsaExecutionHandle
 ) -> torch.Tensor:
-    config = layer.config
     local_tokens = handle.device_plan.local_token_count
     expected = {
         "x": (dsa_input.x, (local_tokens, config.hidden_size)),
@@ -259,62 +260,62 @@ def _validate_inputs(
 
 def _build_attention_indices(
     handle: DsaExecutionHandle,
-    topk_global_ids: torch.Tensor,
-    topk_lengths: torch.Tensor,
+    config: MagiDSAConfig,
+    attention_mode: str,
     raw_bank_rows: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    device_plan = handle.device_plan
-    attention = device_plan.attention
-    ratio = handle.plan.ratio
-    local_tokens = device_plan.local_token_count
-    enabled = topk_global_ids.is_cuda
-    scope = "attention_indices"
+    """Expand the HCA per-query window and compressed runs into flat indices.
+
+    Both regions are contiguous runs in their consumer bank, so the padded
+    index matrix is generated from a base and a length instead of being read
+    out of a resident per-query table.
+    """
+
+    attention = handle.device_plan.attention
+    device = attention.window_base.device
+    window_length = attention.window_length
+    compressed_length = attention.compressed_length
+    # Width is a plan-time constant, so building the indices needs no device
+    # reduction and therefore no host synchronization on the warm path.
+    logical_width = config.window_size + attention.max_compressed_length
+    width = ((logical_width + 127) // 128) * 128
+    enabled = window_length.is_cuda
+    scope = f"attention::{attention_mode}::attention_indices"
     with dsa_nvtx_range(scope, enabled=enabled):
-        if ratio == 4:
-            raise AssertionError("CSA indices must use the fused dual-map builder")
-
-        if ratio == 128:
-            with dsa_nvtx_range(
-                f"{scope}::compressed_mask_and_offset", enabled=enabled
-            ):
-                compressed = attention.compressed_rows
-                invalid = compressed < 0
-                compressed = (compressed + raw_bank_rows).masked_fill(invalid, -1)
-                compressed_lengths = attention.compressed_lengths
-        else:
-            with dsa_nvtx_range(f"{scope}::window_only_init", enabled=enabled):
-                compressed = torch.empty(
-                    (local_tokens, 0),
-                    dtype=torch.int32,
-                    device=attention.window_rows.device,
-                )
-                compressed_lengths = torch.zeros_like(attention.window_lengths)
-
-        logical_width = attention.window_rows.shape[1] + compressed.shape[1]
-        width = ((logical_width + 127) // 128) * 128
-        with dsa_nvtx_range(f"{scope}::output_allocation", enabled=enabled):
-            indices = torch.full(
-                (local_tokens, width),
-                -1,
-                dtype=torch.int32,
-                device=attention.window_rows.device,
+        with dsa_nvtx_range(f"{scope}::column_masks", enabled=enabled):
+            columns = torch.arange(width, dtype=torch.int32, device=device).unsqueeze(0)
+            window_valid = columns < window_length.unsqueeze(1)
+            compressed_columns = columns - window_length.unsqueeze(1)
+            compressed_valid = (compressed_columns >= 0) & (
+                compressed_columns < compressed_length.unsqueeze(1)
             )
-        with dsa_nvtx_range(f"{scope}::window_copy", enabled=enabled):
-            indices[:, : attention.window_rows.shape[1]] = attention.window_rows
-        if compressed.shape[1]:
-            with dsa_nvtx_range(f"{scope}::compressed_scatter", enabled=enabled):
-                columns = torch.arange(
-                    compressed.shape[1], dtype=torch.int32, device=compressed.device
-                ).unsqueeze(0)
-                destinations = attention.window_lengths.unsqueeze(1) + columns
-                indices.scatter_(1, destinations.long(), compressed)
+        with dsa_nvtx_range(f"{scope}::window_expand", enabled=enabled):
+            window_rows = attention.window_base.unsqueeze(1) + columns
+        with dsa_nvtx_range(f"{scope}::compressed_expand", enabled=enabled):
+            compressed_rows = (
+                raw_bank_rows
+                + attention.compressed_base.unsqueeze(1)
+                + compressed_columns
+            )
+        with dsa_nvtx_range(f"{scope}::sentinel_merge", enabled=enabled):
+            indices = torch.where(
+                window_valid,
+                window_rows,
+                torch.where(
+                    compressed_valid,
+                    compressed_rows,
+                    torch.full((), -1, dtype=torch.int32, device=device),
+                ),
+            )
         with dsa_nvtx_range(f"{scope}::length_update", enabled=enabled):
-            lengths = attention.window_lengths + compressed_lengths
-        return indices, lengths
+            lengths = window_length + compressed_length
+        return indices.contiguous(), lengths.contiguous()
 
 
 def _build_csa_indices(
     handle: DsaExecutionHandle,
+    config: MagiDSAConfig,
+    attention_mode: str,
     topk_global_ids: torch.Tensor,
     topk_lengths: torch.Tensor,
     raw_bank_rows: int,
@@ -323,8 +324,9 @@ def _build_csa_indices(
     indexer = device_plan.indexer
     if indexer is None:
         raise RuntimeError("CSA plan is missing Indexer metadata")
+    scope = f"attention::{attention_mode}::attention_indices"
     with dsa_nvtx_range(
-        "attention_indices::fused_csa_dual_map",
+        f"{scope}::fused_dual_map",
         enabled=topk_global_ids.is_cuda,
     ):
         return build_csa_index_tensors(
@@ -332,25 +334,26 @@ def _build_csa_indices(
             topk_lengths,
             device_plan.attention.compressed_global_to_consumer,
             indexer.ki_global_to_consumer,
-            device_plan.attention.window_rows,
-            device_plan.attention.window_lengths,
+            device_plan.attention.window_base,
+            device_plan.attention.window_length,
+            config.window_size,
             raw_bank_rows,
         )
 
 
 def dist_dsa(
-    layer: MagiDSALayer,
+    config: MagiDSAConfig,
+    projections: DsaProjections,
     dsa_input: MagiDSAInput,
     handle: DsaExecutionHandle,
     cp_group: dist.ProcessGroup | None,
 ) -> MagiDSAForwardResult:
     """Execute the frozen owner-local Magi-DSA forward/autograd DAG."""
 
-    config = layer.config
     device_plan = handle.device_plan
-    latent_kv = _validate_inputs(layer, dsa_input, handle)
+    latent_kv = _validate_inputs(config, dsa_input, handle)
     local_tokens = device_plan.local_token_count
-    attention_mode = {0: "w", 4: "csa", 128: "hca"}[config.ratio]
+    attention_mode = {4: "csa", 128: "hca"}[config.ratio]
     caller_stream = torch.cuda.current_stream(dsa_input.x.device)
     csa_main_stream = handle.csa_main_stream
     csa_indexer_stream = handle.csa_indexer_stream
@@ -395,14 +398,6 @@ def dist_dsa(
                 attention_mode=attention_mode,
             )
         pending_transfers.append(window_transfer)
-    elif config.ratio == 0:
-        window_transfer = start_dsa_tensor_route(
-            latent_kv,
-            device_plan.window_route,
-            cp_group,
-            attention_mode=attention_mode,
-        )
-        pending_transfers.append(window_transfer)
     try:
         q_indexer = dsa_input.x.new_empty((local_tokens, 0, 0))
         weights = dsa_input.x.new_empty((local_tokens, 0))
@@ -424,284 +419,282 @@ def dist_dsa(
             device=dsa_input.x.device,
         )
 
-        if config.ratio:
-            overlap_route = device_plan.overlap_x_route
-            compressed_kv_route = device_plan.compressed_kv_route
-            compression = device_plan.compression
+        overlap_route = device_plan.overlap_x_route
+        compressed_kv_route = device_plan.compressed_kv_route
+        compression = device_plan.compression
+        if (
+            overlap_route is None
+            or compressed_kv_route is None
+            or compression is None
+        ):
+            raise RuntimeError("compressed DSA plan is missing mandatory routes")
+        if config.ratio == 4:
             if (
-                overlap_route is None
-                or compressed_kv_route is None
-                or compression is None
-                or layer.compressor is None
+                csa_indexer_stream is None
+                or csa_route_stream is None
+                or csa_caller_ready is None
             ):
-                raise RuntimeError("compressed DSA plan is missing mandatory routes")
-            if config.ratio == 4:
-                if (
-                    layer.indexer is None
-                    or csa_indexer_stream is None
-                    or csa_route_stream is None
-                    or csa_caller_ready is None
+                raise RuntimeError("CSA execution is missing its overlap streams")
+            indexer_project, indexer_compress = projections.require_indexer()
+            with torch.cuda.stream(csa_route_stream):
+                dsa_input.x.record_stream(csa_route_stream)
+                with dsa_nvtx_range(
+                    "attention::csa::stream_overlap::" "support_routes_launch"
                 ):
-                    raise RuntimeError("CSA execution requires the model-side Indexer")
-                with torch.cuda.stream(csa_route_stream):
-                    dsa_input.x.record_stream(csa_route_stream)
-                    with dsa_nvtx_range(
-                        "attention::csa::stream_overlap::" "support_routes_launch"
-                    ):
-                        overlap_transfer = start_dsa_tensor_route(
-                            dsa_input.x,
-                            overlap_route,
-                            cp_group,
-                            attention_mode=attention_mode,
-                        )
-                        pending_transfers.append(overlap_transfer)
-                csa_indexer_stream.wait_event(csa_caller_ready)
-                with torch.cuda.stream(csa_indexer_stream):
-                    dsa_input.x.record_stream(csa_indexer_stream)
-                    dsa_input.qr.record_stream(csa_indexer_stream)
-                    with dsa_nvtx_range(
-                        "attention::csa::stream_overlap::" "indexer_projection_launch"
-                    ):
-                        q_indexer, weights = layer.indexer.project_queries(
-                            dsa_input.x,
-                            dsa_input.qr,
-                            device_plan.local_q_positions,
-                            detach_trunk=dsa_input.detach_indexer_trunk,
-                        )
-                        score_weights = weights
-                    csa_indexer_ready = torch.cuda.Event()
-                    csa_indexer_ready.record(csa_indexer_stream)
-                with torch.cuda.stream(csa_route_stream):
-                    overlap_x = finish_dsa_tensor_route(overlap_transfer)
-                    window_kv = finish_dsa_tensor_route(window_transfer)
-                    (
-                        overlap_x,
-                        window_kv,
-                    ) = _CsaBackwardRouteOrderFunction.apply(
+                    overlap_transfer = start_dsa_tensor_route(
                         dsa_input.x,
-                        latent_kv,
-                        overlap_x,
-                        window_kv,
                         overlap_route,
+                        cp_group,
+                        attention_mode=attention_mode,
+                    )
+                    pending_transfers.append(overlap_transfer)
+            csa_indexer_stream.wait_event(csa_caller_ready)
+            with torch.cuda.stream(csa_indexer_stream):
+                dsa_input.x.record_stream(csa_indexer_stream)
+                dsa_input.qr.record_stream(csa_indexer_stream)
+                with dsa_nvtx_range(
+                    "attention::csa::stream_overlap::" "indexer_projection_launch"
+                ):
+                    q_indexer, weights = indexer_project(
+                        dsa_input.x,
+                        dsa_input.qr,
+                        device_plan.local_q_positions,
+                        detach_trunk=dsa_input.detach_indexer_trunk,
+                    )
+                    score_weights = weights
+                csa_indexer_ready = torch.cuda.Event()
+                csa_indexer_ready.record(csa_indexer_stream)
+            with torch.cuda.stream(csa_route_stream):
+                overlap_x = finish_dsa_tensor_route(overlap_transfer)
+                window_kv = finish_dsa_tensor_route(window_transfer)
+                (
+                    overlap_x,
+                    window_kv,
+                ) = _CsaBackwardRouteOrderFunction.apply(
+                    dsa_input.x,
+                    latent_kv,
+                    overlap_x,
+                    window_kv,
+                    overlap_route,
+                    device_plan.window_route,
+                    cp_group,
+                    csa_route_stream,
+                    caller_stream,
+                )
+                csa_overlap_ready = torch.cuda.Event()
+                csa_overlap_ready.record(csa_route_stream)
+                csa_window_ready = torch.cuda.Event()
+                csa_window_ready.record(csa_route_stream)
+            caller_stream.wait_event(csa_overlap_ready)
+            overlap_x.record_stream(caller_stream)
+        else:
+            if (
+                hca_route_stream is None
+                or hca_caller_ready is None
+                or device_plan.window_route is None
+            ):
+                raise RuntimeError("HCA execution is missing its support route")
+            hca_route_stream.wait_event(hca_caller_ready)
+            with torch.cuda.stream(hca_route_stream):
+                dsa_input.x.record_stream(hca_route_stream)
+                latent_kv.record_stream(hca_route_stream)
+                with dsa_nvtx_range(
+                    "attention::hca::stream_overlap::support_routes_launch"
+                ):
+                    overlap_transfer = start_dsa_tensor_route(
+                        dsa_input.x,
+                        overlap_route,
+                        cp_group,
+                        attention_mode=attention_mode,
+                    )
+                    pending_transfers.append(overlap_transfer)
+                    window_transfer = start_dsa_tensor_route(
+                        latent_kv,
                         device_plan.window_route,
                         cp_group,
-                        csa_route_stream,
+                        attention_mode=attention_mode,
+                    )
+                    pending_transfers.append(window_transfer)
+                    overlap_x = finish_dsa_tensor_route(overlap_transfer)
+                    hca_overlap_ready = torch.cuda.Event()
+                    hca_overlap_ready.record(hca_route_stream)
+                    window_kv = finish_dsa_tensor_route(window_transfer)
+                    hca_window_ready = torch.cuda.Event()
+                    hca_window_ready.record(hca_route_stream)
+            caller_stream.wait_event(hca_overlap_ready)
+            overlap_x.record_stream(caller_stream)
+
+        with dsa_nvtx_range(
+            f"packing::{attention_mode}::compression_support::forward_gather",
+            enabled=overlap_x.is_cuda,
+        ):
+            packed = gather_compressor_support(
+                overlap_x, compression, config.compressor_support
+            )
+        valid_rows = compression.valid_rows
+
+        compressed_ki_transfer: DsaRouteTransfer | None = None
+        compressed_ki_route = device_plan.compressed_ki_route
+        indexer_map = device_plan.indexer
+        if config.ratio == 4:
+            if (
+                compressed_ki_route is None
+                or indexer_map is None
+            ):
+                raise RuntimeError("CSA plan is missing Indexer routes or metadata")
+            (
+                q_indexer,
+                score_weights,
+                packed,
+            ) = _CsaBackwardProjectionGateFunction.apply(
+                q_indexer,
+                score_weights,
+                packed,
+            )
+            indexer_packed = (
+                packed.detach() if dsa_input.detach_indexer_trunk else packed
+            )
+            compressed_ki_local = indexer_compress(
+                indexer_packed,
+                valid_rows,
+                compression.block_positions,
+            )
+            compressed_ki_transfer = start_dsa_tensor_route(
+                compressed_ki_local,
+                compressed_ki_route,
+                cp_group,
+                attention_mode=attention_mode,
+            )
+            pending_transfers.append(compressed_ki_transfer)
+            if csa_main_stream is None:
+                raise RuntimeError("CSA execution is missing its main stream")
+            csa_main_input_ready = torch.cuda.Event()
+            csa_main_input_ready.record(caller_stream)
+            csa_main_stream.wait_event(csa_main_input_ready)
+            with torch.cuda.stream(csa_main_stream):
+                packed.record_stream(csa_main_stream)
+                valid_rows.record_stream(csa_main_stream)
+                compression.block_positions.record_stream(csa_main_stream)
+                with dsa_nvtx_range(
+                    "attention::csa::stream_overlap::main_compressor_launch"
+                ):
+                    compressed_kv_local = projections.main_compress(
+                        packed,
+                        valid_rows,
+                        compression.block_positions,
+                    )
+                    compressed_kv_transfer = start_dsa_tensor_route(
+                        compressed_kv_local,
+                        compressed_kv_route,
+                        cp_group,
+                        attention_mode=attention_mode,
+                    )
+                    pending_transfers.append(compressed_kv_transfer)
+                    compressed_kv = finish_dsa_tensor_route(compressed_kv_transfer)
+                csa_main_ready = torch.cuda.Event()
+                csa_main_ready.record(csa_main_stream)
+
+            assert compressed_ki_transfer is not None
+            compressed_ki = finish_dsa_tensor_route(compressed_ki_transfer)
+            assert csa_indexer_ready is not None
+            assert csa_indexer_stream is not None
+            grouped_input_ready = torch.cuda.Event()
+            grouped_input_ready.record(caller_stream)
+            csa_indexer_stream.wait_event(grouped_input_ready)
+            with torch.cuda.stream(csa_indexer_stream):
+                compressed_ki.record_stream(csa_indexer_stream)
+                with (
+                    torch.no_grad(),
+                    dsa_nvtx_range(
+                        "packing::csa::indexer_key_support::forward_copy",
+                        enabled=compressed_ki.is_cuda,
+                    ),
+                ):
+                    # Each fragment's grouped-K prefix is a contiguous run
+                    # of the unique KI bank, so this is a plain range
+                    # gather. Indexer selection is no-grad, so there is no
+                    # matching backward for it.
+                    grouped_k = range_gather(
+                        compressed_ki,
+                        indexer_map.k_gather_ranges,
+                        total_size=indexer_map.packed_k_rows,
+                    )
+                with dsa_nvtx_range(
+                    "attention::csa::stream_overlap::grouped_indexer_launch"
+                ):
+                    selection = run_grouped_dsa_indexer(
+                        q_indexer,
+                        grouped_k,
+                        score_weights,
+                        indexer_map,
+                        config,
+                    )
+                selection_ready = torch.cuda.Event()
+                selection_ready.record(csa_indexer_stream)
+            caller_stream.wait_event(selection_ready)
+            for indexer_output in (
+                grouped_k,
+                selection.global_ids,
+                selection.lengths,
+                selection.lse,
+            ):
+                indexer_output.record_stream(caller_stream)
+            topk_global_ids = selection.global_ids
+            topk_lengths = selection.lengths
+            indexer_lse = selection.lse
+            assert csa_main_ready is not None
+            caller_stream.wait_event(csa_main_ready)
+            compressed_kv.record_stream(caller_stream)
+        else:
+            if hca_main_stream is None:
+                raise RuntimeError("HCA execution is missing its main stream")
+            hca_packed_ready = torch.cuda.Event()
+            hca_packed_ready.record(caller_stream)
+            hca_main_stream.wait_event(hca_packed_ready)
+            with torch.cuda.stream(hca_main_stream):
+                packed.record_stream(hca_main_stream)
+                valid_rows.record_stream(hca_main_stream)
+                compression.block_positions.record_stream(hca_main_stream)
+                with dsa_nvtx_range(
+                    "attention::hca::stream_overlap::main_compressor_launch"
+                ):
+                    compressed_kv_local = projections.main_compress(
+                        packed,
+                        valid_rows,
+                        compression.block_positions,
+                    )
+                    (
+                        compressed_kv_local,
+                        window_kv,
+                    ) = _HcaBackwardBranchOrderFunction.apply(
+                        compressed_kv_local,
+                        latent_kv,
+                        window_kv,
+                        device_plan.window_route,
+                        cp_group,
+                        hca_route_stream,
                         caller_stream,
                     )
-                    csa_overlap_ready = torch.cuda.Event()
-                    csa_overlap_ready.record(csa_route_stream)
-                    csa_window_ready = torch.cuda.Event()
-                    csa_window_ready.record(csa_route_stream)
-                caller_stream.wait_event(csa_overlap_ready)
-                overlap_x.record_stream(caller_stream)
-            else:
-                if (
-                    hca_route_stream is None
-                    or hca_caller_ready is None
-                    or device_plan.window_route is None
-                ):
-                    raise RuntimeError("HCA execution is missing its support route")
-                hca_route_stream.wait_event(hca_caller_ready)
-                with torch.cuda.stream(hca_route_stream):
-                    dsa_input.x.record_stream(hca_route_stream)
-                    latent_kv.record_stream(hca_route_stream)
-                    with dsa_nvtx_range(
-                        "attention::hca::stream_overlap::support_routes_launch"
-                    ):
-                        overlap_transfer = start_dsa_tensor_route(
-                            dsa_input.x,
-                            overlap_route,
-                            cp_group,
-                            attention_mode=attention_mode,
-                        )
-                        pending_transfers.append(overlap_transfer)
-                        window_transfer = start_dsa_tensor_route(
-                            latent_kv,
-                            device_plan.window_route,
-                            cp_group,
-                            attention_mode=attention_mode,
-                        )
-                        pending_transfers.append(window_transfer)
-                        overlap_x = finish_dsa_tensor_route(overlap_transfer)
-                        hca_overlap_ready = torch.cuda.Event()
-                        hca_overlap_ready.record(hca_route_stream)
-                        window_kv = finish_dsa_tensor_route(window_transfer)
-                        hca_window_ready = torch.cuda.Event()
-                        hca_window_ready.record(hca_route_stream)
-                caller_stream.wait_event(hca_overlap_ready)
-                overlap_x.record_stream(caller_stream)
-
-            packed = copy_dsa_tensor_with_csr(
-                overlap_x,
-                compression.source_pack,
-                compression.source_unpack,
-                nvtx_scope=f"{attention_mode}::compression_support",
-            ).view(-1, config.compressor_support, config.hidden_size)
-            valid_rows = compression.valid_rows.view(-1, config.compressor_support)
-
-            compressed_ki_transfer: DsaRouteTransfer | None = None
-            compressed_ki_route = device_plan.compressed_ki_route
-            indexer_map = device_plan.indexer
-            if config.ratio == 4:
-                if (
-                    layer.indexer is None
-                    or compressed_ki_route is None
-                    or indexer_map is None
-                ):
-                    raise RuntimeError("CSA plan is missing Indexer routes or metadata")
-                (
-                    q_indexer,
-                    score_weights,
-                    packed,
-                ) = _CsaBackwardProjectionGateFunction.apply(
-                    q_indexer,
-                    score_weights,
-                    packed,
-                )
-                indexer_packed = (
-                    packed.detach() if dsa_input.detach_indexer_trunk else packed
-                )
-                compressed_ki_local = layer.indexer.compressor(
-                    indexer_packed,
-                    valid_rows,
-                    compression.block_positions,
-                )
-                compressed_ki_transfer = start_dsa_tensor_route(
-                    compressed_ki_local,
-                    compressed_ki_route,
-                    cp_group,
-                    attention_mode=attention_mode,
-                )
-                pending_transfers.append(compressed_ki_transfer)
-                if csa_main_stream is None:
-                    raise RuntimeError("CSA execution is missing its main stream")
-                csa_main_input_ready = torch.cuda.Event()
-                csa_main_input_ready.record(caller_stream)
-                csa_main_stream.wait_event(csa_main_input_ready)
-                with torch.cuda.stream(csa_main_stream):
-                    packed.record_stream(csa_main_stream)
-                    valid_rows.record_stream(csa_main_stream)
-                    compression.block_positions.record_stream(csa_main_stream)
-                    with dsa_nvtx_range(
-                        "attention::csa::stream_overlap::main_compressor_launch"
-                    ):
-                        compressed_kv_local = layer.compressor(
-                            packed,
-                            valid_rows,
-                            compression.block_positions,
-                        )
-                        compressed_kv_transfer = start_dsa_tensor_route(
-                            compressed_kv_local,
-                            compressed_kv_route,
-                            cp_group,
-                            attention_mode=attention_mode,
-                        )
-                        pending_transfers.append(compressed_kv_transfer)
-                        compressed_kv = finish_dsa_tensor_route(compressed_kv_transfer)
-                    csa_main_ready = torch.cuda.Event()
-                    csa_main_ready.record(csa_main_stream)
-
-                assert compressed_ki_transfer is not None
-                compressed_ki = finish_dsa_tensor_route(compressed_ki_transfer)
-                assert csa_indexer_ready is not None
-                assert csa_indexer_stream is not None
-                grouped_input_ready = torch.cuda.Event()
-                grouped_input_ready.record(caller_stream)
-                csa_indexer_stream.wait_event(grouped_input_ready)
-                with torch.cuda.stream(csa_indexer_stream):
-                    compressed_ki.record_stream(csa_indexer_stream)
-                    with (
-                        torch.no_grad(),
-                        dsa_nvtx_range(
-                            "packing::csa::indexer_key_support::forward_copy",
-                            enabled=compressed_ki.is_cuda,
-                        ),
-                    ):
-                        grouped_k = copy_dsa_device_map(
-                            compressed_ki,
-                            indexer_map.k_pack,
-                        )
-                    with dsa_nvtx_range(
-                        "attention::csa::stream_overlap::grouped_indexer_launch"
-                    ):
-                        selection = run_grouped_dsa_indexer(
-                            q_indexer,
-                            grouped_k,
-                            score_weights,
-                            indexer_map,
-                            config,
-                        )
-                    selection_ready = torch.cuda.Event()
-                    selection_ready.record(csa_indexer_stream)
-                caller_stream.wait_event(selection_ready)
-                for indexer_output in (
-                    grouped_k,
-                    selection.global_ids,
-                    selection.lengths,
-                    selection.lse,
-                ):
-                    indexer_output.record_stream(caller_stream)
-                topk_global_ids = selection.global_ids
-                topk_lengths = selection.lengths
-                indexer_lse = selection.lse
-                assert csa_main_ready is not None
-                caller_stream.wait_event(csa_main_ready)
-                compressed_kv.record_stream(caller_stream)
-            else:
-                if hca_main_stream is None:
-                    raise RuntimeError("HCA execution is missing its main stream")
-                hca_packed_ready = torch.cuda.Event()
-                hca_packed_ready.record(caller_stream)
-                hca_main_stream.wait_event(hca_packed_ready)
-                with torch.cuda.stream(hca_main_stream):
-                    packed.record_stream(hca_main_stream)
-                    valid_rows.record_stream(hca_main_stream)
-                    compression.block_positions.record_stream(hca_main_stream)
-                    with dsa_nvtx_range(
-                        "attention::hca::stream_overlap::main_compressor_launch"
-                    ):
-                        compressed_kv_local = layer.compressor(
-                            packed,
-                            valid_rows,
-                            compression.block_positions,
-                        )
-                        (
-                            compressed_kv_local,
-                            window_kv,
-                        ) = _HcaBackwardBranchOrderFunction.apply(
-                            compressed_kv_local,
-                            latent_kv,
-                            window_kv,
-                            device_plan.window_route,
-                            cp_group,
-                            hca_route_stream,
-                            caller_stream,
-                        )
-                        compressed_kv_transfer = start_dsa_tensor_route(
-                            compressed_kv_local,
-                            compressed_kv_route,
-                            cp_group,
-                            attention_mode=attention_mode,
-                        )
-                        pending_transfers.append(compressed_kv_transfer)
-                        compressed_kv = finish_dsa_tensor_route(compressed_kv_transfer)
-                    hca_main_ready = torch.cuda.Event()
-                    hca_main_ready.record(hca_main_stream)
-                caller_stream.wait_event(hca_main_ready)
-                compressed_kv.record_stream(caller_stream)
-        else:
-            compressed_kv = latent_kv.new_empty((0, config.head_dim))
+                    compressed_kv_transfer = start_dsa_tensor_route(
+                        compressed_kv_local,
+                        compressed_kv_route,
+                        cp_group,
+                        attention_mode=attention_mode,
+                    )
+                    pending_transfers.append(compressed_kv_transfer)
+                    compressed_kv = finish_dsa_tensor_route(compressed_kv_transfer)
+                hca_main_ready = torch.cuda.Event()
+                hca_main_ready.record(hca_main_stream)
+            caller_stream.wait_event(hca_main_ready)
+            compressed_kv.record_stream(caller_stream)
 
         if config.ratio == 4:
             assert csa_window_ready is not None
             caller_stream.wait_event(csa_window_ready)
-            window_kv.record_stream(caller_stream)
-        elif config.ratio == 128:
+        else:
             assert hca_window_ready is not None
             caller_stream.wait_event(hca_window_ready)
-            window_kv.record_stream(caller_stream)
-        else:
-            window_kv = finish_dsa_tensor_route(window_transfer)
+        window_kv.record_stream(caller_stream)
     except BaseException:
         for transfer in pending_transfers:
             transfer.wait()
@@ -719,7 +712,9 @@ def dist_dsa(
             caller_stream.wait_stream(hca_route_stream)
         raise
 
-    with dsa_nvtx_range("attention::kv_bank_assembly", enabled=dsa_input.q.is_cuda):
+    with dsa_nvtx_range(
+        f"attention::{attention_mode}::kv_bank_assembly", enabled=dsa_input.q.is_cuda
+    ):
         kv_bank = torch.cat((window_kv, compressed_kv), dim=0).contiguous()
     if config.ratio == 4:
         (
@@ -729,6 +724,8 @@ def dist_dsa(
             attention_compressed_indices,
         ) = _build_csa_indices(
             handle,
+            config,
+            attention_mode,
             topk_global_ids,
             topk_lengths,
             window_kv.shape[0],
@@ -736,8 +733,8 @@ def dist_dsa(
     else:
         attention_indices, attention_lengths = _build_attention_indices(
             handle,
-            topk_global_ids,
-            topk_lengths,
+            config,
+            attention_mode,
             window_kv.shape[0],
         )
     if config.ratio == 4:
@@ -808,17 +805,29 @@ def dist_dsa(
         kl.record_stream(caller_stream)
         sparse_lse.record_stream(caller_stream)
     else:
-        output, sparse_lse, _ = dsa_sparse_attention(
-            dsa_input.q,
-            kv_bank,
-            dsa_input.sink,
-            attention_indices,
-            attention_lengths,
-            config,
-        )
+        # Symmetric to the CSA combined attention+KL launch, so a profile can
+        # attribute the HCA attention window the same way.
+        with dsa_nvtx_range(
+            "attention::hca::stream_overlap::sparse_attention_launch",
+            enabled=dsa_input.q.is_cuda,
+        ):
+            output, sparse_lse, _ = dsa_sparse_attention(
+                dsa_input.q,
+                kv_bank,
+                dsa_input.sink,
+                attention_indices,
+                attention_lengths,
+                config,
+            )
         kl = torch.zeros((), dtype=torch.float32, device=dsa_input.x.device)
 
-    output = layer.inverse_output_rope(output, device_plan.local_q_positions)
+    with dsa_nvtx_range(
+        f"attention::{attention_mode}::output_inverse_rope",
+        enabled=dsa_input.q.is_cuda,
+    ):
+        output = projections.inverse_output_rope(
+            output, device_plan.local_q_positions
+        )
 
     return MagiDSAForwardResult(
         output=output,

@@ -18,25 +18,18 @@ import hashlib
 import json
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
-from typing import TYPE_CHECKING, Iterator
+from typing import Iterator
 
 import torch
 import torch.distributed as dist
 
 from .comm import layout_dsa_hidden, route_dsa_tensor
-from .config import (
-    DsaPlanPolicy,
-    DsaSharedLayoutConfig,
-    DsaStructuralLayoutConfig,
-    MagiDSAConfig,
-)
+from .config import DsaStructuralLayoutConfig, MagiDSAConfig
 from .meta import DsaExecutionPlan
 from .packing import DsaDeviceRankPlan, DsaDeviceRoutePlan, make_dsa_device_rank_plan
-from .solver import build_dsa_execution_plan, validate_dsa_execution_plan
+from .projection import DsaProjections
+from .solver import build_dsa_execution_plan
 from .types import MagiDSAForwardResult, MagiDSAInput, MagiDSAPackedMeta
-
-if TYPE_CHECKING:
-    from .layer import MagiDSALayer
 
 
 @dataclass(frozen=True)
@@ -56,6 +49,7 @@ class DsaExecutionHandle:
 
     runtime_identity: int
     schema_hash: str
+    packed_meta: MagiDSAPackedMeta
     plan: DsaExecutionPlan
     device_plan: DsaDeviceRankPlan
     rank: int
@@ -80,40 +74,23 @@ def _digest(payload: object) -> str:
 
 
 class MagiDSARuntimeMgr:
-    """Parameter-free cold-plan owner and warm DSA execution orchestrator."""
+    """Parameter-free cold-plan owner and warm DSA execution orchestrator.
+
+    Preparing an execution runs no collective of any kind. The caller states the
+    packed metadata and the source split, the structural solver is a pure
+    function of those, and so every rank independently derives a bit-identical
+    plan. The handle cache is therefore keyed on purely local information and is
+    consulted before any work is done.
+    """
 
     def __init__(
         self,
         config: MagiDSAConfig,
         cp_group: dist.ProcessGroup | None = None,
         *,
-        policy: DsaPlanPolicy = "indexer_balanced",
-        shared_layout_config: DsaSharedLayoutConfig | None = None,
         structural_layout_config: DsaStructuralLayoutConfig | None = None,
         max_cached_handles: int = 4,
     ) -> None:
-        if policy not in (
-            "sequential",
-            "indexer_balanced",
-            "shared_greedy",
-            "structural_balanced",
-        ):
-            raise ValueError(
-                "DSA policy must be sequential, indexer_balanced, shared_greedy, "
-                "or structural_balanced"
-            )
-        if policy == "shared_greedy" and shared_layout_config is None:
-            raise ValueError("shared_greedy requires an explicit shared_layout_config")
-        if policy != "shared_greedy" and shared_layout_config is not None:
-            raise ValueError("shared_layout_config is only valid for shared_greedy")
-        if policy == "structural_balanced" and structural_layout_config is None:
-            raise ValueError(
-                "structural_balanced requires an explicit structural_layout_config"
-            )
-        if policy != "structural_balanced" and structural_layout_config is not None:
-            raise ValueError(
-                "structural_layout_config is only valid for structural_balanced"
-            )
         if max_cached_handles <= 0:
             raise ValueError("max_cached_handles must be positive")
         if cp_group is None:
@@ -122,28 +99,28 @@ class MagiDSARuntimeMgr:
         else:
             if not dist.is_initialized():
                 raise RuntimeError(
-                    "torch.distributed must be initialized before constructing a CP runtime"
+                    "torch.distributed must be initialized before constructing "
+                    "a CP runtime"
                 )
             self.rank = dist.get_rank(cp_group)
             self.world_size = dist.get_world_size(cp_group)
         self.config = config
         self.cp_group = cp_group
-        self.policy = policy
-        self.shared_layout_config = shared_layout_config
-        self.structural_layout_config = structural_layout_config
+        self.structural_layout_config = (
+            structural_layout_config or DsaStructuralLayoutConfig()
+        )
         self.max_cached_handles = max_cached_handles
         self._identity = id(self)
         self._handle_cache: OrderedDict[
             tuple[object, ...], DsaExecutionHandle
         ] = OrderedDict()
         self._solver_invocations = 0
-        self._object_collective_invocations = 0
         self._device_materializations = 0
         self._health_checks = 0
         self._warm_invocations = 0
 
     def parameters(self, recurse: bool = True) -> Iterator[torch.nn.Parameter]:
-        """Return no parameters; all trainable state belongs to MagiDSALayer."""
+        """Return no parameters; all trainable state belongs to the model."""
 
         del recurse
         return iter(())
@@ -161,7 +138,9 @@ class MagiDSARuntimeMgr:
     def counters(self) -> DsaRuntimeCounters:
         return DsaRuntimeCounters(
             solver_invocations=self._solver_invocations,
-            object_collective_invocations=self._object_collective_invocations,
+            # Kept at zero and asserted by the release gate: neither the cold
+            # nor the warm path may run an object collective.
+            object_collective_invocations=0,
             device_materializations=self._device_materializations,
             health_checks=self._health_checks,
             warm_invocations=self._warm_invocations,
@@ -181,130 +160,52 @@ class MagiDSARuntimeMgr:
             {
                 "config": asdict(self.config),
                 "cu_seqlens": packed_meta.cu_seqlens,
-                "policy": self.policy,
-                "shared_layout_config": (
-                    None
-                    if self.shared_layout_config is None
-                    else asdict(self.shared_layout_config)
-                ),
-                "structural_layout_config": (
-                    None
-                    if self.structural_layout_config is None
-                    else asdict(self.structural_layout_config)
-                ),
+                "source_token_counts": packed_meta.source_token_counts,
+                "structural_layout_config": asdict(self.structural_layout_config),
                 "world_size": self.world_size,
             }
         )
 
-    def _collect_owner_layout(
-        self,
-        packed_meta: MagiDSAPackedMeta,
-        local_token_capacity: int,
-        schema_hash: str,
-    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        local_record = (
-            schema_hash,
-            int(packed_meta.local_token_count),
-            int(local_token_capacity),
-        )
-        records: list[tuple[str, int, int] | None]
-        if self.cp_group is None:
-            records = [local_record]
-        else:
-            records = [None] * self.world_size
-            dist.all_gather_object(records, local_record, group=self.cp_group)
-            self._object_collective_invocations += 1
-        concrete = [record for record in records if record is not None]
-        if len(concrete) != self.world_size:
-            raise RuntimeError(
-                "owner-layout collective returned an incomplete rank table"
-            )
-        if any(record[0] != schema_hash for record in concrete):
+    def _validate_packed_meta(self, packed_meta: MagiDSAPackedMeta) -> None:
+        if packed_meta.cp_size != self.world_size:
             raise ValueError(
-                "DSA config, packed metadata, or policy differs across CP ranks"
+                "packed metadata source split does not match the CP group size"
             )
-        local_counts = tuple(record[1] for record in concrete)
-        capacities = tuple(record[2] for record in concrete)
-        if any(count > capacity for count, capacity in zip(local_counts, capacities)):
-            raise ValueError(
-                "a local token count exceeds its declared execution capacity"
-            )
-        if sum(local_counts) != packed_meta.cu_seqlens[-1]:
-            raise ValueError(
-                "owner-local counts do not cover the global packed token count"
-            )
-        return local_counts, capacities
-
-    def _build_and_broadcast_plan(
-        self,
-        packed_meta: MagiDSAPackedMeta,
-        local_counts: tuple[int, ...],
-    ) -> DsaExecutionPlan:
-        if self.cp_group is None:
-            self._solver_invocations += 1
-            return build_dsa_execution_plan(
-                self.config,
-                packed_meta.cu_seqlens,
-                local_counts,
-                policy=self.policy,
-                shared_layout_config=self.shared_layout_config,
-                structural_layout_config=self.structural_layout_config,
-            )
-        payload: list[DsaExecutionPlan | None]
-        if self.rank == 0:
-            self._solver_invocations += 1
-            payload = [
-                build_dsa_execution_plan(
-                    self.config,
-                    packed_meta.cu_seqlens,
-                    local_counts,
-                    policy=self.policy,
-                    shared_layout_config=self.shared_layout_config,
-                    structural_layout_config=self.structural_layout_config,
-                )
-            ]
-        else:
-            payload = [None]
-        dist.broadcast_object_list(payload, src=0, group=self.cp_group)
-        self._object_collective_invocations += 1
-        plan = payload[0]
-        if not isinstance(plan, DsaExecutionPlan):
-            raise RuntimeError("rank 0 did not broadcast a DSA execution plan")
-        validate_dsa_execution_plan(plan)
-        return plan
 
     def _cache_key(
         self,
-        schema_hash: str,
-        local_counts: tuple[int, ...],
-        capacities: tuple[int, ...],
+        packed_meta: MagiDSAPackedMeta,
+        local_token_capacity: int,
         device: torch.device,
     ) -> tuple[object, ...]:
         return (
-            schema_hash,
-            local_counts,
-            capacities,
+            packed_meta.cu_seqlens,
+            packed_meta.source_token_counts,
+            local_token_capacity,
             device.type,
             device.index,
             self.rank,
         )
 
     def _health_check_route(
-        self,
-        route: DsaDeviceRoutePlan,
+        self, route: DsaDeviceRoutePlan, device: torch.device
     ) -> None:
         source = torch.ones(
             (route.producer_row_count, 8),
             dtype=torch.bfloat16,
-            device=route.consumer_global_rows.device,
+            device=device,
             requires_grad=True,
         )
         consumer = route_dsa_tensor(source, route, self.cp_group)
         gradient = torch.autograd.grad(consumer.float().sum(), source)[0]
-        multiplicity = (
-            route.owner_reduce.row_offsets[1:] - route.owner_reduce.row_offsets[:-1]
+        # Every owner row reaches as many consumers as reference it, so the
+        # reverse route must return exactly that multiplicity.
+        expected = (
+            _owner_multiplicity(route, device)
+            .to(torch.bfloat16)
+            .unsqueeze(1)
+            .expand_as(source)
         )
-        expected = multiplicity.to(torch.bfloat16).unsqueeze(1).expand_as(source)
         if not torch.equal(gradient, expected):
             raise RuntimeError(f"{route.name} reverse-route health check failed")
 
@@ -319,8 +220,7 @@ class MagiDSARuntimeMgr:
         )
         for route in routes:
             if route is not None:
-                self._health_check_route(route)
-        torch.cuda.synchronize(handle.device)
+                self._health_check_route(route, handle.device)
         self._health_checks += 1
 
     def prepare_execution(
@@ -329,9 +229,13 @@ class MagiDSARuntimeMgr:
         device: torch.device | str,
         *,
         local_token_capacity: int,
-        health_check: bool = True,
+        health_check: bool = False,
     ) -> DsaExecutionHandle:
-        """Collect, solve, broadcast, materialize, and optionally dry-run a cold plan."""
+        """Solve and materialize one cold plan, or return the cached handle.
+
+        ``health_check`` runs a real collective per route and is off by default,
+        because it is a debugging dry run rather than part of preparing a plan.
+        """
 
         resolved_device = torch.device(device)
         if resolved_device.type != "cuda":
@@ -340,37 +244,42 @@ class MagiDSARuntimeMgr:
             resolved_device = torch.device("cuda", torch.cuda.current_device())
         if torch.cuda.get_device_capability(resolved_device) != (10, 3):
             raise RuntimeError("Magi-DSA v4 release execution requires B300 SM103")
-        if local_token_capacity < packed_meta.local_token_count:
-            raise ValueError("local_token_capacity is smaller than local_token_count")
-        schema_hash = self._shared_schema_hash(packed_meta)
-        local_counts, capacities = self._collect_owner_layout(
-            packed_meta,
-            local_token_capacity,
-            schema_hash,
-        )
-        cache_key = self._cache_key(
-            schema_hash, local_counts, capacities, resolved_device
-        )
+        self._validate_packed_meta(packed_meta)
+        source_tokens = packed_meta.local_token_count(self.rank)
+        if local_token_capacity < source_tokens:
+            raise ValueError("local_token_capacity is smaller than the source count")
+
+        cache_key = self._cache_key(packed_meta, local_token_capacity, resolved_device)
         cached = self._handle_cache.get(cache_key)
         if cached is not None:
             self._handle_cache.move_to_end(cache_key)
             return cached
 
-        plan = self._build_and_broadcast_plan(packed_meta, local_counts)
-        if any(
-            query_count > capacity
-            for query_count, capacity in zip(plan.query_token_counts, capacities)
-        ):
+        self._solver_invocations += 1
+        plan = build_dsa_execution_plan(
+            self.config,
+            packed_meta.cu_seqlens,
+            packed_meta.source_token_counts,
+            structural_layout_config=self.structural_layout_config,
+        )
+        if plan.query_token_counts[self.rank] > local_token_capacity:
             raise ValueError(
                 "a final Query token count exceeds its declared execution capacity"
             )
         device_plan = make_dsa_device_rank_plan(
-            plan, self.rank, self.config, resolved_device
+            plan,
+            self.rank,
+            self.config,
+            resolved_device,
+            cp_group=self.cp_group,
+            deterministic=False,
         )
         self._device_materializations += 1
+        is_csa = self.config.ratio == 4
         handle = DsaExecutionHandle(
             runtime_identity=self._identity,
-            schema_hash=schema_hash,
+            schema_hash=self._shared_schema_hash(packed_meta),
+            packed_meta=packed_meta,
             plan=plan,
             device_plan=device_plan,
             rank=self.rank,
@@ -378,34 +287,26 @@ class MagiDSARuntimeMgr:
             device=resolved_device,
             local_token_capacity=local_token_capacity,
             sparse_backward_stream=(
-                torch.cuda.Stream(device=resolved_device)
-                if self.config.ratio == 4
-                else None
+                torch.cuda.Stream(device=resolved_device) if is_csa else None
             ),
             csa_main_stream=(
-                torch.cuda.Stream(device=resolved_device)
-                if self.config.ratio == 4
-                else None
+                torch.cuda.Stream(device=resolved_device) if is_csa else None
             ),
             csa_indexer_stream=(
-                torch.cuda.Stream(device=resolved_device)
-                if self.config.ratio == 4
-                else None
+                torch.cuda.Stream(device=resolved_device) if is_csa else None
             ),
             csa_route_stream=(
-                torch.cuda.Stream(device=resolved_device)
-                if self.config.ratio == 4
-                else None
+                torch.cuda.Stream(device=resolved_device) if is_csa else None
             ),
             hca_main_stream=(
-                torch.cuda.Stream(device=resolved_device, priority=-1)
-                if self.config.ratio == 128
-                else None
+                None
+                if is_csa
+                else torch.cuda.Stream(device=resolved_device, priority=-1)
             ),
             hca_route_stream=(
-                torch.cuda.Stream(device=resolved_device, priority=-1)
-                if self.config.ratio == 128
-                else None
+                None
+                if is_csa
+                else torch.cuda.Stream(device=resolved_device, priority=-1)
             ),
         )
         if health_check:
@@ -425,16 +326,11 @@ class MagiDSARuntimeMgr:
             )
         if handle.rank != self.rank or handle.world_size != self.world_size:
             raise ValueError("execution handle CP identity does not match the runtime")
-        if self._shared_schema_hash(dsa_input.packed_meta) != handle.schema_hash:
+        # A frozen dataclass compares as a pair of tuples, so the warm path
+        # never re-hashes the schema.
+        if dsa_input.packed_meta != handle.packed_meta:
             raise ValueError(
                 "input packed metadata does not match the frozen execution handle"
-            )
-        if (
-            dsa_input.packed_meta.local_token_count
-            != handle.device_plan.source_token_count
-        ):
-            raise ValueError(
-                "input source token count does not match the frozen rank plan"
             )
         tensors = (
             dsa_input.x,
@@ -469,15 +365,9 @@ class MagiDSARuntimeMgr:
             raise ValueError(
                 "source hidden state must be contiguous owner-local CUDA BF16"
             )
-        route = handle.device_plan.token_layout_route
-        if route is None:
-            if (
-                handle.device_plan.source_token_count
-                != handle.device_plan.local_token_count
-            ):
-                raise RuntimeError("a changed Query layout is missing TOKEN_LAYOUT")
-            return source_x
-        return layout_dsa_hidden(source_x, route, self.cp_group)
+        return layout_dsa_hidden(
+            source_x, handle.device_plan.token_layout_route, self.cp_group
+        )
 
     def get_position_ids(self, handle: DsaExecutionHandle) -> torch.Tensor:
         """Return resident sample-relative positions in final Query-row order."""
@@ -492,22 +382,56 @@ class MagiDSARuntimeMgr:
 
     def calc_dsa(
         self,
-        layer: MagiDSALayer,
+        projections: DsaProjections,
         dsa_input: MagiDSAInput,
         handle: DsaExecutionHandle,
     ) -> MagiDSAForwardResult:
-        """Execute only the frozen warm DAG; this method never prepares a plan."""
+        """Execute only the frozen warm DAG; this method never prepares a plan.
+
+        ``projections`` carries the model's own parameterized callbacks. The
+        runtime schedules them and never owns them.
+        """
 
         self._validate_warm_handle(dsa_input, handle)
-        if layer.config != self.config:
-            raise ValueError("MagiDSALayer config does not match its runtime")
         from .dist import dist_dsa
         from .phase import dsa_phase
 
         with dsa_phase("forward"):
-            result = dist_dsa(layer, dsa_input, handle, self.cp_group)
+            result = dist_dsa(
+                self.config, projections, dsa_input, handle, self.cp_group
+            )
         self._warm_invocations += 1
         return result
+
+
+def _owner_multiplicity(
+    route: DsaDeviceRoutePlan, device: torch.device
+) -> torch.Tensor:
+    """Count how many consumers reference each owner row of a route.
+
+    A route is not always onto: a sample tail shorter than the compression ratio
+    produces no block, so some OVERLAP_X owner rows are consumed by nobody and
+    must come back with a zero gradient rather than one.
+    """
+
+    counts = torch.zeros(
+        (route.producer_row_count,), dtype=torch.float32, device=device
+    )
+    arg = route.group_collective_arg
+    if arg is None:
+        ranges = route.local_gather_ranges
+        if ranges is None:
+            raise RuntimeError(f"{route.name}: one-rank route has no local range plan")
+        for begin, end in ranges.tolist():
+            counts[begin:end] += 1.0
+        return counts
+    cursor = 0
+    for split_size, destinations in zip(
+        arg.input_split_size_list, arg.dst_indices_list
+    ):
+        counts[cursor : cursor + split_size] = float(len(destinations))
+        cursor += split_size
+    return counts
 
 
 __all__ = ["DsaExecutionHandle", "DsaRuntimeCounters", "MagiDSARuntimeMgr"]
