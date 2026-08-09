@@ -19,18 +19,21 @@ from typing import Any, cast
 
 import pytest
 import torch
-
-from magi_attention.dsa_config import DsaRatio, DsaStructuralLayoutConfig, MagiDSAConfig
-from magi_attention.dsa_layer import MagiDSALayer
-from magi_attention.dsa_runtime_mgr import MagiDSARuntimeMgr
-from magi_attention.dsa_types import MagiDSAInput, MagiDSAPackedMeta
-from magi_attention.functional.dsa_backend import run_grouped_dsa_indexer
-from magi_attention.functional.dsa_packing import copy_dsa_device_map
-from magi_attention.functional.dsa_reference import (
+from magi_attn_extensions.DSA.backend import run_grouped_dsa_indexer
+from magi_attn_extensions.DSA.config import (
+    DsaRatio,
+    DsaStructuralLayoutConfig,
+    MagiDSAConfig,
+)
+from magi_attn_extensions.DSA.layer import MagiDSALayer
+from magi_attn_extensions.DSA.packing import copy_dsa_device_map
+from magi_attn_extensions.DSA.reference import (
     _compress_global,
     assert_backend_native_topk_outputs_close,
     dsa_reference,
 )
+from magi_attn_extensions.DSA.runtime import MagiDSARuntimeMgr
+from magi_attn_extensions.DSA.types import MagiDSAInput, MagiDSAPackedMeta
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA is required"

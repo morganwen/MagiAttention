@@ -18,8 +18,8 @@ import math
 
 import torch
 
-from magi_attention.dsa_layer import DsaCompressor, MagiDSALayer
-from magi_attention.dsa_types import MagiDSAForwardResult
+from .layer import DsaCompressor, MagiDSALayer
+from .types import MagiDSAForwardResult
 
 
 def dsa_position_ids(

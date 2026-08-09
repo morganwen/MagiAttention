@@ -16,9 +16,9 @@ from __future__ import annotations
 
 import inspect
 
-from magi_attention.dsa_config import MagiDSAConfig
-from magi_attention.functional import dsa_comm
-from magi_attention.meta.solver.dsa_solver import build_dsa_execution_plan
+from magi_attn_extensions.DSA import comm as dsa_comm
+from magi_attn_extensions.DSA.config import MagiDSAConfig
+from magi_attn_extensions.DSA.solver import build_dsa_execution_plan
 
 
 def test_all_typed_routes_have_symmetric_counts_and_unique_rows() -> None:

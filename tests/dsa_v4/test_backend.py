@@ -19,10 +19,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
-from magi_attention.dsa_config import MagiDSAConfig
-from magi_attention.functional import dsa_backend as dsa_backend_module
-from magi_attention.functional.dsa_backend import (
+from magi_attn_extensions.DSA import backend as dsa_backend_module
+from magi_attn_extensions.DSA.backend import (
     DsaIndexerSelection,
     _finalize_backend_topk,
     _require_current_cudnn_stream,
@@ -32,7 +30,8 @@ from magi_attention.functional.dsa_backend import (
     dsa_selected_kl,
     dsa_sparse_attention,
 )
-from magi_attention.functional.dsa_reference import validate_backend_native_topk
+from magi_attn_extensions.DSA.config import MagiDSAConfig
+from magi_attn_extensions.DSA.reference import validate_backend_native_topk
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA is required"
@@ -91,7 +90,7 @@ def test_selected_kl_backward_waits_for_unit_gradient_event(monkeypatch) -> None
     monkeypatch.setattr(torch.cuda, "current_stream", current_stream)
     monkeypatch.setattr(torch.Tensor, "record_stream", record_stream)
     monkeypatch.setattr(
-        "magi_attention.kernel.triton.dsa_gradients."
+        "magi_attn_extensions.DSA.kernels.triton.gradients."
         "fused_dsa_scale_indexer_gradients",
         scale_gradients,
     )

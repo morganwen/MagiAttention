@@ -20,24 +20,12 @@ from typing import TYPE_CHECKING, Iterator
 import torch
 import torch.distributed as dist
 
-from magi_attention.dsa_config import (
-    DsaRatio,
-    DsaStructuralLayoutConfig,
-    MagiDSAProModelSpec,
-)
-from magi_attention.dsa_runtime_mgr import (
-    DsaExecutionHandle,
-    DsaRuntimeCounters,
-    MagiDSARuntimeMgr,
-)
-from magi_attention.dsa_types import (
-    MagiDSAForwardResult,
-    MagiDSAInput,
-    MagiDSAPackedMeta,
-)
+from .config import DsaRatio, DsaStructuralLayoutConfig, MagiDSAProModelSpec
+from .runtime import DsaExecutionHandle, DsaRuntimeCounters, MagiDSARuntimeMgr
+from .types import MagiDSAForwardResult, MagiDSAInput, MagiDSAPackedMeta
 
 if TYPE_CHECKING:
-    from magi_attention.dsa_model_adapter import MagiDSAProjector
+    from .model_adapter import MagiDSAProjector
 
 
 @dataclass(frozen=True, eq=False)
@@ -239,7 +227,7 @@ class MagiDSAProRuntimeMgr:
             self.model_spec.make_layer_config(layer_id).ratio
         )
         handle = self.handle_for_layer(layer_id, bundle)
-        from magi_attention.dsa_model_adapter import project_local_dsa_input
+        from .model_adapter import project_local_dsa_input
 
         return project_local_dsa_input(
             local_x,
@@ -258,7 +246,7 @@ class MagiDSAProRuntimeMgr:
         dsa_input: MagiDSAInput,
         bundle: MagiDSAProExecutionBundle,
     ) -> MagiDSAForwardResult:
-        from magi_attention.dsa_layer import MagiDSALayer
+        from .layer import MagiDSALayer
 
         if not isinstance(layer, MagiDSALayer):
             raise TypeError("layer must be a MagiDSALayer")

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from magi_attention.dsa_config import (
+from .config import (
     DsaPlanPolicy,
     DsaRatio,
     DsaSharedLayoutConfig,

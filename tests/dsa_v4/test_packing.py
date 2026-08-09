@@ -15,9 +15,8 @@
 from __future__ import annotations
 
 import torch
-
-from magi_attention.dsa_config import DsaStructuralLayoutConfig, MagiDSAConfig
-from magi_attention.functional.dsa_packing import (
+from magi_attn_extensions.DSA.config import DsaStructuralLayoutConfig, MagiDSAConfig
+from magi_attn_extensions.DSA.packing import (
     _make_indexer_map,
     copy_dsa_rows_reference,
     make_dsa_copy_map,
@@ -25,7 +24,7 @@ from magi_attention.functional.dsa_packing import (
     make_dsa_route_maps,
     reduce_dsa_rows_reference,
 )
-from magi_attention.meta.solver.dsa_solver import build_dsa_execution_plan
+from magi_attn_extensions.DSA.solver import build_dsa_execution_plan
 
 
 def test_copy_and_reduce_maps_cover_duplicates_and_empty_rows() -> None:

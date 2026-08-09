@@ -20,20 +20,19 @@ from typing import Any
 
 import pytest
 import torch
-
-from magi_attention.dsa_config import DsaRatio, MagiDSAConfig, MagiDSAProModelSpec
-from magi_attention.dsa_layer import MagiDSALayer, MagiDSAProLayerStack
-from magi_attention.dsa_model_adapter import (
+from magi_attn_extensions.DSA.config import DsaRatio, MagiDSAConfig, MagiDSAProModelSpec
+from magi_attn_extensions.DSA.layer import MagiDSALayer, MagiDSAProLayerStack
+from magi_attn_extensions.DSA.model_adapter import (
     layout_and_project_dsa_input,
     layout_source_hidden_once,
     project_local_dsa_input,
 )
-from magi_attention.dsa_pro_runtime_mgr import (
+from magi_attn_extensions.DSA.pro_runtime import (
     MagiDSAProExecutionBundle,
     MagiDSAProRuntimeMgr,
 )
-from magi_attention.dsa_runtime_mgr import MagiDSARuntimeMgr
-from magi_attention.dsa_types import MagiDSAInput, MagiDSAPackedMeta
+from magi_attn_extensions.DSA.runtime import MagiDSARuntimeMgr
+from magi_attn_extensions.DSA.types import MagiDSAInput, MagiDSAPackedMeta
 
 
 def _small_config(ratio: DsaRatio) -> MagiDSAConfig:

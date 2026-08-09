@@ -34,6 +34,10 @@ _FLASHMLA_PRO_H128_PATCH_REVISION = "b7643bd54521f563b839b98289b5cd048c062ba2"
 _FLASHMLA_PRO_H128_PATCH_SHA256 = (
     "c534e13ff432ac1c694cb24981826c11be26a2d9743d7175ddb05f887279461f"
 )
+# Magi-DSA ships as the magi_attn_extensions distribution, whose version is a
+# plain literal in extensions/magi_attn_extensions/__init__.py rather than a
+# versioningit-derived string like the Core wheel's.
+_MAGI_ATTN_EXTENSIONS_VERSION = "1.1.0"
 _PRO_MODEL_REVISION = "b5968e9190ef611bbf34a7229255be88a0e937c1"
 _PRO_FLASHMLA_FORWARD_KERNEL = "sparse_attn_fwd_for_small_topk_kernel"
 _PRO_PAIR_WORLD_SIZE = 8
@@ -1708,6 +1712,8 @@ def _expected_release_image_labels(revision: str) -> dict[str, str]:
         "org.magi-dsa.flashmla-revision": ("9241ae3ef9bac614dd25e45e507e089f888280e0"),
         "org.magi-dsa.install-mode": "python-wheel",
         "org.magi-dsa.magi-attention-revision": revision,
+        "org.magi-dsa.magi-attn-extensions-revision": revision,
+        "org.magi-dsa.magi-attn-extensions-version": _MAGI_ATTN_EXTENSIONS_VERSION,
         "org.magi-dsa.quack-kernels": "0.4.1",
         "org.magi-dsa.tvm-ffi": "0.1.8.post0",
     }
@@ -1794,9 +1800,12 @@ def main() -> None:
             args.image,
             "-lc",
             "python3 -VV; python3 -m pip freeze; nsys --version; "
-            "sha256sum /opt/magi-wheels/magi_attention-*.whl; "
+            "sha256sum /opt/magi-wheels/magi_attention-*.whl "
+            "/opt/magi-wheels/magi_attn_extensions-*.whl; "
             "python3 -c 'from importlib import metadata; import magi_attention; "
-            'print(metadata.version("magi-attention")); print(magi_attention.__file__)\'',
+            "import magi_attn_extensions.DSA as magi_dsa; "
+            'print(metadata.version("magi-attention")); print(magi_attention.__file__); '
+            'print(metadata.version("magi_attn_extensions")); print(magi_dsa.__file__)\'',
         ],
         cwd=repo_root,
         timeout_seconds=70,

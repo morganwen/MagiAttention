@@ -18,10 +18,10 @@ from typing import TYPE_CHECKING, Protocol
 
 import torch
 
-from magi_attention.dsa_types import MagiDSAInput, MagiDSAPackedMeta
+from .types import MagiDSAInput, MagiDSAPackedMeta
 
 if TYPE_CHECKING:
-    from magi_attention.dsa_runtime_mgr import DsaExecutionHandle, MagiDSARuntimeMgr
+    from .runtime import DsaExecutionHandle, MagiDSARuntimeMgr
 
 
 class MagiDSAProjector(Protocol):

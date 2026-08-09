@@ -16,14 +16,13 @@ from __future__ import annotations
 
 import pytest
 import torch
-
-from magi_attention.dsa_config import DsaRatio, MagiDSAConfig
-from magi_attention.dsa_layer import (
+from magi_attn_extensions.DSA.config import DsaRatio, MagiDSAConfig
+from magi_attn_extensions.DSA.layer import (
     MagiDSALayer,
     _yarn_inverse_frequencies,
     apply_dsa_rope,
 )
-from magi_attention.functional.dsa_reference import (
+from magi_attn_extensions.DSA.reference import (
     _compress_global,
     assert_backend_native_topk_outputs_close,
     backend_native_topk_global_ids,
@@ -32,6 +31,7 @@ from magi_attention.functional.dsa_reference import (
     validate_backend_native_topk,
     validate_backend_native_topk_pair,
 )
+
 from tests.dsa_v4.distributed_worker import (
     _compare_natural_snapshots,
     _cp2_backend_config,

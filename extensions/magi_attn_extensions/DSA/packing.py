@@ -18,13 +18,9 @@ from dataclasses import dataclass
 
 import torch
 
-from magi_attention.dsa_config import MagiDSAConfig
-from magi_attention.dsa_nvtx import dsa_nvtx_range
-from magi_attention.meta.collection.dsa_meta import (
-    DsaExecutionPlan,
-    DsaRankPlan,
-    DsaRouteRankPlan,
-)
+from .config import MagiDSAConfig
+from .meta import DsaExecutionPlan, DsaRankPlan, DsaRouteRankPlan
+from .nvtx import dsa_nvtx_range
 
 
 @dataclass(frozen=True)
@@ -558,7 +554,7 @@ def copy_dsa_device_map(
     if mapping.is_identity:
         return source
 
-    from magi_attention.kernel.cutedsl.dsa_pack import copy_dsa_rows
+    from .kernels.cutedsl.pack import copy_dsa_rows
 
     with dsa_nvtx_range("packing::cute_row_copy", enabled=source.is_cuda):
         return copy_dsa_rows(source, mapping.source_rows)
@@ -572,7 +568,7 @@ def reduce_dsa_device_map(
     if mapping.is_identity:
         return source
 
-    from magi_attention.kernel.cutedsl.dsa_pack import reduce_dsa_rows
+    from .kernels.cutedsl.pack import reduce_dsa_rows
 
     with dsa_nvtx_range("packing::cute_csr_reduce", enabled=source.is_cuda):
         return reduce_dsa_rows(source, mapping.row_offsets, mapping.source_rows)

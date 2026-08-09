@@ -12,10 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from . import dispatch_solver, dist_attn_solver, overlap_solver
+"""Compute kernels backing the Magi-DSA runtime.
 
-__all__ = [
-    "dispatch_solver",
-    "overlap_solver",
-    "dist_attn_solver",
-]
+Both kernel families are imported lazily by their functional wrappers so that
+CPU plan/reference paths do not require the CuTe or Triton toolchains.
+"""

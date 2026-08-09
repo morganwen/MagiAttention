@@ -15,7 +15,6 @@
 
 from .dispatch import dispatch_func, undispatch_func
 from .dist_attn import dist_attn_func
-from .dsa_reference import dsa_reference
 from .fa4 import ffa_fa4_func
 from .flex_flash_attn import flex_flash_attn_func
 from .roll import roll_p2p as roll_func
@@ -43,5 +42,4 @@ __all__ = [
     "correct_attn_lse_with_sink",
     "correct_attn_out_with_sink",
     "correct_attn_out_lse_with_sink",
-    "dsa_reference",
 ]

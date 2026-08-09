@@ -25,15 +25,20 @@ from typing import cast
 
 from magi_attention.common import AttnRanges
 from magi_attention.common.enum import AttnMaskType
-from magi_attention.dsa_config import (
+from magi_attention.meta._make_dispatch_meta import make_dispatch_meta_from_qk_ranges
+from magi_attention.meta.solver.dispatch_solver import (
+    DispatchConfig,
+    MinHeapDispatchAlg,
+)
+
+from .config import (
     DSV4_PRO_INDEXER_SCORE_ROW_ALIGNMENT,
     DsaPlanPolicy,
     DsaSharedLayoutConfig,
     DsaStructuralLayoutConfig,
     MagiDSAConfig,
 )
-from magi_attention.meta._make_dispatch_meta import make_dispatch_meta_from_qk_ranges
-from magi_attention.meta.collection.dsa_meta import (
+from .meta import (
     DsaCompressionBlock,
     DsaExecutionPlan,
     DsaFragmentSpec,
@@ -47,10 +52,6 @@ from magi_attention.meta.collection.dsa_meta import (
     DsaStructuralLayoutMetrics,
     DsaStructuralRankCost,
     DsaTypedRoutePlan,
-)
-from magi_attention.meta.solver.dispatch_solver import (
-    DispatchConfig,
-    MinHeapDispatchAlg,
 )
 
 _SHARED_SCORE_WEIGHT = 8

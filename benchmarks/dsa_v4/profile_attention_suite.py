@@ -63,22 +63,24 @@ from dsa_v4.profile_5step import (  # noqa: E402
     _training_gradient_snapshot,
     _wait_for_file,
 )
-
-from magi_attention.dsa_config import (  # noqa: E402
+from magi_attn_extensions.DSA.config import (  # noqa: E402
     DsaPlanPolicy,
     DsaSharedLayoutConfig,
     DsaStructuralLayoutConfig,
     MagiDSAConfig,
     MagiDSAProModelSpec,
 )
-from magi_attention.dsa_layer import MagiDSALayer  # noqa: E402
-from magi_attention.dsa_nvtx import dsa_nvtx_range  # noqa: E402
-from magi_attention.dsa_pro_runtime_mgr import (  # noqa: E402
+from magi_attn_extensions.DSA.layer import MagiDSALayer  # noqa: E402
+from magi_attn_extensions.DSA.nvtx import dsa_nvtx_range  # noqa: E402
+from magi_attn_extensions.DSA.pro_runtime import (  # noqa: E402
     MagiDSAProExecutionBundle,
     MagiDSAProRuntimeMgr,
 )
-from magi_attention.dsa_runtime_mgr import MagiDSARuntimeMgr  # noqa: E402
-from magi_attention.dsa_types import MagiDSAForwardResult, MagiDSAInput  # noqa: E402
+from magi_attn_extensions.DSA.runtime import MagiDSARuntimeMgr  # noqa: E402
+from magi_attn_extensions.DSA.types import (  # noqa: E402
+    MagiDSAForwardResult,
+    MagiDSAInput,
+)
 
 
 @dataclass(frozen=True)

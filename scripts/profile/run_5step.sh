@@ -228,7 +228,7 @@ image_flashmla_pro_patch_revision="$(image_label \
     "org.magi-dsa.flashmla-pro-h128-patch-revision")"
 image_flashmla_pro_patch_sha256="$(image_label \
     "org.magi-dsa.flashmla-pro-h128-patch-sha256")"
-pack_sha="$(sha256sum "$repo_root/magi_attention/kernel/cutedsl/dsa_pack.py" | cut -c1-16)"
+pack_sha="$(sha256sum "$repo_root/extensions/magi_attn_extensions/DSA/kernels/cutedsl/pack.py" | cut -c1-16)"
 aot_dir="${MAGI_DSA_CUTE_AOT:-$repo_root/.cache/magi-dsa-v4/aot-cutlass-4.5.0-sm103-$pack_sha}"
 cudnn_cache_dir="${MAGI_DSA_CUDNN_CACHE:-$repo_root/.cache/magi-dsa-v4/cudnn-dsa-9.24.0.43-frontend-35fd7b0d-cutlass-4.5.0-sm103}"
 msa_reference_report="${MAGI_DSA_MSA_REFERENCE_REPORT:-not-configured}"

@@ -576,7 +576,7 @@ def test_formal_artifact_gates_reject_dirty_worktrees(tmp_path: Path) -> None:
         artifact = tmp_path / directory_name
         _minimal_provenance_artifact(
             artifact,
-            dirty_status=" M magi_attention/dsa_runtime_mgr.py\n",
+            dirty_status=" M extensions/magi_attn_extensions/DSA/runtime.py\n",
         )
         with pytest.raises(ValueError, match="dirty worktree"):
             validator(artifact, _REVISION)

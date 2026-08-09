@@ -72,6 +72,7 @@ RUN python3 -m pip wheel --no-build-isolation --no-deps --wheel-dir /opt/wheels 
 FROM ${BASE_IMAGE} AS magi-builder
 
 ARG MAGI_ATTENTION_REVISION
+ARG MAGI_ATTN_EXTENSIONS_VERSION=1.1.0
 ARG VERSIONINGIT_VERSION=3.3.0
 
 ENV MAGI_ATTENTION_PREBUILD_FFA=0 \
@@ -94,7 +95,11 @@ RUN cp -a /workspace/Magi-DSA/. . && \
         pyproject.toml && \
     python3 -m pip wheel --no-build-isolation --no-deps \
         --wheel-dir /opt/magi-wheels . && \
+    python3 -m pip wheel --no-build-isolation --no-deps \
+        --wheel-dir /opt/magi-wheels ./extensions && \
+    test -f "/opt/magi-wheels/magi_attn_extensions-${MAGI_ATTN_EXTENSIONS_VERSION}-py3-none-any.whl" && \
     sha256sum /opt/magi-wheels/magi_attention-*.whl \
+        /opt/magi-wheels/magi_attn_extensions-*.whl \
         > /opt/magi-wheels/SHA256SUMS
 
 FROM ${BASE_IMAGE}
@@ -109,6 +114,7 @@ ARG FLASHMLA_DUAL_LSE_PATCH_SHA256=6957dbde516c73066c5911108761325edc1bdcd8f62e1
 ARG FLASHMLA_PRO_H128_PATCH_REVISION=b7643bd54521f563b839b98289b5cd048c062ba2
 ARG FLASHMLA_PRO_H128_PATCH_SHA256=c534e13ff432ac1c694cb24981826c11be26a2d9743d7175ddb05f887279461f
 ARG MAGI_ATTENTION_REVISION=unknown
+ARG MAGI_ATTN_EXTENSIONS_VERSION=1.1.0
 ARG PACKAGING_VERSION=25.0
 ARG PYTEST_VERSION=8.4.2
 ARG QUACK_VERSION=0.4.1
@@ -138,11 +144,14 @@ COPY --from=flashmla-builder /opt/wheels /opt/flashmla-wheels
 COPY --from=magi-builder /opt/magi-wheels /opt/magi-wheels
 COPY --from=magi-builder /workspace/Magi-DSA /workspace/Magi-DSA
 
+# Core and Extension are two distributions and both belong in the release image.
 RUN python3 -m pip install --no-cache-dir --no-deps \
         /opt/flashmla-wheels/flash_mla-*.whl \
-        /opt/magi-wheels/magi_attention-*.whl
+        /opt/magi-wheels/magi_attention-*.whl \
+        /opt/magi-wheels/magi_attn_extensions-*.whl
 
 ENV LD_LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH} \
+    MAGI_DSA_EXTENSION_VERSION=${MAGI_ATTN_EXTENSIONS_VERSION} \
     MAGI_DSA_FLASHMLA_BASE_REVISION=${FLASHMLA_REVISION} \
     MAGI_DSA_FLASHMLA_DUAL_LSE_PATCH_REVISION=${FLASHMLA_DUAL_LSE_PATCH_REVISION} \
     MAGI_DSA_FLASHMLA_PRO_H128_PATCH_REVISION=${FLASHMLA_PRO_H128_PATCH_REVISION} \
@@ -150,7 +159,7 @@ ENV LD_LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages/nvidia/cudnn/lib:${L
 
 WORKDIR /tmp
 
-RUN python3 -c "import inspect; import os; from importlib import metadata; from pathlib import Path; import cudnn; import flash_mla; import magi_attention; from cudnn import DSA; from cutlass import Int32; from magi_attention.dsa_layer import MagiDSALayer; from magi_attention.dsa_runtime_mgr import MagiDSARuntimeMgr; assert cudnn.__version__ == '1.26.0'; assert cudnn.backend_version() == 92400; assert metadata.version('nvidia-cudnn-cu13') == '9.24.0.43'; assert metadata.version('nvidia-cutlass-dsl') == '4.5.0'; assert metadata.version('nvidia-cutlass-dsl-libs-base') == '4.5.0'; assert metadata.version('nvidia-cutlass-dsl-libs-cu13') == '4.5.0'; assert Int32; assert metadata.version('apache-tvm-ffi') == '0.1.8.post0'; assert metadata.version('packaging') == '25.0'; assert metadata.version('pytest') == '8.4.2'; assert metadata.version('quack-kernels') == '0.4.1'; assert metadata.version('flash-mla').endswith('+9241ae3'); assert 'indexer_topk' in inspect.signature(flash_mla.flash_mla_sparse_fwd).parameters; indexer_forward_parameters = inspect.signature(DSA.indexer_forward_wrapper).parameters; assert 'q_causal_offsets' in indexer_forward_parameters; assert indexer_forward_parameters['q_causal_offsets'].kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY); indexer_topk_parameters = inspect.signature(DSA.indexer_top_k_wrapper).parameters; assert 'return_val' in indexer_topk_parameters; assert indexer_topk_parameters['return_val'].kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY); assert metadata.version('magi-attention') == '1.1.1+g' + os.environ['MAGI_DSA_SOURCE_REVISION']; assert set(Path(magi_attention.__file__).parts).intersection({'site-packages', 'dist-packages'}); assert DSA.indexer_forward_wrapper; assert DSA.indexer_top_k_wrapper; assert DSA.sparse_attention_backward_wrapper; assert DSA.indexer_backward_wrapper; assert flash_mla.flash_mla_sparse_fwd; assert MagiDSALayer; assert MagiDSARuntimeMgr"
+RUN python3 -c "import inspect; import os; from importlib import metadata; from pathlib import Path; import cudnn; import flash_mla; import magi_attention; import magi_attn_extensions; import magi_attn_extensions.DSA as magi_dsa; from cudnn import DSA; from cutlass import Int32; from magi_attn_extensions.DSA.layer import MagiDSALayer; from magi_attn_extensions.DSA.runtime import MagiDSARuntimeMgr; assert cudnn.__version__ == '1.26.0'; assert cudnn.backend_version() == 92400; assert metadata.version('nvidia-cudnn-cu13') == '9.24.0.43'; assert metadata.version('nvidia-cutlass-dsl') == '4.5.0'; assert metadata.version('nvidia-cutlass-dsl-libs-base') == '4.5.0'; assert metadata.version('nvidia-cutlass-dsl-libs-cu13') == '4.5.0'; assert Int32; assert metadata.version('apache-tvm-ffi') == '0.1.8.post0'; assert metadata.version('packaging') == '25.0'; assert metadata.version('pytest') == '8.4.2'; assert metadata.version('quack-kernels') == '0.4.1'; assert metadata.version('flash-mla').endswith('+9241ae3'); assert 'indexer_topk' in inspect.signature(flash_mla.flash_mla_sparse_fwd).parameters; indexer_forward_parameters = inspect.signature(DSA.indexer_forward_wrapper).parameters; assert 'q_causal_offsets' in indexer_forward_parameters; assert indexer_forward_parameters['q_causal_offsets'].kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY); indexer_topk_parameters = inspect.signature(DSA.indexer_top_k_wrapper).parameters; assert 'return_val' in indexer_topk_parameters; assert indexer_topk_parameters['return_val'].kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY); assert metadata.version('magi-attention') == '1.1.1+g' + os.environ['MAGI_DSA_SOURCE_REVISION']; assert metadata.version('magi_attn_extensions') == os.environ['MAGI_DSA_EXTENSION_VERSION']; assert set(Path(magi_attention.__file__).parts).intersection({'site-packages', 'dist-packages'}); assert set(Path(magi_attn_extensions.__file__).parts).intersection({'site-packages', 'dist-packages'}); assert set(Path(magi_dsa.__file__).parts).intersection({'site-packages', 'dist-packages'}); assert DSA.indexer_forward_wrapper; assert DSA.indexer_top_k_wrapper; assert DSA.sparse_attention_backward_wrapper; assert DSA.indexer_backward_wrapper; assert flash_mla.flash_mla_sparse_fwd; assert MagiDSALayer; assert MagiDSARuntimeMgr"
 
 LABEL org.opencontainers.image.base.digest="sha256:192d749b4d773610ec9e01c0443a9df545d196c412b7b8fd33bfa3da362a49e7" \
       org.magi-dsa.cudnn-backend="9.24.0.43" \
@@ -166,6 +175,8 @@ LABEL org.opencontainers.image.base.digest="sha256:192d749b4d773610ec9e01c0443a9
       org.magi-dsa.flashmla-revision="${FLASHMLA_REVISION}" \
       org.magi-dsa.install-mode="python-wheel" \
       org.magi-dsa.magi-attention-revision="${MAGI_ATTENTION_REVISION}" \
-      org.magi-dsa.magi-attention-wheel-scope="dsa-python-runtime" \
+      org.magi-dsa.magi-attention-wheel-scope="core-python-runtime" \
+      org.magi-dsa.magi-attn-extensions-revision="${MAGI_ATTENTION_REVISION}" \
+      org.magi-dsa.magi-attn-extensions-version="${MAGI_ATTN_EXTENSIONS_VERSION}" \
       org.magi-dsa.quack-kernels="0.4.1" \
       org.magi-dsa.tvm-ffi="0.1.8.post0"

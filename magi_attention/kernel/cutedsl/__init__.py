@@ -29,7 +29,3 @@ def is_ffa_debug_mode_enabled() -> bool:
     import os
 
     return os.getenv("MAGI_ATTENTION_FFA_CUTEDSL_DEBUG_MODE", "0") == "1"
-
-
-# Magi-DSA kernels are imported lazily by functional wrappers so environments
-# without the frozen CuTe dependency can still run CPU plan/reference tests.

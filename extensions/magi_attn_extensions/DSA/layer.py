@@ -22,16 +22,13 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from magi_attention.dsa_config import MagiDSAConfig, MagiDSAProModelSpec
-from magi_attention.dsa_nvtx import dsa_nvtx_range
-from magi_attention.dsa_types import MagiDSAInput
+from .config import MagiDSAConfig, MagiDSAProModelSpec
+from .nvtx import dsa_nvtx_range
+from .types import MagiDSAInput
 
 if TYPE_CHECKING:
-    from magi_attention.dsa_pro_runtime_mgr import (
-        MagiDSAProExecutionBundle,
-        MagiDSAProRuntimeMgr,
-    )
-    from magi_attention.dsa_runtime_mgr import DsaExecutionHandle, MagiDSARuntimeMgr
+    from .pro_runtime import MagiDSAProExecutionBundle, MagiDSAProRuntimeMgr
+    from .runtime import DsaExecutionHandle, MagiDSARuntimeMgr
 
 
 def _apply_fused_rms_norm(
@@ -260,9 +257,7 @@ class DsaCompressor(nn.Module):
                 projected_gate = _linear_projection(projection_input, self.wgate.weight)
             ratio = self.config.ratio
             if self.overlap and packed_x.is_cuda:
-                from magi_attention.kernel.triton.dsa_compressor import (
-                    fused_csa_compressor_reduce,
-                )
+                from .kernels.triton.compressor import fused_csa_compressor_reduce
 
                 with dsa_nvtx_range(f"{scope}::post_gemm_fused", enabled=True):
                     compressed = fused_csa_compressor_reduce(
@@ -306,9 +301,7 @@ class DsaCompressor(nn.Module):
             if self.rotate_output:
                 with dsa_nvtx_range(f"{scope}::rope_hadamard", enabled=enabled):
                     if compressed.is_cuda:
-                        from magi_attention.kernel.triton.dsa_rope import (
-                            fused_dsa_rope_hadamard,
-                        )
+                        from .kernels.triton.rope import fused_dsa_rope_hadamard
 
                         with dsa_nvtx_range(
                             f"{scope}::rope_hadamard::fused_triton", enabled=True
@@ -329,7 +322,7 @@ class DsaCompressor(nn.Module):
                         )
                     )
             if compressed.is_cuda:
-                from magi_attention.kernel.triton.dsa_rope import fused_dsa_rope
+                from .kernels.triton.rope import fused_dsa_rope
 
                 with dsa_nvtx_range(f"{scope}::rope", enabled=True):
                     with dsa_nvtx_range(f"{scope}::rope::fused_triton", enabled=True):
@@ -404,9 +397,7 @@ class DsaIndexer(nn.Module):
                     self.config.indexer_head_dim,
                 )
             if q.is_cuda:
-                from magi_attention.kernel.triton.dsa_rope import (
-                    fused_dsa_rope_hadamard,
-                )
+                from .kernels.triton.rope import fused_dsa_rope_hadamard
 
                 with dsa_nvtx_range(f"{scope}::query::rope_hadamard", enabled=True):
                     with dsa_nvtx_range(
@@ -439,9 +430,7 @@ class DsaIndexer(nn.Module):
             weight_scale = self.config.indexer_heads**-0.5
             with dsa_nvtx_range(f"{scope}::weight_scaling", enabled=enabled):
                 if weights.is_cuda:
-                    from magi_attention.kernel.triton.dsa_projection import (
-                        fused_dsa_scale_cast,
-                    )
+                    from .kernels.triton.projection import fused_dsa_scale_cast
 
                     with dsa_nvtx_range(
                         f"{scope}::weight_scaling::fused_triton", enabled=True
@@ -511,7 +500,7 @@ class MagiDSALayer(nn.Module):
             raise ValueError(f"attention output must have shape {expected_shape}")
         scope = "attention::output_inverse_rope"
         if output.is_cuda:
-            from magi_attention.kernel.triton.dsa_rope import fused_dsa_rope
+            from .kernels.triton.rope import fused_dsa_rope
 
             with dsa_nvtx_range(f"{scope}::fused_triton", enabled=True):
                 return fused_dsa_rope(

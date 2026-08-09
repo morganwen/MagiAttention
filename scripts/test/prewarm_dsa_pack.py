@@ -18,12 +18,12 @@ import json
 import os
 
 import torch
-
-from magi_attention.kernel.cutedsl.dsa_pack import (
+from magi_attn_extensions.DSA.kernels.cutedsl.pack import (
     copy_dsa_rows,
     export_dsa_pack_aot,
     reduce_dsa_rows,
 )
+
 from scripts.test.dsa_pack_aot_manifest import COPY_SPECS, REDUCE_SPECS
 
 _TORCH_DTYPES = {

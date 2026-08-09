@@ -40,7 +40,9 @@ setup(
         exclude=(
             "build",
             "dist",
-            "tests",
+            # "tests" alone would not exclude "tests.dsa_v4" once the DSA test
+            # suite lives under extensions/tests/.
+            "tests*",
         )
     ),
     description="Extensions to provide supplementary utilities based on MagiAttention.",

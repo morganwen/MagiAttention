@@ -18,23 +18,11 @@ import math
 
 import pytest
 import torch
-
-from magi_attention import dsa_layer as dsa_layer_module
-from magi_attention.dsa_config import DsaRatio, MagiDSAConfig
-from magi_attention.dsa_layer import (
-    DsaIndexer,
-    DsaRMSNorm,
-    MagiDSALayer,
-    _yarn_inverse_frequencies,
-    apply_dsa_rope,
-    apply_normalized_hadamard,
-)
-from magi_attention.dsa_runtime_mgr import MagiDSARuntimeMgr
-from magi_attention.dsa_types import MagiDSAInput, MagiDSAPackedMeta
-from magi_attention.functional import dist_dsa as dist_dsa_module
-from magi_attention.functional import dsa_comm as dsa_comm_module
-from magi_attention.functional.dsa_backend import DsaIndexerSelection
-from magi_attention.functional.dsa_comm import (
+from magi_attn_extensions.DSA import comm as dsa_comm_module
+from magi_attn_extensions.DSA import dist as dist_dsa_module
+from magi_attn_extensions.DSA import layer as dsa_layer_module
+from magi_attn_extensions.DSA.backend import DsaIndexerSelection
+from magi_attn_extensions.DSA.comm import (
     copy_dsa_tensor_with_csr,
     finish_dsa_reverse_route,
     finish_dsa_tensor_route,
@@ -42,31 +30,45 @@ from magi_attention.functional.dsa_comm import (
     start_dsa_reverse_route,
     start_dsa_tensor_route,
 )
-from magi_attention.functional.dsa_packing import (
+from magi_attn_extensions.DSA.config import DsaRatio, MagiDSAConfig
+from magi_attn_extensions.DSA.kernels.cutedsl.pack import copy_dsa_rows, reduce_dsa_rows
+from magi_attn_extensions.DSA.kernels.triton import rope as dsa_rope_module
+from magi_attn_extensions.DSA.kernels.triton.compressor import (
+    fused_csa_compressor_reduce,
+)
+from magi_attn_extensions.DSA.kernels.triton.diagnostics import (
+    dsa_nonfinite_block_stats,
+    dsa_nonfinite_row_counts,
+)
+from magi_attn_extensions.DSA.kernels.triton.gradients import (
+    fused_dsa_mask_empty_indexer_gradients,
+    fused_dsa_scale_indexer_gradients,
+)
+from magi_attn_extensions.DSA.kernels.triton.indices import build_csa_index_tensors
+from magi_attn_extensions.DSA.kernels.triton.kl import fused_dsa_selected_kl_state
+from magi_attn_extensions.DSA.kernels.triton.projection import fused_dsa_scale_cast
+from magi_attn_extensions.DSA.kernels.triton.reductions import fused_dsa_row_logsumexp
+from magi_attn_extensions.DSA.kernels.triton.rope import (
+    fused_dsa_rope,
+    fused_dsa_rope_hadamard,
+)
+from magi_attn_extensions.DSA.layer import (
+    DsaIndexer,
+    DsaRMSNorm,
+    MagiDSALayer,
+    _yarn_inverse_frequencies,
+    apply_dsa_rope,
+    apply_normalized_hadamard,
+)
+from magi_attn_extensions.DSA.packing import (
     DsaDeviceCopyMap,
     DsaDeviceReduceMap,
     make_dsa_device_rank_plan,
 )
-from magi_attention.kernel.cutedsl.dsa_pack import copy_dsa_rows, reduce_dsa_rows
-from magi_attention.kernel.triton import dsa_rope as dsa_rope_module
-from magi_attention.kernel.triton.dsa_compressor import fused_csa_compressor_reduce
-from magi_attention.kernel.triton.dsa_diagnostics import (
-    dsa_nonfinite_block_stats,
-    dsa_nonfinite_row_counts,
-)
-from magi_attention.kernel.triton.dsa_gradients import (
-    fused_dsa_mask_empty_indexer_gradients,
-    fused_dsa_scale_indexer_gradients,
-)
-from magi_attention.kernel.triton.dsa_indices import build_csa_index_tensors
-from magi_attention.kernel.triton.dsa_kl import fused_dsa_selected_kl_state
-from magi_attention.kernel.triton.dsa_projection import fused_dsa_scale_cast
-from magi_attention.kernel.triton.dsa_reductions import fused_dsa_row_logsumexp
-from magi_attention.kernel.triton.dsa_rope import (
-    fused_dsa_rope,
-    fused_dsa_rope_hadamard,
-)
-from magi_attention.meta.solver.dsa_solver import build_dsa_execution_plan
+from magi_attn_extensions.DSA.runtime import MagiDSARuntimeMgr
+from magi_attn_extensions.DSA.solver import build_dsa_execution_plan
+from magi_attn_extensions.DSA.types import MagiDSAInput, MagiDSAPackedMeta
+
 from scripts.test.dsa_pack_aot_manifest import required_object_names
 
 pytestmark = pytest.mark.skipif(

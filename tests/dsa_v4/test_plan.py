@@ -15,8 +15,7 @@
 from __future__ import annotations
 
 import pytest
-
-from magi_attention.dsa_config import (
+from magi_attn_extensions.DSA.config import (
     DSV4_PRO_INDEXER_SCORE_ROW_ALIGNMENT,
     DSV4_PRO_MAIN_COMPRESS_RATIOS,
     DSV4_PRO_REVISION,
@@ -26,12 +25,12 @@ from magi_attention.dsa_config import (
     MagiDSAConfig,
     MagiDSAProModelSpec,
 )
-from magi_attention.meta.collection.dsa_meta import (
+from magi_attn_extensions.DSA.meta import (
     DsaExecutionPlan,
     DsaLayoutMetrics,
     DsaStructuralLayoutMetrics,
 )
-from magi_attention.meta.solver.dsa_solver import _build_route, build_dsa_execution_plan
+from magi_attn_extensions.DSA.solver import _build_route, build_dsa_execution_plan
 
 
 def test_dsv4_pro_main_schedule_matches_the_official_31_hca_30_csa_stack() -> None:

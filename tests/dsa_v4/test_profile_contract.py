@@ -22,10 +22,25 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Iterator, Protocol, cast
 
+import magi_attn_extensions.DSA.dist as dist_dsa_module
 import pytest
 import torch
+from magi_attn_extensions.DSA import layer as dsa_layer_module
+from magi_attn_extensions.DSA.config import DsaRatio, MagiDSAConfig
+from magi_attn_extensions.DSA.layer import MagiDSALayer
+from magi_attn_extensions.DSA.nvtx import (
+    DSA_CUDNN_CALL_NVTX_PREFIX,
+    DSA_MODULE_NVTX_PREFIX,
+    dsa_cudnn_call_range,
+    dsa_nvtx_range,
+)
+from magi_attn_extensions.DSA.runtime import MagiDSARuntimeMgr
+from magi_attn_extensions.DSA.types import (
+    MagiDSAForwardResult,
+    MagiDSAInput,
+    MagiDSAPackedMeta,
+)
 
-import magi_attention.functional.dist_dsa as dist_dsa_module
 from benchmarks.dsa_v4 import profile_5step as profile_5step_module
 from benchmarks.dsa_v4 import profile_attention_suite as attention_suite_module
 from benchmarks.dsa_v4.profile_5step import (
@@ -50,21 +65,6 @@ from benchmarks.dsa_v4.profile_attention_suite import (
     _prepare_pro_pair_boundaries,
     _run_attention_suite_step,
     _validate_mode_result,
-)
-from magi_attention import dsa_layer as dsa_layer_module
-from magi_attention.dsa_config import DsaRatio, MagiDSAConfig
-from magi_attention.dsa_layer import MagiDSALayer
-from magi_attention.dsa_nvtx import (
-    DSA_CUDNN_CALL_NVTX_PREFIX,
-    DSA_MODULE_NVTX_PREFIX,
-    dsa_cudnn_call_range,
-    dsa_nvtx_range,
-)
-from magi_attention.dsa_runtime_mgr import MagiDSARuntimeMgr
-from magi_attention.dsa_types import (
-    MagiDSAForwardResult,
-    MagiDSAInput,
-    MagiDSAPackedMeta,
 )
 from scripts.image.finalize_release import (
     _validate_correctness_summary,
@@ -3916,9 +3916,9 @@ def test_pro_pair_records_selected_recompute_cudnn_memcpy_scopes_without_capture
     entrypoint_source = (repo_root / "scripts/profile/run_5step.sh").read_text(
         encoding="utf-8"
     )
-    backend_source = (repo_root / "magi_attention/functional/dsa_backend.py").read_text(
-        encoding="utf-8"
-    )
+    backend_source = (
+        repo_root / "extensions/magi_attn_extensions/DSA/backend.py"
+    ).read_text(encoding="utf-8")
     worker_source = (
         repo_root / "benchmarks/dsa_v4/profile_attention_suite.py"
     ).read_text(encoding="utf-8")

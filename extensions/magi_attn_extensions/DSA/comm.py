@@ -21,17 +21,17 @@ import torch.distributed as dist
 
 from magi_attention.comm.primitive import all2all_v
 from magi_attention.comm.work import GeneralWork
-from magi_attention.dsa_nvtx import dsa_nvtx_range
 from magi_attention.utils import nvtx
 
-from .dsa_packing import (
+from .nvtx import dsa_nvtx_range
+from .packing import (
     DsaDeviceCopyMap,
     DsaDeviceReduceMap,
     DsaDeviceRoutePlan,
     copy_dsa_device_map,
     reduce_dsa_device_map,
 )
-from .dsa_phase import dsa_phase
+from .phase import dsa_phase
 
 
 def _validate_route_tensor(source: torch.Tensor, expected_rows: int, name: str) -> None:

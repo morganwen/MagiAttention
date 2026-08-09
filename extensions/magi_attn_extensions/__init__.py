@@ -12,14 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .fa2_interface_with_sink import (
-    fa2_func_with_sink,
-    fa2_kvpacked_func_with_sink,
-    fa2_qkvpacked_func_with_sink,
-    fa2_varlen_func_with_sink,
-    fa2_varlen_kvpacked_func_with_sink,
-    fa2_varlen_qkvpacked_func_with_sink,
-)
+# Every interface below is optional: importing this root package must not force
+# an unrelated backend dependency on a consumer. In particular, importing the
+# ``magi_attn_extensions.DSA`` subpackage must not require any FA backend.
+try:
+    from .fa2_interface_with_sink import (
+        fa2_func_with_sink,
+        fa2_kvpacked_func_with_sink,
+        fa2_qkvpacked_func_with_sink,
+        fa2_varlen_func_with_sink,
+        fa2_varlen_kvpacked_func_with_sink,
+        fa2_varlen_qkvpacked_func_with_sink,
+    )
+except ImportError:
+    pass
 
 try:
     from .fa4_interface_with_sink import fa4_func_with_sink, fa4_varlen_func_with_sink
@@ -35,7 +41,10 @@ try:
 except ImportError:
     pass
 
-from .dsa_interface import dsa_attn_func
+try:
+    from .dsa_interface import dsa_attn_func
+except ImportError:
+    pass
 
 __all__ = [
     "fa2_func_with_sink",

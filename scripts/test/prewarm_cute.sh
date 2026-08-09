@@ -17,7 +17,7 @@ set -euo pipefail
 
 repo_root="$(git rev-parse --show-toplevel)"
 image="${MAGI_DSA_IMAGE:-magi-dsa-v4:preflight-68c2f15}"
-pack_sha="$(sha256sum "$repo_root/magi_attention/kernel/cutedsl/dsa_pack.py" | cut -c1-16)"
+pack_sha="$(sha256sum "$repo_root/extensions/magi_attn_extensions/DSA/kernels/cutedsl/pack.py" | cut -c1-16)"
 aot_dir="${MAGI_DSA_CUTE_AOT:-$repo_root/.cache/magi-dsa-v4/aot-cutlass-4.5.0-sm103-$pack_sha}"
 run_id="$(date -u +%Y%m%dT%H%M%SZ)-cute-jit"
 artifact_dir="$repo_root/artifacts/release/$run_id"

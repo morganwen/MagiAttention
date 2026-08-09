@@ -20,18 +20,12 @@ from typing import SupportsInt, cast
 import torch
 import torch.distributed as dist
 
-from magi_attention.dsa_config import (
-    DSV4_PRO_INDEXER_SCORE_ROW_ALIGNMENT,
-    MagiDSAConfig,
-)
-from magi_attention.dsa_nvtx import dsa_cudnn_call_range, dsa_nvtx_range
-from magi_attention.functional.dsa_packing import (
-    DsaDeviceIndexerMap,
-    DsaDeviceRoutePlan,
-)
 from magi_attention.utils import nvtx
 
-from .dsa_phase import dsa_phase
+from .config import DSV4_PRO_INDEXER_SCORE_ROW_ALIGNMENT, MagiDSAConfig
+from .nvtx import dsa_cudnn_call_range, dsa_nvtx_range
+from .packing import DsaDeviceIndexerMap, DsaDeviceRoutePlan
+from .phase import dsa_phase
 
 
 def _attention_mode(ratio: int) -> str:
@@ -153,7 +147,7 @@ def _finalize_backend_topk(
                     "an empty backend Top-K cannot fill a non-empty output"
                 )
             return backend_local_ids, torch.zeros_like(seq_lens)
-        from magi_attention.kernel.triton.dsa_indices import finalize_dsa_topk
+        from .kernels.triton.indices import finalize_dsa_topk
 
         return finalize_dsa_topk(
             seq_lens,
@@ -274,9 +268,7 @@ def run_grouped_dsa_indexer(
                         "check the aligned backend max_seqlen_k"
                     )
             with dsa_nvtx_range("indexer::score::logsumexp"):
-                from magi_attention.kernel.triton.dsa_reductions import (
-                    fused_dsa_row_logsumexp,
-                )
+                from .kernels.triton.reductions import fused_dsa_row_logsumexp
 
                 with dsa_nvtx_range("indexer::score::logsumexp::fused_triton"):
                     lse = fused_dsa_row_logsumexp(scores, mapping.seq_lens)
@@ -609,7 +601,7 @@ def _run_dsa_selected_kl_forward(
                     topk_length=topk_length,
                     stream=stream,
                 )["target"]
-    from magi_attention.kernel.triton.dsa_kl import fused_dsa_selected_kl_state
+    from .kernels.triton.kl import fused_dsa_selected_kl_state
 
     with dsa_nvtx_range("selected_kl::loss_and_teacher_fused"):
         loss = fused_dsa_selected_kl_state(
@@ -812,7 +804,7 @@ class _DsaCsaAttentionKlFunction(torch.autograd.Function):
                     ):
                         for backward_input in (*unit_gradients, dkl):
                             backward_input.record_stream(caller_stream)
-                    from magi_attention.kernel.triton.dsa_gradients import (
+                    from .kernels.triton.gradients import (
                         fused_dsa_scale_indexer_gradients,
                     )
 
@@ -830,7 +822,7 @@ class _DsaCsaAttentionKlFunction(torch.autograd.Function):
                             dkl,
                         )
 
-                from magi_attention.functional.dsa_comm import start_dsa_reverse_route
+                from .comm import start_dsa_reverse_route
 
                 with dsa_nvtx_range(
                     "attention::csa::backward_overlap::compressed_ki_reverse_start"
@@ -877,7 +869,7 @@ class _DsaCsaAttentionKlFunction(torch.autograd.Function):
                     sparse_launched = True
 
             if reverse_transfer is not None:
-                from magi_attention.functional.dsa_comm import finish_dsa_reverse_route
+                from .comm import finish_dsa_reverse_route
 
                 with dsa_nvtx_range(
                     "attention::csa::backward_overlap::compressed_ki_reverse_finish"
@@ -1018,9 +1010,7 @@ class _DsaSelectedKlFunction(torch.autograd.Function):
                 grad_loss,
             ):
                 backward_input.record_stream(backward_stream)
-        from magi_attention.kernel.triton.dsa_gradients import (
-            fused_dsa_scale_indexer_gradients,
-        )
+        from .kernels.triton.gradients import fused_dsa_scale_indexer_gradients
 
         grad_q, grad_weights, grad_k = fused_dsa_scale_indexer_gradients(
             saved_grad_q,

@@ -29,18 +29,17 @@ from typing import Any, cast
 
 import torch
 import torch.distributed as dist
-
-from magi_attention.dsa_config import DsaPlanPolicy, MagiDSAConfig
-from magi_attention.dsa_layer import MagiDSALayer
-from magi_attention.dsa_model_adapter import layout_and_project_dsa_input
-from magi_attention.dsa_nvtx import dsa_nvtx_range
-from magi_attention.dsa_runtime_mgr import MagiDSARuntimeMgr
-from magi_attention.dsa_types import (
+from magi_attn_extensions.DSA.comm import unlayout_dsa_query_tensor
+from magi_attn_extensions.DSA.config import DsaPlanPolicy, MagiDSAConfig
+from magi_attn_extensions.DSA.layer import MagiDSALayer
+from magi_attn_extensions.DSA.model_adapter import layout_and_project_dsa_input
+from magi_attn_extensions.DSA.nvtx import dsa_nvtx_range
+from magi_attn_extensions.DSA.runtime import MagiDSARuntimeMgr
+from magi_attn_extensions.DSA.types import (
     MagiDSAForwardResult,
     MagiDSAInput,
     MagiDSAPackedMeta,
 )
-from magi_attention.functional.dsa_comm import unlayout_dsa_query_tensor
 
 _POLICY_BY_PLAN: dict[str, DsaPlanPolicy] = {
     "balanced": "indexer_balanced",
@@ -233,8 +232,9 @@ def _install_indexer_backward_diagnostics(
         raise ValueError("Indexer backward diagnostics require --mode diagnostic")
 
     from cudnn import DSA
-
-    from magi_attention.kernel.triton.dsa_diagnostics import dsa_nonfinite_row_counts
+    from magi_attn_extensions.DSA.kernels.triton.diagnostics import (
+        dsa_nonfinite_row_counts,
+    )
 
     original = DSA.indexer_backward_wrapper
     call_index = 0
@@ -340,7 +340,9 @@ def _queue_backward_pipeline_diagnostic(
     label: str,
     tensor: torch.Tensor,
 ) -> torch.Tensor:
-    from magi_attention.kernel.triton.dsa_diagnostics import dsa_nonfinite_block_stats
+    from magi_attn_extensions.DSA.kernels.triton.diagnostics import (
+        dsa_nonfinite_block_stats,
+    )
 
     observed = tensor if tensor.is_contiguous() else tensor.contiguous()
     counts, block_max_abs = dsa_nonfinite_block_stats(observed)
@@ -381,13 +383,15 @@ def _install_backward_pipeline_diagnostics(
             "Indexer and asynchronous backward diagnostics cannot run together"
         )
 
-    dist_dsa_module = importlib.import_module("magi_attention.functional.dist_dsa")
-    dsa_comm_module = importlib.import_module("magi_attention.functional.dsa_comm")
-    dsa_layer_module = importlib.import_module("magi_attention.dsa_layer")
+    dist_dsa_module = importlib.import_module("magi_attn_extensions.DSA.dist")
+    dsa_comm_module = importlib.import_module("magi_attn_extensions.DSA.comm")
+    dsa_layer_module = importlib.import_module("magi_attn_extensions.DSA.layer")
     dsa_compressor_module = importlib.import_module(
-        "magi_attention.kernel.triton.dsa_compressor"
+        "magi_attn_extensions.DSA.kernels.triton.compressor"
     )
-    dsa_rope_module = importlib.import_module("magi_attention.kernel.triton.dsa_rope")
+    dsa_rope_module = importlib.import_module(
+        "magi_attn_extensions.DSA.kernels.triton.rope"
+    )
     original_copy_with_csr = dist_dsa_module.copy_dsa_tensor_with_csr
     original_reverse_received_route = dsa_comm_module._reverse_received_route
     original_rms_norm = dsa_layer_module._apply_fused_rms_norm

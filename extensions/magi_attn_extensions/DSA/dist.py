@@ -19,16 +19,8 @@ from typing import TYPE_CHECKING
 import torch
 import torch.distributed as dist
 
-from magi_attention.dsa_nvtx import dsa_nvtx_range
-from magi_attention.dsa_types import MagiDSAForwardResult, MagiDSAInput
-from magi_attention.kernel.triton.dsa_indices import build_csa_index_tensors
-
-from .dsa_backend import (
-    dsa_csa_attention_kl,
-    dsa_sparse_attention,
-    run_grouped_dsa_indexer,
-)
-from .dsa_comm import (
+from .backend import dsa_csa_attention_kl, dsa_sparse_attention, run_grouped_dsa_indexer
+from .comm import (
     DsaRouteTransfer,
     copy_dsa_tensor_with_csr,
     finish_dsa_reverse_route,
@@ -36,13 +28,15 @@ from .dsa_comm import (
     start_dsa_reverse_route,
     start_dsa_tensor_route,
 )
-from .dsa_packing import copy_dsa_device_map
+from .kernels.triton.indices import build_csa_index_tensors
+from .nvtx import dsa_nvtx_range
+from .packing import copy_dsa_device_map
+from .types import MagiDSAForwardResult, MagiDSAInput
 
 if TYPE_CHECKING:
-    from magi_attention.dsa_layer import MagiDSALayer
-    from magi_attention.dsa_runtime_mgr import DsaExecutionHandle
-
     from .dsa_packing import DsaDeviceRoutePlan
+    from .layer import MagiDSALayer
+    from .runtime import DsaExecutionHandle
 
 
 class _CsaBackwardProjectionGateFunction(torch.autograd.Function):

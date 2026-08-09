@@ -23,31 +23,20 @@ from typing import TYPE_CHECKING, Iterator
 import torch
 import torch.distributed as dist
 
-from magi_attention.dsa_config import (
+from .comm import layout_dsa_hidden, route_dsa_tensor
+from .config import (
     DsaPlanPolicy,
     DsaSharedLayoutConfig,
     DsaStructuralLayoutConfig,
     MagiDSAConfig,
 )
-from magi_attention.dsa_types import (
-    MagiDSAForwardResult,
-    MagiDSAInput,
-    MagiDSAPackedMeta,
-)
-from magi_attention.functional.dsa_comm import layout_dsa_hidden, route_dsa_tensor
-from magi_attention.functional.dsa_packing import (
-    DsaDeviceRankPlan,
-    DsaDeviceRoutePlan,
-    make_dsa_device_rank_plan,
-)
-from magi_attention.meta.collection.dsa_meta import DsaExecutionPlan
-from magi_attention.meta.solver.dsa_solver import (
-    build_dsa_execution_plan,
-    validate_dsa_execution_plan,
-)
+from .meta import DsaExecutionPlan
+from .packing import DsaDeviceRankPlan, DsaDeviceRoutePlan, make_dsa_device_rank_plan
+from .solver import build_dsa_execution_plan, validate_dsa_execution_plan
+from .types import MagiDSAForwardResult, MagiDSAInput, MagiDSAPackedMeta
 
 if TYPE_CHECKING:
-    from magi_attention.dsa_layer import MagiDSALayer
+    from .layer import MagiDSALayer
 
 
 @dataclass(frozen=True)
@@ -512,8 +501,8 @@ class MagiDSARuntimeMgr:
         self._validate_warm_handle(dsa_input, handle)
         if layer.config != self.config:
             raise ValueError("MagiDSALayer config does not match its runtime")
-        from magi_attention.functional.dist_dsa import dist_dsa
-        from magi_attention.functional.dsa_phase import dsa_phase
+        from .dist import dist_dsa
+        from .phase import dsa_phase
 
         with dsa_phase("forward"):
             result = dist_dsa(layer, dsa_input, handle, self.cp_group)

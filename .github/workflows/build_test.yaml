@@ -66,6 +66,9 @@ jobs:
           filters: |
             MagiAttention:
               - 'magi_attention/**'
+              - 'extensions/**'
+              - 'benchmarks/dsa_v4/**'
+              - 'scripts/**'
       - name: print filter results
         run: |
           echo "is MagiAttention modified: ${{ steps.filter.outputs.MagiAttention }}"
@@ -131,10 +134,16 @@ jobs:
       - name: install MagiAttention
         run: |
           MAGI_ATTENTION_PREBUILD_LEVEL=ci pip install -e . --no-build-isolation -vvv
+      # Magi-DSA lives in the separate magi_attn_extensions distribution, so the
+      # extension has to be installed too or ./extensions/tests fails at collection.
+      - name: install MagiAttention extensions
+        run: |
+          pip install -e ./extensions --no-build-isolation -vvv
       - name: verify MagiAttention import
         run: |
           cd /github/home
           python -c "import magi_attention; print('Pip Installation and Import Success')"
+          python -c "from magi_attn_extensions.DSA import MagiDSALayer; print('Extension Installation and Import Success')"
       # ONLY clean the dist folder to ensure we install the correct newly-built wheel.
       # We KEEP the 'build/' directory to reuse the compilation cache from the previous 'pip install -e' step.
       - name: build MagiAttention wheel
@@ -149,9 +158,14 @@ jobs:
         run: |
           cd /github/home
           python -c "import magi_attention; print('Wheel Installation and Import Success')"
+      # ./extensions/tests carries the Magi-DSA suite after the extension migration,
+      # so it has to be collected and counted toward coverage. The two upstream
+      # FA/dsa_interface test modules stay excluded because they need einops and the
+      # flash_attn wheels, which this runner does not install -- exactly as before
+      # the migration, when ./extensions/tests was not collected at all.
       - name: Test and Generate coverage report
         run: |
-          MAGI_ATTENTION_TEST_PRINT_NO_MISMATCH=0 MAGI_ATTENTION_TEST_BACKEND="*SDPA,*FFA" coverage run --source magi_attention -m pytest --skip-slow --import-mode=append -qsv ./tests
+          MAGI_ATTENTION_TEST_PRINT_NO_MISMATCH=0 MAGI_ATTENTION_TEST_BACKEND="*SDPA,*FFA" coverage run --source magi_attention,extensions/magi_attn_extensions -m pytest --skip-slow --import-mode=append -qsv ./tests ./extensions/tests --ignore=extensions/tests/test_fa_interface_with_sink.py --ignore=extensions/tests/test_dsa_interface.py
           coverage combine
           coverage xml -i
         env:

@@ -42,8 +42,12 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 [run]
-# Specify the package/directory for collecting coverage data
-source = magi_attention
+# Specify the package/directory for collecting coverage data.
+# Magi-DSA ships in the separate magi_attn_extensions distribution, whose source
+# stays in the repo tree under an editable install.
+source =
+    magi_attention
+    extensions/magi_attn_extensions
 # Enable parallel mode
 parallel = True
 # Specify concurrency type

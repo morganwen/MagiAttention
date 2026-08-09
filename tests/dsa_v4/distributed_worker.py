@@ -69,33 +69,35 @@ _RANK_LOCAL_CACHE_PATHS = _configure_rank_local_caches()
 import torch  # noqa: E402
 import torch.distributed as dist  # noqa: E402
 
-from magi_attention.dsa_config import (  # noqa: E402
+from magi_attn_extensions.DSA.config import (  # noqa: E402
     DsaPlanPolicy,
     DsaRatio,
     DsaSharedLayoutConfig,
     DsaStructuralLayoutConfig,
     MagiDSAConfig,
 )
-from magi_attention.dsa_layer import MagiDSALayer  # noqa: E402
-from magi_attention.dsa_model_adapter import layout_and_project_dsa_input  # noqa: E402
-from magi_attention.dsa_nvtx import dsa_nvtx_range  # noqa: E402
-from magi_attention.dsa_pro_runtime_mgr import MagiDSAProRuntimeMgr  # noqa: E402
-from magi_attention.dsa_runtime_mgr import (  # noqa: E402
+from magi_attn_extensions.DSA.layer import MagiDSALayer  # noqa: E402
+from magi_attn_extensions.DSA.model_adapter import (  # noqa: E402
+    layout_and_project_dsa_input,
+)
+from magi_attn_extensions.DSA.nvtx import dsa_nvtx_range  # noqa: E402
+from magi_attn_extensions.DSA.pro_runtime import MagiDSAProRuntimeMgr  # noqa: E402
+from magi_attn_extensions.DSA.runtime import (  # noqa: E402
     DsaExecutionHandle,
     MagiDSARuntimeMgr,
 )
-from magi_attention.dsa_types import (  # noqa: E402
+from magi_attn_extensions.DSA.types import (  # noqa: E402
     MagiDSAForwardResult,
     MagiDSAInput,
     MagiDSAPackedMeta,
 )
-from magi_attention.functional.dsa_comm import (  # noqa: E402
+from magi_attn_extensions.DSA.comm import (  # noqa: E402
     finish_dsa_tensor_route,
     start_dsa_tensor_route,
     unlayout_dsa_query_tensor,
 )
-from magi_attention.functional.dsa_phase import dsa_phase  # noqa: E402
-from magi_attention.functional.dsa_reference import (  # noqa: E402
+from magi_attn_extensions.DSA.phase import dsa_phase  # noqa: E402
+from magi_attn_extensions.DSA.reference import (  # noqa: E402
     assert_backend_native_topk_outputs_close,
     dsa_reference,
     validate_backend_native_topk,
@@ -1584,10 +1586,7 @@ def _reference_csa_index_scores(
 
     if len(cu_seqlens) < 2 or layer.indexer is None:
         raise ValueError("the raw-score reference requires a packed CSA input")
-    from magi_attention.functional.dsa_reference import (
-        _compress_global,
-        dsa_position_ids,
-    )
+    from magi_attn_extensions.DSA.reference import _compress_global, dsa_position_ids
 
     x, qr = inputs[:2]
     positions = dsa_position_ids(cu_seqlens, device=x.device)
