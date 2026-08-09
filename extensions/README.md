@@ -2,6 +2,16 @@
 
 Extensions to provide supplementary utilities based on MagiAttention.
 
+Two things in this distribution are named "DSA" and they are not the same:
+
+* **`magi_attn_extensions.dsa_attn_func`** — the low-level Top-K sparse-attention
+  wrapper documented under [DSA Interface](#dsa-interface-) below.
+* **`magi_attn_extensions.DSA`** — Magi-DSA, the full sparse-attention extension
+  with its own models, plans, runtime, backends and kernels. See
+  [`magi_attn_extensions/DSA/README.md`](magi_attn_extensions/DSA/README.md) for
+  its API, its dependency boundary against MagiAttention Core, and how to run
+  its test suite under `tests/dsa_v4/`.
+
 
 ## Installation ⚙️
 
