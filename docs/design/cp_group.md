@@ -5,8 +5,8 @@
 > 本文研究多个 DP replica/CP group 之间的样本与 GPU 容量分配，不在当前单机
 > 8×B300、`world_size=cp_size=8` 的 DeepSeek-V4-Pro release 范围内，也不改变 CP group 内
 > `structural_balanced` Query layout 或 DSA 数学。当前 Pro 合同见
-> [`magi_dsa_v4_design.md`](./magi_dsa_v4_design.md) 和
-> [`README_dsv4_cp_dispatch_structural_balancing.md`](./README_dsv4_cp_dispatch_structural_balancing.md)。
+> [`magi_dsa_v4_design.md`](../../extensions/magi_attn_extensions/DSA/docs/design.md) 和
+> [`README_dsv4_cp_dispatch_structural_balancing.md`](../../extensions/magi_attn_extensions/DSA/docs/structural_balancing.md)。
 
 ## 1. 问题定义
 系统包含 $$N$$ 张 GPU，其中：

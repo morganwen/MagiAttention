@@ -816,7 +816,7 @@ common_docker_args=(
     --volume "$aot_dir:/dsa-pack-aot:ro"
     --volume "$artifact_dir:/profile-artifact"
     --volume "$cudnn_cache_dir:/cudnn-dsa-cache"
-    --volume "$repo_root/scripts/profile:/workspace/Magi-DSA/scripts/profile:ro"
+    --volume "$repo_root/scripts/profile:/workspace/MagiAttention/scripts/profile:ro"
     --workdir /profile-artifact
 )
 
@@ -843,7 +843,7 @@ if ((skip_smoke == 0)); then
         --standalone \
         --nnodes=1 \
         --nproc-per-node=8 \
-        /workspace/Magi-DSA/benchmarks/dsa_v4/profile_5step.py \
+        /workspace/MagiAttention/benchmarks/dsa_v4/profile_5step.py \
         --mode smoke \
         --artifact-dir /profile-artifact/smoke \
         --seed 0 \
@@ -866,7 +866,7 @@ for plan in "${profile_plan_order[@]}"; do
         "${common_docker_args[@]}" \
         --entrypoint bash \
         "$image" \
-        /workspace/Magi-DSA/scripts/profile/run_plan.sh \
+        /workspace/MagiAttention/scripts/profile/run_plan.sh \
         --plan "$plan" \
         --artifact-dir "/profile-artifact/$plan" \
         --world-size 8 \

@@ -114,6 +114,8 @@ from scripts.profile.summarize_pro_pair import (
     validate_pro_pair_sendrecv,
 )
 
+from .conftest import find_repo_root
+
 
 def _small_config(ratio: DsaRatio) -> MagiDSAConfig:
     return MagiDSAConfig(
@@ -2174,9 +2176,9 @@ def test_pro_pair_reports_every_indexer_d2d_wrapper_separately() -> None:
 
 
 def test_pro_pair_summary_hard_counts_selected_recompute_cudnn_calls() -> None:
-    source = (
-        Path(__file__).resolve().parents[2] / "scripts/profile/summarize_pro_pair.py"
-    ).read_text(encoding="utf-8")
+    source = (find_repo_root() / "scripts/profile/summarize_pro_pair.py").read_text(
+        encoding="utf-8"
+    )
     assert '"magi_dsa::CUDNN_CALL::selected_attention_recompute": invocations' in source
     assert '"magi_dsa::CUDNN_CALL::selected_indexer_recompute": invocations' in source
 
@@ -3767,7 +3769,7 @@ def test_nsys_main_writes_global_and_per_rank_memcpy_attribution(
 
 
 def test_pro_cudnn_preflight_freezes_full_indexer_attention_and_sentinel_abi() -> None:
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = find_repo_root()
     source = (repo_root / "scripts/test/preflight_cudnn_dsa.py").read_text(
         encoding="utf-8"
     )
@@ -3793,7 +3795,7 @@ def test_pro_cudnn_preflight_freezes_full_indexer_attention_and_sentinel_abi() -
 
 
 def test_correctness_and_profile_entrypoints_require_the_full_image_contract() -> None:
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = find_repo_root()
     obsolete_cudnn_patch_markers = (
         "cudnn_frontend_dense_indexer_" "no_host_sync.patch",
         "9428e144c5c44d09268f6f6281e5f8291" "b0a837d2c11d200ff32728b067b9b9a",
@@ -3851,7 +3853,7 @@ def test_correctness_and_profile_entrypoints_require_the_full_image_contract() -
 
 
 def test_flashmla_patch_chain_checks_source_provenance_and_pro_parent() -> None:
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = find_repo_root()
     source = (repo_root / "docker/Dockerfile.dsa-v4").read_text(encoding="utf-8")
     compact = " ".join(source.replace("\\\n", " ").split())
     assert (
@@ -3873,7 +3875,7 @@ def test_flashmla_patch_chain_checks_source_provenance_and_pro_parent() -> None:
 def test_pro_pair_entrypoint_requires_same_capture_memcpy_and_summary_artifacts() -> (
     None
 ):
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = find_repo_root()
     source = (repo_root / "scripts/profile/run_5step.sh").read_text(encoding="utf-8")
 
     required_memcpy_artifacts = (
@@ -3912,7 +3914,7 @@ def test_pro_pair_entrypoint_requires_same_capture_memcpy_and_summary_artifacts(
 def test_pro_pair_records_selected_recompute_cudnn_memcpy_scopes_without_capture_io() -> (
     None
 ):
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = find_repo_root()
     entrypoint_source = (repo_root / "scripts/profile/run_5step.sh").read_text(
         encoding="utf-8"
     )

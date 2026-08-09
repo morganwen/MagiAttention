@@ -120,8 +120,17 @@ def _internal_int(value: object, field: str) -> int:
 
 
 def _installed_wheel_metadata() -> dict[str, str] | None:
+    """Record where Core and Extension were actually imported from.
+
+    Magi-DSA now ships in the magi_attn_extensions distribution, so checking the
+    Core wheel alone would no longer prove that the DSA code under test came
+    from an installed wheel rather than a mounted source tree.
+    """
+
     if os.environ.get("MAGI_DSA_REQUIRE_INSTALLED_WHEEL") != "1":
         return None
+    import magi_attn_extensions.DSA as magi_dsa
+
     import magi_attention
 
     expected_revision = os.environ.get("MAGI_DSA_EXPECTED_REVISION", "")
@@ -130,19 +139,26 @@ def _installed_wheel_metadata() -> dict[str, str] | None:
     package_path = str(Path(magi_attention.__file__).resolve())
     package_version = package_metadata.version("magi-attention")
     expected_version = f"1.1.1+g{expected_revision}"
-    installation_parts = set(Path(package_path).parts)
-    if not installation_parts.intersection({"site-packages", "dist-packages"}):
-        raise RuntimeError(
-            "Magi-DSA was not imported from a Python installation directory: "
-            f"{package_path}"
-        )
+    extension_path = str(Path(magi_dsa.__file__).resolve())
+    extension_version = package_metadata.version("magi_attn_extensions")
+    for label, path in (
+        ("magi_attention", package_path),
+        ("magi_attn_extensions.DSA", extension_path),
+    ):
+        if not set(Path(path).parts).intersection({"site-packages", "dist-packages"}):
+            raise RuntimeError(
+                f"{label} was not imported from a Python installation directory: {path}"
+            )
     if package_version != expected_version:
         raise RuntimeError(
-            f"installed Magi-DSA version is {package_version}, expected {expected_version}"
+            f"installed magi_attention version is {package_version}, "
+            f"expected {expected_version}"
         )
     return {
         "package_path": package_path,
         "package_version": package_version,
+        "extension_path": extension_path,
+        "extension_version": extension_version,
         "source_revision": expected_revision,
     }
 

@@ -2,7 +2,7 @@
 
 > **历史文档（已被架构层面取代）：** 本文保留 Q13–Q16、correctness/profile 和旧实现证据。
 > 2026-07-21 起，CSA `ratio=4` 的当前权威架构是
-> [`magi_dsa_v4_design.md`](./magi_dsa_v4_design.md)；若两者冲突，以新文档为准，禁止据本文恢复
+> [`magi_dsa_v4_design.md`](../../extensions/magi_attn_extensions/DSA/docs/design.md)；若两者冲突，以新文档为准，禁止据本文恢复
 > Query worker、`INDEXER_QW`、Top-K restore 或 owner-stable layout。
 > 2026-07-22 曾取消 CSA dual-LSE/四输出 backport并采用 full-domain Indexer KL；该裁决已于
 > 2026-07-23 被用户明确推翻。当前实现以冻结 924 为基线应用已审核 dual-LSE 回移：

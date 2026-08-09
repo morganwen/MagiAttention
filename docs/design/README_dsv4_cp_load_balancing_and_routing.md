@@ -3,8 +3,8 @@
 > 状态：当前实现的解释性总览与性能证据，不是第三份权威设计。
 >
 > 架构、tensor/index ABI、collective、backward 和 backend 合同以
-> [`magi_dsa_v4_design.md`](magi_dsa_v4_design.md) 为准；结构性 cost 与 dispatch
-> 以 [`README_dsv4_cp_dispatch_structural_balancing.md`](README_dsv4_cp_dispatch_structural_balancing.md)
+> [`magi_dsa_v4_design.md`](../../extensions/magi_attn_extensions/DSA/docs/design.md) 为准；结构性 cost 与 dispatch
+> 以 [`README_dsv4_cp_dispatch_structural_balancing.md`](../../extensions/magi_attn_extensions/DSA/docs/structural_balancing.md)
 > 为准。本文若与二者冲突，以这两份权威文档为准。
 >
 > 本文描述 clean revision

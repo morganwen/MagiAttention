@@ -65,8 +65,8 @@ common=(
     --rm
     --ipc=host
     --stop-timeout=5
-    --volume "$repo_root:/workspace/Magi-DSA:ro"
-    --workdir /workspace/Magi-DSA
+    --volume "$repo_root:/workspace/MagiAttention:ro"
+    --workdir /workspace/MagiAttention
 )
 
 phase "environment and eight-GPU visibility"

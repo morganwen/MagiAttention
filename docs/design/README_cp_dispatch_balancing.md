@@ -7,8 +7,8 @@
 > DeepSeek-V4-Pro 的 `structural_balanced` 共享 Query layout 取代，不得用来恢复当前 policy。
 >
 > 当前 Pro 的唯一事实源为
-> [`magi_dsa_v4_design.md`](./magi_dsa_v4_design.md) 与
-> [`README_dsv4_cp_dispatch_structural_balancing.md`](./README_dsv4_cp_dispatch_structural_balancing.md)。
+> [`magi_dsa_v4_design.md`](../../extensions/magi_attn_extensions/DSA/docs/design.md) 与
+> [`README_dsv4_cp_dispatch_structural_balancing.md`](../../extensions/magi_attn_extensions/DSA/docs/structural_balancing.md)。
 > 本文仅保留 `shared_greedy` 决策、CP8 natural correctness、8×B300 profile 和消融数据，
 > 供历史差异与回归审计。
 

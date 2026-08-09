@@ -236,7 +236,7 @@ echo "magi_source_revision=$magi_source_revision" | tee -a "$artifact_dir/COMMAN
 echo "installed_wheel=$installed_wheel" | tee -a "$artifact_dir/COMMAND.txt"
 echo "NCCL_DEBUG=$nccl_debug" | tee -a "$artifact_dir/COMMAND.txt"
 echo "TORCH_DISTRIBUTED_DEBUG=$torch_distributed_debug" | tee -a "$artifact_dir/COMMAND.txt"
-echo "torchrun --standalone --nproc-per-node=$world_size tests/dsa_v4/distributed_worker.py --case $case_name" \
+echo "torchrun --standalone --nproc-per-node=$world_size extensions/tests/dsa_v4/distributed_worker.py --case $case_name" \
     | tee -a "$artifact_dir/COMMAND.txt"
 
 total_deadline_seconds=60
@@ -301,12 +301,12 @@ timeout --signal=TERM --kill-after=5s 60s docker run --rm --entrypoint bash "$im
 
 log_path="$artifact_dir/stdout_stderr.log"
 : >"$log_path"
-worker_path="tests/dsa_v4/distributed_worker.py"
-container_workdir="/workspace/Magi-DSA"
-source_environment=(--env PYTHONPATH=/workspace/Magi-DSA)
+worker_path="extensions/tests/dsa_v4/distributed_worker.py"
+container_workdir="/workspace/MagiAttention"
+source_environment=(--env PYTHONPATH=/workspace/MagiAttention:/workspace/MagiAttention/extensions)
 installed_environment=()
 if ((installed_wheel == 1)); then
-    worker_path="/workspace/Magi-DSA/tests/dsa_v4/distributed_worker.py"
+    worker_path="/workspace/MagiAttention/extensions/tests/dsa_v4/distributed_worker.py"
     container_workdir="/cp2-artifact/workdir"
     source_environment=()
     installed_environment=(
@@ -348,7 +348,7 @@ setsid timeout --signal=TERM --kill-after=5s "${total_deadline_seconds}s" docker
     --volume "$artifact_dir:/cp2-artifact" \
     --volume "$cudnn_cache_dir:/cudnn-dsa-cache" \
     --volume "$rank_cache_dir:/rank-cache" \
-    --volume "$repo_root:/workspace/Magi-DSA:ro" \
+    --volume "$repo_root:/workspace/MagiAttention:ro" \
     --workdir "$container_workdir" \
     "$image" \
     --standalone --nproc-per-node="$world_size" \

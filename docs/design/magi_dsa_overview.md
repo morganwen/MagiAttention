@@ -6,8 +6,8 @@
 > Indexer-cost Query 分配和 Base profile 口径均为历史记录。当前 DeepSeek-V4-Pro 合同是
 > hidden `7168`、H128/D512、Indexer H64/D128/Top-K `1024`、
 > `[1024 compressed + 128 window]` 以及 CSA/HCA 共享的 `structural_balanced` Query layout。
-> 请以 [`magi_dsa_v4_design.md`](./magi_dsa_v4_design.md) 和
-> [`README_dsv4_cp_dispatch_structural_balancing.md`](./README_dsv4_cp_dispatch_structural_balancing.md)
+> 请以 [`magi_dsa_v4_design.md`](../../extensions/magi_attn_extensions/DSA/docs/design.md) 和
+> [`README_dsv4_cp_dispatch_structural_balancing.md`](../../extensions/magi_attn_extensions/DSA/docs/structural_balancing.md)
 > 为准；下文只用于理解历史 Base 实现。
 
 ## 1. 概览

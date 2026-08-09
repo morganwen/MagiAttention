@@ -14,9 +14,11 @@
 
 from pathlib import Path
 
+from .conftest import find_repo_root
+
 
 def _repository_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+    return find_repo_root()
 
 
 def test_preflight_records_the_required_cudnn_indexer_forward_abi() -> None:

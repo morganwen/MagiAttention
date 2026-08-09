@@ -32,7 +32,9 @@ from magi_attn_extensions.DSA.reference import (
     validate_backend_native_topk_pair,
 )
 
-from tests.dsa_v4.distributed_worker import (
+# Relative, not "from tests.dsa_v4...": under extensions/ that absolute path is
+# captured by the repository-root tests package, which is a different suite.
+from .distributed_worker import (
     _compare_natural_snapshots,
     _cp2_backend_config,
     _reference_csa_index_scores,

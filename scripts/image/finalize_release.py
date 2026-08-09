@@ -1203,11 +1203,20 @@ def _validate_correctness(path: Path, revision: str) -> dict[str, Any]:
             raise ValueError(f"rank {rank} installed-wheel revision mismatch")
         if installed.get("package_version") != expected_version:
             raise ValueError(f"rank {rank} installed-wheel version mismatch")
-        package_parts = set(Path(str(installed.get("package_path"))).parts)
-        if not package_parts.intersection({"site-packages", "dist-packages"}):
-            raise ValueError(
-                f"rank {rank} did not import Magi-DSA from a Python installation directory"
-            )
+        if installed.get("extension_version") != _MAGI_ATTN_EXTENSIONS_VERSION:
+            raise ValueError(f"rank {rank} installed-extension version mismatch")
+        # Magi-DSA lives in the extension, so both distributions have to prove
+        # they came from an installation directory rather than a source mount.
+        for field, label in (
+            ("package_path", "magi_attention"),
+            ("extension_path", "magi_attn_extensions.DSA"),
+        ):
+            parts = set(Path(str(installed.get(field))).parts)
+            if not parts.intersection({"site-packages", "dist-packages"}):
+                raise ValueError(
+                    f"rank {rank} did not import {label} from a Python "
+                    "installation directory"
+                )
     structural = _validate_cp8_structural_reports(raw_reports)
     if summary.get("structural_contract") != structural:
         raise ValueError("installed-wheel CP8 report structural evidence differs")
@@ -1283,7 +1292,7 @@ def _validate_cp1(path: Path, revision: str) -> dict[str, Any]:
     expected_command = {
         "case": "cp1-kernel",
         "package_import": "installed-wheel",
-        "pytest": "tests/dsa_v4/test_cp1_kernel.py",
+        "pytest": "extensions/tests/dsa_v4/test_cp1_kernel.py",
         "pytest_import_mode": "importlib",
         "source_mount": "read-only",
         "source_revision": revision,

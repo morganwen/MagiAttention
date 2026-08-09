@@ -158,9 +158,9 @@ if [[ -e "$report_path" || -e "$sqlite_path" || -e "$control_dir/start" ]]; then
 fi
 
 session="magi_dsa_${plan}_$$_$(date -u +%Y%m%dT%H%M%SZ)"
-worker_script="/workspace/Magi-DSA/benchmarks/dsa_v4/profile_5step.py"
+worker_script="/workspace/MagiAttention/benchmarks/dsa_v4/profile_5step.py"
 if [[ "$step_mode" == "attention-suite" || "$step_mode" == "pro-pair" ]]; then
-    worker_script="/workspace/Magi-DSA/benchmarks/dsa_v4/profile_attention_suite.py"
+    worker_script="/workspace/MagiAttention/benchmarks/dsa_v4/profile_attention_suite.py"
 fi
 worker_extra_args=()
 if [[ "$step_mode" == "attention-suite" || "$step_mode" == "pro-pair" ]]; then
@@ -335,7 +335,7 @@ timeout --signal=TERM --kill-after=5s 600s nsys stats \
     "$report_path" \
     >"$artifact_dir/NSYS_STATS.txt" 2>&1
 
-python /workspace/Magi-DSA/scripts/profile/extract_nsys.py \
+python /workspace/MagiAttention/scripts/profile/extract_nsys.py \
     --plan "$plan" \
     --report "$report_path" \
     --sqlite "$sqlite_path" \

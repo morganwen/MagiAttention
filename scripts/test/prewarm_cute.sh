@@ -77,13 +77,13 @@ if ((${#missing_objects[@]} > 0)); then
         --env XDG_CACHE_HOME=/dsa-pack-aot/xdg-cache \
         --env TORCH_HOME=/dsa-pack-aot/torch \
         --env TRITON_CACHE_DIR=/dsa-pack-aot/triton \
-        --env PYTHONPATH=/workspace/Magi-DSA \
+        --env PYTHONPATH=/workspace/MagiAttention:/workspace/MagiAttention/extensions \
         --env PYTHONDONTWRITEBYTECODE=1 \
         --volume "$aot_dir:/dsa-pack-aot" \
-        --volume "$repo_root:/workspace/Magi-DSA:ro" \
+        --volume "$repo_root:/workspace/MagiAttention:ro" \
         --workdir /dsa-pack-aot \
         "$image" \
-        /workspace/Magi-DSA/scripts/test/prewarm_dsa_pack.py \
+        /workspace/MagiAttention/scripts/test/prewarm_dsa_pack.py \
         2>&1 | tee "$artifact_dir/compile.log"
 fi
 
@@ -113,13 +113,13 @@ timeout --signal=TERM --kill-after=5s 300s docker run \
     --env XDG_CACHE_HOME=/dsa-pack-aot/xdg-cache \
     --env TORCH_HOME=/dsa-pack-aot/torch \
     --env TRITON_CACHE_DIR=/dsa-pack-aot/triton \
-    --env PYTHONPATH=/workspace/Magi-DSA \
+    --env PYTHONPATH=/workspace/MagiAttention:/workspace/MagiAttention/extensions \
     --env PYTHONDONTWRITEBYTECODE=1 \
     --volume "$aot_dir:/dsa-pack-aot" \
-    --volume "$repo_root:/workspace/Magi-DSA:ro" \
+    --volume "$repo_root:/workspace/MagiAttention:ro" \
     --workdir /dsa-pack-aot \
     "$image" \
-    /workspace/Magi-DSA/scripts/test/prewarm_dsa_pack.py \
+    /workspace/MagiAttention/scripts/test/prewarm_dsa_pack.py \
     2>&1 | tee "$artifact_dir/validate.log"
 
 {

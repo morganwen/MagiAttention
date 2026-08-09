@@ -1553,13 +1553,13 @@ CuTe row-copy 向量宽度，不进入正式 capture，也不改变 public schem
 
 关键源码：
 
-- `Magi-DSA/magi_attention/meta/solver/dsa_solver.py`
-- `Magi-DSA/magi_attention/functional/dist_dsa.py`
-- `Magi-DSA/magi_attention/functional/dsa_comm.py`
-- `Magi-DSA/magi_attention/functional/dsa_packing.py`
-- `Magi-MSA/magi_attention/meta/solver/msa_solver.py`
-- `Magi-MSA/magi_attention/functional/dist_msa.py`
-- `Magi-MSA/magi_attention/functional/msa_comm.py`
+- `extensions/magi_attn_extensions/DSA/solver.py`
+- `extensions/magi_attn_extensions/DSA/dist.py`
+- `extensions/magi_attn_extensions/DSA/comm.py`
+- `extensions/magi_attn_extensions/DSA/packing.py`
+- `magi_attn_extensions/MSA/solver.py`（mentor 仓库）
+- `magi_attn_extensions/MSA/dist.py`（mentor 仓库）
+- `magi_attn_extensions/MSA/comm.py`（mentor 仓库）
 - `Megatron-LM/megatron/core/transformer/experimental_attention_variant/csa.py`
 - `Megatron-LM/megatron/core/transformer/experimental_attention_variant/dsa_kernels.py`
 

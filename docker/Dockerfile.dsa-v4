@@ -82,11 +82,11 @@ RUN test "$(printf '%s' "${MAGI_ATTENTION_REVISION}" | wc -c)" -eq 40 && \
     python3 -m pip install --no-cache-dir --no-deps \
         "versioningit==${VERSIONINGIT_VERSION}"
 
-COPY . /workspace/Magi-DSA
+COPY . /workspace/MagiAttention
 
 WORKDIR /tmp/Magi-DSA-build
 
-RUN cp -a /workspace/Magi-DSA/. . && \
+RUN cp -a /workspace/MagiAttention/. . && \
     sed -i \
         "s/default-version = \"1.1.1\"/default-version = \"1.1.1+g${MAGI_ATTENTION_REVISION}\"/" \
         pyproject.toml && \
@@ -142,7 +142,7 @@ RUN python3 -m pip install --no-cache-dir \
 
 COPY --from=flashmla-builder /opt/wheels /opt/flashmla-wheels
 COPY --from=magi-builder /opt/magi-wheels /opt/magi-wheels
-COPY --from=magi-builder /workspace/Magi-DSA /workspace/Magi-DSA
+COPY --from=magi-builder /workspace/MagiAttention /workspace/MagiAttention
 
 # Core and Extension are two distributions and both belong in the release image.
 RUN python3 -m pip install --no-cache-dir --no-deps \

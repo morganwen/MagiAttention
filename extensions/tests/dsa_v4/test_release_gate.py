@@ -50,6 +50,8 @@ from scripts.image.finalize_release import (
     _write_release_summary_and_manifest,
 )
 
+from .conftest import find_repo_root
+
 _REVISION = "1" * 40
 
 
@@ -451,6 +453,11 @@ def _installed_cp8_artifact(
                     "magi_attention/__init__.py"
                 ),
                 "package_version": f"1.1.1+g{_REVISION}",
+                "extension_path": (
+                    "/usr/local/lib/python3.12/site-packages/"
+                    "magi_attn_extensions/DSA/__init__.py"
+                ),
+                "extension_version": "1.1.0",
                 "source_revision": _REVISION,
             },
             "rank": rank,
@@ -471,7 +478,7 @@ def _cp1_artifact(root: Path) -> None:
         "case": "cp1-kernel",
         "image": "magi-dsa:test",
         "package_import": "installed-wheel",
-        "pytest": "tests/dsa_v4/test_cp1_kernel.py",
+        "pytest": "extensions/tests/dsa_v4/test_cp1_kernel.py",
         "pytest_basetemp": "/magi-cache/pytest-tmp/run",
         "pytest_import_mode": "importlib",
         "pytest_rootdir": "/magi-cache/pytest-root",
@@ -784,12 +791,12 @@ def test_release_gate_requires_exact_official_image_labels() -> None:
 
 
 def test_cp1_has_a_separate_artifact_entrypoint() -> None:
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = find_repo_root()
     cp1 = (repo_root / "scripts/test/run_cp1.sh").read_text(encoding="utf-8")
     multigpu = (repo_root / "scripts/test/run_multigpu.sh").read_text(encoding="utf-8")
     for marker in (
         "case=cp1-kernel",
-        "tests/dsa_v4/test_cp1_kernel.py",
+        "extensions/tests/dsa_v4/test_cp1_kernel.py",
         "pytest_import_mode=importlib",
         "--import-mode=importlib",
         "PYTEST.xml",
@@ -809,7 +816,7 @@ def test_cp1_has_a_separate_artifact_entrypoint() -> None:
 
 
 def test_release_orchestrator_builds_once_and_reuses_one_image_id() -> None:
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = find_repo_root()
     source = (repo_root / "scripts/image/run_release.sh").read_text(encoding="utf-8")
 
     assert source.count('bash "$repo_root/scripts/image/build.sh"') == 1
@@ -867,7 +874,7 @@ def test_release_summary_stdout_is_covered_by_final_manifest(tmp_path: Path) -> 
 
 
 def test_release_report_uses_q16_backend_native_contract() -> None:
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = find_repo_root()
     source = (repo_root / "scripts/image/finalize_release.py").read_text(
         encoding="utf-8"
     )

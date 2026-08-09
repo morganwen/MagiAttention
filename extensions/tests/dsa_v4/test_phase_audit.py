@@ -28,6 +28,8 @@ from scripts.test.summarize_distributed import (
     summarize,
 )
 
+from .conftest import find_repo_root
+
 
 def _record(prefix: str, rank: int, event: str, name: str | None = None) -> str:
     payload: dict[str, object] = {"event": event, "rank": rank}
@@ -68,7 +70,7 @@ def _run_phase_audit_cli(
     log = tmp_path / "phase.log"
     output = tmp_path / "audit.json"
     log.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = find_repo_root()
     command = [
         sys.executable,
         str(repo_root / "scripts/test/audit_dsa_phases.py"),
@@ -183,7 +185,7 @@ def test_phase_audit_cli_rejects_fabricated_failures(
 
 
 def test_multigpu_runner_propagates_phase_audit_failure() -> None:
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = find_repo_root()
     source = (repo_root / "scripts/test/run_multigpu.sh").read_text(encoding="utf-8")
 
     assert "phase_audit_status=0" in source

@@ -34,8 +34,10 @@ while (($# > 0)); do
 done
 
 repo_root="$(git rev-parse --show-toplevel)"
-if [[ "$repo_root" != "/home/scratch.wewen_gpu/Magi-DSA" ]]; then
-    echo "CP1 artifact generation is restricted to /home/scratch.wewen_gpu/Magi-DSA" >&2
+# Magi-DSA ships as a second distribution, so a valid CP1 checkout has to carry
+# both. This replaces the old hardcoded host path with a structural check.
+if [[ ! -f "$repo_root/pyproject.toml" || ! -f "$repo_root/extensions/setup.py" ]]; then
+    echo "CP1 artifact generation requires a checkout with both the Core and the Extension distribution: $repo_root" >&2
     exit 1
 fi
 
@@ -145,7 +147,7 @@ image_id="$(docker image inspect "$image" --format '{{.Id}}')"
     echo "image=$image"
     echo "source_revision=$source_revision"
     echo "timeout_seconds=1800"
-    echo "pytest=tests/dsa_v4/test_cp1_kernel.py"
+    echo "pytest=extensions/tests/dsa_v4/test_cp1_kernel.py"
     echo "packaging_version=$packaging_version"
     echo "pytest_version=$pytest_version"
     echo "pytest_import_mode=importlib"
@@ -228,13 +230,13 @@ timeout --signal=TERM --kill-after=5s 1800s docker run --rm \
     --env CUDA_VISIBLE_DEVICES=0 \
     --env PYTEST_ADDOPTS=-p\ no:cacheprovider \
     --volume "$artifact_dir:/cp1-artifact" \
-    --volume "$repo_root:/workspace:ro" \
+    --volume "$repo_root:/workspace/MagiAttention:ro" \
     "$image" -m pytest \
     --import-mode=importlib \
     --rootdir=/magi-cache/pytest-root \
     --basetemp="/magi-cache/pytest-tmp/$run_id" \
     --junitxml=/cp1-artifact/PYTEST.xml \
-    -q /workspace/tests/dsa_v4/test_cp1_kernel.py \
+    -q /workspace/MagiAttention/extensions/tests/dsa_v4/test_cp1_kernel.py \
     >"$artifact_dir/STDOUT.txt" 2>"$artifact_dir/STDERR.txt"
 pytest_status=$?
 set -e
