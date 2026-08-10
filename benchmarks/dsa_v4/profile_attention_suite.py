@@ -375,7 +375,7 @@ def _calc_attention_case(
     if case.pro_runtime is None:
         if case.pro_bundle is not None:
             raise ValueError("a Pro bundle requires its owning Pro runtime")
-        return case.runtime.calc_dsa(case.layer, dsa_input, case.handle)
+        return case.runtime.calc_dsa(case.layer.projections(), dsa_input, case.handle)
     if case.pro_bundle is None or case.layer.layer_id is None:
         raise ValueError("a Pro profile case requires a bound layer and bundle")
     return case.pro_runtime.calc_layer(

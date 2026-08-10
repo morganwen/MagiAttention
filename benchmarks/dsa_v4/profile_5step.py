@@ -974,7 +974,7 @@ def _run_forward_backward_step(
     )
     with torch.cuda.nvtx.range("magi_dsa::forward"):
         with torch.cuda.nvtx.range(f"{plan}/rank_{rank}/O"):
-            result = runtime.calc_dsa(layer, dsa_input, handle)
+            result = runtime.calc_dsa(layer.projections(), dsa_input, handle)
     if result.output.shape != input_boundary.dout.shape:
         raise ValueError("profile dout shape does not match the DSA output")
     if result.kl.ndim != 0 or result.kl.dtype != input_boundary.dkl.dtype:
@@ -1085,7 +1085,7 @@ def _prewarm(
                         handle,
                         retain_input_gradients=False,
                     )
-                    result = runtime.calc_dsa(layer, dsa_input, handle)
+                    result = runtime.calc_dsa(layer.projections(), dsa_input, handle)
             elif step_mode == "forward-backward":
                 _clear_training_gradients(layer, source, input_boundary)
                 result, dsa_input = _run_forward_backward_step(
@@ -1421,7 +1421,7 @@ def _run_smoke(
             retain_input_gradients=False,
         )
         sequential_local = sequential_runtime.calc_dsa(
-            layer, sequential_input, sequential_handle
+            layer.projections(), sequential_input, sequential_handle
         )
         balanced_input = _make_plan_input(
             source,
@@ -1430,7 +1430,7 @@ def _run_smoke(
             retain_input_gradients=False,
         )
         balanced_local = balanced_runtime.calc_dsa(
-            layer, balanced_input, balanced_handle
+            layer.projections(), balanced_input, balanced_handle
         )
         sequential = _source_order_result(sequential_local, sequential_handle)
         balanced = _source_order_result(balanced_local, balanced_handle)
@@ -1472,7 +1472,7 @@ def _run_with_raw_scores(
 
     DSA.indexer_forward_wrapper = capture
     try:
-        result = runtime.calc_dsa(layer, dsa_input, handle)
+        result = runtime.calc_dsa(layer.projections(), dsa_input, handle)
     finally:
         DSA.indexer_forward_wrapper = original
     if len(captured) != 1:
@@ -2137,7 +2137,7 @@ def _run_profile(
                         )
                         torch.cuda.nvtx.range_push(f"{plan}/rank_{rank}/O")
                         try:
-                            last_result = runtime.calc_dsa(layer, last_input, handle)
+                            last_result = runtime.calc_dsa(layer.projections(), last_input, handle)
                         finally:
                             torch.cuda.nvtx.range_pop()
                 finally:
@@ -2261,7 +2261,7 @@ def _run_profile(
                 retain_input_gradients=False,
             )
             shadow_result_local = shadow_runtime.calc_dsa(
-                layer, shadow_input, shadow_handle
+                layer.projections(), shadow_input, shadow_handle
             )
             torch.cuda.synchronize()
         gradient_metrics = None
