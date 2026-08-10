@@ -277,10 +277,11 @@ def test_backward_launches_every_reverse_route_in_schedule_order(
 ) -> None:
     """The backward order is program order, so it is asserted directly.
 
-    Both modes launch WINDOW_KV and COMPRESSED_KV together off the KV-bank
-    split, wait COMPRESSED_KV to run the Main Compressor backward, and only
-    then launch the terminal OVERLAP_X reverse. COMPRESSED_KI does not appear
-    here because CSA starts and waits it inside the combined attention node.
+    COMPRESSED_KV goes out first because it gates the Main Compressor backward.
+    OVERLAP_X follows once that backward has produced the support gradient, and
+    WINDOW_KV goes last since it is waited last and would otherwise take
+    bandwidth from the critical route. COMPRESSED_KI does not appear here
+    because CSA starts and waits it inside the combined attention node.
     """
 
     torch.manual_seed(41 + ratio)
@@ -343,14 +344,29 @@ def test_backward_launches_every_reverse_route_in_schedule_order(
     torch.cuda.synchronize()
 
     routes = [event for event in events if ":" in event]
-    assert routes == [
-        "start:WINDOW_KV",
-        "start:COMPRESSED_KV",
-        "finish:COMPRESSED_KV",
-        "start:OVERLAP_X",
-        "finish:WINDOW_KV",
-        "finish:OVERLAP_X",
-    ]
+    if ratio == 4:
+        # CSA has the Indexer projection backward to put between the two
+        # launches, so WINDOW_KV waits until that work is about to run.
+        expected = [
+            "start:COMPRESSED_KV",
+            "finish:COMPRESSED_KV",
+            "start:OVERLAP_X",
+            "start:WINDOW_KV",
+            "finish:WINDOW_KV",
+            "finish:OVERLAP_X",
+        ]
+    else:
+        # HCA has nothing to run before the COMPRESSED_KV wait, so holding
+        # WINDOW_KV back would buy nothing and it goes out immediately after.
+        expected = [
+            "start:COMPRESSED_KV",
+            "start:WINDOW_KV",
+            "finish:COMPRESSED_KV",
+            "start:OVERLAP_X",
+            "finish:WINDOW_KV",
+            "finish:OVERLAP_X",
+        ]
+    assert routes == expected
 
     # Every source that fed a route has to come back out of its reverse.
     for name, tensor in (
@@ -365,7 +381,7 @@ def test_backward_launches_every_reverse_route_in_schedule_order(
     assert all(parameter.grad is not None for parameter in layer.parameters())
 
     # The Main Compressor backward is the only route-independent work HCA owns,
-    # so it has to sit under the two routes launched off the bank split.
+    # so it has to sit under the routes launched off the bank split.
     assert events.index("start:COMPRESSED_KV") < events.index(
         "main_compressor_backward"
     )

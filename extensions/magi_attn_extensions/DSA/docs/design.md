@@ -183,13 +183,14 @@ CSA 还要多产出一份给 Indexer 用的压缩表示，规矩完全一样，�
 
 - 先做输出的逆旋转位置编码，再做注意力和 KL 的反向。COMPRESSED_KI 的反向路由在这一步
   内部发起，被稀疏注意力的反向盖住。
-- 拿到 KV 库的梯度，切成窗口部分和压缩部分，同时发起 WINDOW_KV 和 COMPRESSED_KV 的
-  反向路由。
-- 跑 Indexer 压缩器的反向，盖住上面这两条。
-- 等 COMPRESSED_KV 回来，跑主压缩器的反向，把梯度散射回 OVERLAP_X 的行上，发起
-  OVERLAP_X 的反向路由。
-- 最后跑 Indexer 投影的反向。这是唯一还剩下的、不依赖任何路由的计算，用它盖住
-  OVERLAP_X。
+- 拿到 KV 库的梯度，切成窗口部分和压缩部分，先发起 COMPRESSED_KV 的反向路由。它在
+  关键路径上，主压缩器的反向要等它，所以让它先走、先拿满带宽。
+- 跑 Indexer 压缩器的反向，盖住 COMPRESSED_KV。
+- 等 COMPRESSED_KV 回来，跑主压缩器的反向，把梯度散射回 OVERLAP_X 的行上，然后发起
+  OVERLAP_X 和 WINDOW_KV 的反向路由。窗口那条最后才等，所以放到这里发，不跟关键
+  路径抢带宽。
+- 最后跑 Indexer 投影的反向。这是唯一还剩下的、不依赖任何路由的计算，用它同时盖住
+  上面两条。
 - 收尾时等 WINDOW_KV 和 OVERLAP_X。
 
 HCA 没有 Indexer，也就没有任何与路由无关的计算可用。它的三条路由中，COMPRESSED_KV

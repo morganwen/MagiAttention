@@ -575,12 +575,13 @@ class _CsaScheduler(_DsaScheduler):
             ) = self.attention_node.backward((grad_attention_output, grad_kl, None))
 
         grad_window_kv, grad_compressed_kv = self._split_bank_gradient(grad_kv_bank)
+        # COMPRESSED_KV goes out first because it is the one on the critical
+        # path: nothing downstream can move until the Main Compressor has its
+        # gradient. WINDOW_KV is waited last, so it is launched last and costs
+        # the critical route no bandwidth.
         with dsa_nvtx_range(
-            "attention::csa::backward_overlap::support_reverse_launch"
+            "attention::csa::backward_overlap::compressed_kv_reverse_launch"
         ):
-            window_reverse = start_dsa_reverse_route(
-                grad_window_kv, self.window_route, cp_group, attention_mode=mode
-            )
             kv_reverse = start_dsa_reverse_route(
                 grad_compressed_kv, self.compressed_kv_route, cp_group,
                 attention_mode=mode,
@@ -604,14 +605,17 @@ class _CsaScheduler(_DsaScheduler):
 
         grad_overlap_x = self._scatter_support_gradient(grad_packed)
         with dsa_nvtx_range(
-            "attention::csa::backward_overlap::overlap_x_reverse_launch"
+            "attention::csa::backward_overlap::support_reverse_launch"
         ):
             overlap_reverse = start_dsa_reverse_route(
                 grad_overlap_x, self.overlap_route, cp_group, attention_mode=mode
             )
+            window_reverse = start_dsa_reverse_route(
+                grad_window_kv, self.window_route, cp_group, attention_mode=mode
+            )
 
         # The Indexer projection backward is the last route-independent work,
-        # so it is what hides the terminal OVERLAP_X reverse.
+        # so it is what hides both of the reverses above.
         with dsa_nvtx_range(
             "attention::csa::backward_overlap::indexer_projection_backward"
         ):
@@ -785,15 +789,18 @@ class _HcaScheduler(_DsaScheduler):
             )
 
         grad_window_kv, grad_compressed_kv = self._split_bank_gradient(grad_kv_bank)
+        # COMPRESSED_KV first for the same reason as CSA: it gates the Main
+        # Compressor backward, which is the only work either mode can put under
+        # a route here.
         with dsa_nvtx_range(
             "attention::hca::backward_overlap::support_reverse_launch"
         ):
-            window_reverse = start_dsa_reverse_route(
-                grad_window_kv, self.window_route, cp_group, attention_mode=mode
-            )
             kv_reverse = start_dsa_reverse_route(
                 grad_compressed_kv, self.compressed_kv_route, cp_group,
                 attention_mode=mode,
+            )
+            window_reverse = start_dsa_reverse_route(
+                grad_window_kv, self.window_route, cp_group, attention_mode=mode
             )
         with dsa_nvtx_range(
             "attention::hca::backward_overlap::compressed_kv_reverse_wait"
