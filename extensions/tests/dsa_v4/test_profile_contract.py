@@ -2127,7 +2127,12 @@ def test_pro_pair_reports_routes_serialization_and_support_overheads() -> None:
                 "magi_dsa::phase::collective_all2all_v::"
                 f"attention::{mode}::{route}.{direction}"
             )
-            start = base + 200 + route_index * 100
+            if (mode, direction, route) == ("csa", "forward", "COMPRESSED_KV"):
+                # Waited before the grouped Indexer runs, so it shares no
+                # window with this phase's compute.
+                start = base + compute_end + 100
+            else:
+                start = base + 200 + route_index * 100
             records.append(
                 {
                     "attribution_path": [
@@ -2289,8 +2294,8 @@ def test_pro_pair_reports_routes_serialization_and_support_overheads() -> None:
     assert route_audit["overlap_gate"] == "report_only"
     assert route_audit["overlap_contract"] == {
         "classification_counts": {
-            "dependency_bound": 4,
-            "overlap_capable": 10,
+            "dependency_bound": 5,
+            "overlap_capable": 9,
         },
         "dependency_bound_requires_positive_overlap": False,
         "fraction_threshold": None,
@@ -2308,11 +2313,14 @@ def test_pro_pair_reports_routes_serialization_and_support_overheads() -> None:
         for record in route_audit["records"]
         if record["overlap_classification"] == "dependency_bound"
     ]
+    # CSA overlaps every route it can, except that it waits COMPRESSED_KV
+    # before the grouped Indexer: that kernel is SM-hungry enough that sharing
+    # the device costs more than the route costs exposed.
     expected_csa_overlap_capable = {
         ("csa", direction, route)
         for direction in ("forward", "backward")
         for route in route_orders[("csa", direction)]
-    }
+    } - {("csa", "forward", "COMPRESSED_KV")}
     assert {
         (record["mode"], record["direction"], record["route"])
         for record in overlap_capable
@@ -2324,24 +2332,23 @@ def test_pro_pair_reports_routes_serialization_and_support_overheads() -> None:
         (record["mode"], record["direction"], record["route"])
         for record in dependency_bound
     } == {
+        ("csa", "forward", "COMPRESSED_KV"),
         ("hca", "forward", "OVERLAP_X"),
         ("hca", "forward", "COMPRESSED_KV"),
         ("hca", "backward", "COMPRESSED_KV"),
         ("hca", "backward", "OVERLAP_X"),
     }
-    assert all(
-        record["same_mode_compute_overlap_ns"] > 0
-        and record["same_mode_compute_overlap_fraction"] > 0
-        and record["observed_positive_same_mode_compute_overlap"] is True
-        for record in overlap_capable
-    )
-    assert all(
-        record["same_mode_compute_overlap_ns"] == 0
-        and record["same_mode_compute_overlap_fraction"] == 0
-        and record["overlap_contract_reason"]
-        and record["observed_positive_same_mode_compute_overlap"] is False
-        for record in dependency_bound
-    )
+    for record in overlap_capable:
+        key = (record["mode"], record["direction"], record["route"])
+        assert record["same_mode_compute_overlap_ns"] > 0, key
+        assert record["same_mode_compute_overlap_fraction"] > 0, key
+        assert record["observed_positive_same_mode_compute_overlap"] is True, key
+    for record in dependency_bound:
+        key = (record["mode"], record["direction"], record["route"])
+        assert record["same_mode_compute_overlap_ns"] == 0, key
+        assert record["same_mode_compute_overlap_fraction"] == 0, key
+        assert record["overlap_contract_reason"], key
+        assert record["observed_positive_same_mode_compute_overlap"] is False, key
     assert all(
         record["other_mode_compute_overlap_fraction"] == 0 and record["nvtx_path"]
         for record in route_audit["records"]
@@ -2360,11 +2367,18 @@ def test_pro_pair_reports_routes_serialization_and_support_overheads() -> None:
         if record["mode"] == "csa" and record["direction"] == "forward"
     ]
     assert zero_overlap_audit["result"] == "PASS"
-    assert all(
-        record["overlap_classification"] == "overlap_capable"
-        and record["observed_positive_same_mode_compute_overlap"] is False
-        for record in zero_overlap_csa_forward
-    )
+    # Dropping the compute a route was supposed to hide behind is reported, not
+    # failed: the classification stays put and only the observation goes false.
+    for record in zero_overlap_csa_forward:
+        expected = (
+            "dependency_bound"
+            if record["route"] == "COMPRESSED_KV"
+            else "overlap_capable"
+        )
+        assert record["overlap_classification"] == expected, record["route"]
+        assert (
+            record["observed_positive_same_mode_compute_overlap"] is False
+        ), record["route"]
     cross_mode_overlap = [
         *records,
         {

@@ -86,8 +86,8 @@ _ROUTE_OVERLAP_CONTRACT = {
         "reason": "CSA Main Compressor runs after the Indexer Compressor starts the KI route.",
     },
     ("csa", "forward", "COMPRESSED_KV"): {
-        "classification": "overlap_capable",
-        "reason": "CSA grouped Indexer score and Top-K run while compressed KV is in flight.",
+        "classification": "dependency_bound",
+        "reason": "CSA compressed KV is deliberately waited before the grouped Indexer: sharing the device with that kernel costs more in SM contention than the route costs exposed, and it makes the Indexer time track each rank's route volume.",
     },
     ("csa", "backward", "COMPRESSED_KI"): {
         "classification": "overlap_capable",

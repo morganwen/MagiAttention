@@ -420,6 +420,13 @@ class _CsaScheduler(_DsaScheduler):
             grouped_ready_in = torch.cuda.Event()
             grouped_ready_in.record(caller_stream)
             indexer_stream.wait_event(grouped_ready_in)
+            # The grouped Indexer waits for the compressed-KV route instead of
+            # running under it. Letting the two share the device costs more in
+            # SM contention than the route would cost exposed: the Indexer
+            # kernel measurably slows down, and by an amount that tracks how
+            # much of the route each rank happens to own, which turns a
+            # balanced dispatch into an unbalanced profile.
+            indexer_stream.wait_event(main_ready)
             with torch.cuda.stream(indexer_stream):
                 compressed_ki.record_stream(indexer_stream)
                 with (
