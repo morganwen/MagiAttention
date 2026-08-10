@@ -236,3 +236,6 @@ detect_cuda_version.cc
 
 # DSA design notes stay local.
 /extensions/magi_attn_extensions/DSA/docs/
+
+# Profile results live next to the script that makes them, and stay local.
+/scripts/profile/result/

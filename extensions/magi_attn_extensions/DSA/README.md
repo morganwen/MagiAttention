@@ -66,14 +66,15 @@ scripts/test/run_multigpu.sh --world-size 8 --case cp8-natural-backward --image 
 ### cp=8 profile
 
 ```bash
-scripts/profile/run_5step.sh --world-size 8 --cp-size 8 --case dsv4-pro-128k \
-    --plans balanced --steps 5 --step-mode pro-pair \
-    --layout-policy structural-balanced --local-improvement-passes 4 \
-    --profiler-attach-warmup-steps 0 --skip-smoke --image "$IMAGE"
+scripts/profile/run_5step.sh --image "$IMAGE"
 ```
 
-采五步，大约十五分钟，产物在 `artifacts/profile/<时间戳>/`。和上面两条不同，这条
-跑的是镜像里烤进去的 wheel，完全不看你的工作区，所以没提交的改动根本不会被测到。
+采集本身是写死的：八张卡、cp=8、dsv4-pro-128k、五步、pro-pair、structural-balanced。
+这些曾经都是命令行参数，但每一个都只有一个合法值，所以不再问你。
+
+采五步大约十五分钟，产物落在 `scripts/profile/result/<日期>-<时间>-cp8-<commit>/`。
+和上面两条不同，这条跑的是镜像里烤进去的 wheel，完全不看你的工作区，所以没提交的
+改动根本不会被测到。
 
 它校验的东西远多于计时：每个阶段的集合通信次数、路由发起的先后、每条路由遮挡了
 哪段计算、Indexer kernel 在各卡之间是否均衡、以及显存拷贝的归因。一个跑得挺快但
@@ -82,10 +83,17 @@ scripts/profile/run_5step.sh --world-size 8 --cp-size 8 --case dsv4-pro-128k \
 跑它的时候把机器让给它。它测的是墙钟，同机跑别的负载会污染数字；而且单次之间本来
 就有百分之一左右的波动，同一配置重复三次再判断差异。
 
-想直接看结论的话，`REPORT_PRO_PAIR.md` 是人读的汇总，
-`MAJOR_KERNEL_BALANCE_PRO_PAIR.json` 是各大 kernel 的耗时和跨卡均衡，
-`PRO_PAIR_ROUTE_TIMINGS.json` 是每条路由的耗时和遮挡情况，
-`balanced/*.sqlite` 是 nsys 原始库。
+校验通过之后脚本会把中间产物删掉，一次结果从六十多兆降到十八兆左右。留下的是：
+
+- `balanced/*.nsys-rep`，用 Nsight Systems 打开看时间线
+- `balanced/*.sqlite`，同一份数据的可查询形式，所有墙钟数字都从这里查
+- `REPORT_PRO_PAIR.md`，人读的汇总
+- `MAJOR_KERNEL_BALANCE_PRO_PAIR.json`，各大 kernel 的耗时和跨卡均衡
+- `PRO_PAIR_ROUTE_TIMINGS.json` 和 `PRO_PAIR_COMMUNICATION_OVERLAP.json`，每条路由的
+  耗时和它遮挡了什么
+
+删掉的那些 jsonl 是给校验程序读的，它跑完就没人再看了，而且比留下的东西还大三倍。
+一次失败的运行不会被清理，好让你能查现场。
 
 ### 静态检查
 

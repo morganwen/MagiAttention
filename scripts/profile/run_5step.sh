@@ -16,51 +16,26 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: $0 --world-size 8 --cp-size 8 --case dsv4-pro-128k --plans balanced --steps 5 --step-mode pro-pair --layout-policy structural-balanced [--profiler-attach-warmup-steps N] [--skip-smoke] [--image IMAGE]" >&2
+    echo "Usage: $0 [--image IMAGE] [--profiler-attach-warmup-steps N] [--local-improvement-passes N] [--lock-gpu-clock-mhz MHZ]" >&2
+    echo "" >&2
+    echo "The capture is fixed: 8 ranks, cp=8, dsv4-pro-128k, 5 steps, pro-pair," >&2
+    echo "structural-balanced. Those were flags once, and every one of them had" >&2
+    echo "exactly one legal value." >&2
 }
 
-world_size=""
-cp_size=""
-case_name=""
-plans=""
-steps=""
-skip_smoke=0
-step_mode="forward"
-layout_policy="legacy"
+world_size="8"
+cp_size="8"
+case_name="dsv4-pro-128k"
+plans="balanced"
+steps="5"
+step_mode="pro-pair"
+layout_policy="structural-balanced"
 local_improvement_passes="4"
 profiler_attach_warmup_steps="0"
 lock_gpu_clock_mhz=""
 image="${MAGI_DSA_IMAGE:-magi-dsa-v4:preflight-68c2f15}"
 while (($# > 0)); do
     case "$1" in
-        --world-size)
-            world_size="${2:-}"
-            shift 2
-            ;;
-        --cp-size)
-            cp_size="${2:-}"
-            shift 2
-            ;;
-        --case)
-            case_name="${2:-}"
-            shift 2
-            ;;
-        --plans)
-            plans="${2:-}"
-            shift 2
-            ;;
-        --steps)
-            steps="${2:-}"
-            shift 2
-            ;;
-        --step-mode)
-            step_mode="${2:-}"
-            shift 2
-            ;;
-        --layout-policy)
-            layout_policy="${2:-}"
-            shift 2
-            ;;
         --local-improvement-passes)
             local_improvement_passes="${2:-}"
             shift 2
@@ -73,10 +48,6 @@ while (($# > 0)); do
             lock_gpu_clock_mhz="${2:-}"
             shift 2
             ;;
-        --skip-smoke)
-            skip_smoke=1
-            shift
-            ;;
         --image)
             image="${2:-}"
             shift 2
@@ -88,26 +59,6 @@ while (($# > 0)); do
     esac
 done
 
-if [[ "$world_size" != "8" || "$cp_size" != "8" ]]; then
-    usage
-    exit 2
-fi
-if [[ "$steps" != "5" ]]; then
-    usage
-    exit 2
-fi
-if [[ "$step_mode" != "pro-pair" ]]; then
-    echo "only the Pro pair capture remains; the Flash-Base modes were retired" >&2
-    exit 2
-fi
-if [[ "$case_name" != "dsv4-pro-128k" || "$plans" != "balanced" ]]; then
-    usage
-    exit 2
-fi
-if [[ "$layout_policy" != "structural-balanced" ]]; then
-    echo "structural-balanced is the only layout policy" >&2
-    exit 2
-fi
 if [[ ! "$profiler_attach_warmup_steps" =~ ^[0-8]$ ]]; then
     usage
     exit 2
@@ -194,7 +145,7 @@ cudnn_cache_dir="${MAGI_DSA_CUDNN_CACHE:-$repo_root/.cache/magi-dsa-v4/cudnn-dsa
 msa_reference_report="${MAGI_DSA_MSA_REFERENCE_REPORT:-not-configured}"
 
 gpu_count="$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)"
-non_b300_count="$(nvidia-smi --query-gpu=name --format=csv,noheader | rg -v '^NVIDIA B300([[:space:]]|$)' | wc -l || true)"
+non_b300_count="$(nvidia-smi --query-gpu=name --format=csv,noheader | grep -cvE '^NVIDIA B300([[:space:]]|$)' || true)"
 if ((gpu_count != 8 || non_b300_count != 0)); then
     echo "the release profile requires exactly 8 NVIDIA B300 GPUs" >&2
     exit 1
@@ -224,19 +175,19 @@ elif [[ "$step_mode" == "attention-suite" ]]; then
 elif [[ "$step_mode" == "pro-pair" ]]; then
     run_suffix="-pro-pair-structural-balanced-precomputed-dout"
 fi
-run_id="$(date -u +%Y%m%dT%H%M%SZ)-${case_name}${run_suffix}"
-artifact_dir="$repo_root/artifacts/profile/$run_id"
+run_id="$(date -u +%Y%m%d-%H%M%S)-cp8-$(git -C "$repo_root" rev-parse --short=12 HEAD)"
+artifact_dir="$repo_root/scripts/profile/result/$run_id"
 if [[ -e "$artifact_dir" ]]; then
     echo "refusing to overwrite profile artifact directory: $artifact_dir" >&2
     exit 1
 fi
-mkdir -p "$artifact_dir/smoke" "$artifact_dir/sequential" "$artifact_dir/balanced" \
+mkdir -p "$artifact_dir/balanced" \
     "$cudnn_cache_dir/cuda" "$cudnn_cache_dir/cute-dsl" \
     "$cudnn_cache_dir/magi-workspace" "$cudnn_cache_dir/tmp" \
     "$cudnn_cache_dir/xdg-cache" "$cudnn_cache_dir/torch" \
     "$cudnn_cache_dir/triton"
-chmod 0777 "$artifact_dir" "$artifact_dir/smoke" "$artifact_dir/sequential" \
-    "$artifact_dir/balanced" "$cudnn_cache_dir" "$cudnn_cache_dir/cuda" \
+chmod 0777 "$artifact_dir" "$artifact_dir/balanced" \
+    "$cudnn_cache_dir" "$cudnn_cache_dir/cuda" \
     "$cudnn_cache_dir/cute-dsl" "$cudnn_cache_dir/magi-workspace" \
     "$cudnn_cache_dir/tmp" "$cudnn_cache_dir/xdg-cache" \
     "$cudnn_cache_dir/torch" "$cudnn_cache_dir/triton"
@@ -245,8 +196,8 @@ current_container=""
 current_runner_pid=""
 current_runner_pgid=""
 gpu_clocks_locked=0
-profile_capture_order="balanced,sequential"
-if [[ "$step_mode" != "forward" ]]; then
+profile_capture_order="balanced"
+if true; then
     profile_capture_order="balanced"
 fi
 
@@ -368,12 +319,9 @@ trap 'handle_signal 130' INT
 trap 'handle_signal 143' TERM
 
 {
-    command_line="bash scripts/profile/run_5step.sh --world-size 8 --cp-size 8 --case $case_name --plans $plans --steps 5 --step-mode $step_mode --layout-policy $layout_policy --local-improvement-passes $local_improvement_passes --profiler-attach-warmup-steps $profiler_attach_warmup_steps"
+    command_line="bash scripts/profile/run_5step.sh --local-improvement-passes $local_improvement_passes --profiler-attach-warmup-steps $profiler_attach_warmup_steps"
     if [[ -n "$lock_gpu_clock_mhz" ]]; then
         command_line+=" --lock-gpu-clock-mhz $lock_gpu_clock_mhz"
-    fi
-    if ((skip_smoke == 1)); then
-        command_line+=" --skip-smoke"
     fi
     command_line+=" --image $image"
     echo "$command_line"
@@ -394,7 +342,6 @@ trap 'handle_signal 143' TERM
     echo "flashmla_dual_lse_patch_sha256=$flashmla_patch_sha256"
     echo "flashmla_pro_h128_patch_revision=$flashmla_pro_patch_revision"
     echo "flashmla_pro_h128_patch_sha256=$flashmla_pro_patch_sha256"
-    echo "smoke_deadline_seconds=600"
     echo "profile_deadline_seconds_per_plan=1800"
     echo "no_progress_watchdog_seconds=60"
     echo "watchdog_kill_sequence=TERM,wait-5s,KILL"
@@ -450,7 +397,6 @@ trap 'handle_signal 143' TERM
         echo "indexer_d2d_cudnn_call_scopes=magi_dsa::CUDNN_CALL::{indexer_score,indexer_topk,selected_indexer_recompute,selected_attention_recompute,indexer_backward}"
         echo "pro_pair_required_summary_artifacts=INDEXER_D2D_PRO_PAIR.json,SUPPORT_OVERHEAD_PRO_PAIR.json,PRO_PAIR_COMMUNICATION_OVERLAP.json"
     fi
-    echo "skip_smoke=$skip_smoke"
 } >"$artifact_dir/COMMAND.txt"
 
 cat >"$artifact_dir/IMAGE_CONTRACT.txt" <<EOF
@@ -545,12 +491,9 @@ nvidia-smi -q >"$artifact_dir/HARDWARE.txt"
 timeout --signal=TERM --kill-after=5s 60s docker run --rm --entrypoint bash "$image" -lc \
     'python -VV; python -m pip freeze; nsys --version' \
     >"$artifact_dir/ENVIRONMENT.txt" 2>&1
-smoke_mode="executed"
-if ((skip_smoke == 1)); then
-    smoke_mode="skipped_by_user"
-fi
-profile_plans_json='["sequential", "balanced"]'
-profile_capture_order_json='["balanced", "sequential"]'
+smoke_mode="retired"
+profile_plans_json='["balanced"]'
+profile_capture_order_json='["balanced"]'
 profile_gradient_boundary="source_owner_x"
 projection_capture="per_step"
 token_layout_capture="per_step"
@@ -779,32 +722,8 @@ reset_required=false
 EOF
 fi
 
-if ((skip_smoke == 0)); then
-    run_stage \
-        smoke \
-        600 \
-        "$artifact_dir/smoke" \
-        "${common_docker_args[@]}" \
-        --entrypoint /usr/local/bin/torchrun \
-        "$image" \
-        --standalone \
-        --nnodes=1 \
-        --nproc-per-node=8 \
-        /workspace/MagiAttention/benchmarks/dsa_v4/profile_5step.py \
-        --mode smoke \
-        --artifact-dir /profile-artifact/smoke \
-        --seed 0 \
-        --tokens 4096 \
-        --steps 1 \
-        --warmup 1
-else
-    echo "stage=smoke skipped_by_user=1" | tee -a "$artifact_dir/WATCHDOG.log"
-fi
 
-profile_plan_order=(balanced sequential)
-if [[ "$step_mode" != "forward" ]]; then
-    profile_plan_order=(balanced)
-fi
+profile_plan_order=(balanced)
 for plan in "${profile_plan_order[@]}"; do
     run_stage \
         "$plan" \
@@ -1030,4 +949,23 @@ if ((summary_status != 0)); then
     echo "profile validation failed; preserved artifact: $artifact_dir" >&2
     exit "$summary_status"
 fi
+
+# The per-rank and merged jsonl exports exist so the summarizer can validate
+# collective counts, route order and attribution. Once it has passed there is
+# nothing left to read them for, and they are four times the size of everything
+# worth keeping. The nsys report and its sqlite stay, so any of it can be
+# regenerated.
+kept_bytes_before="$(du -sk "$artifact_dir" | cut -f1)"
+find "$artifact_dir" -name '*.jsonl' -delete
+find "$artifact_dir" -name '*.stdout' -delete
+find "$artifact_dir" -name '*.stderr' -delete
+find "$artifact_dir" -name '*.log' -delete
+rm -f "$artifact_dir/SHA256SUMS" "$artifact_dir/HARDWARE.txt" \
+    "$artifact_dir/ENVIRONMENT.txt" "$artifact_dir/SUBMODULES.txt" \
+    "$artifact_dir/IMAGE.json" "$artifact_dir/NSYS_STATS.txt"
+rm -rf "$artifact_dir"/*/control "$artifact_dir"/*/capture_done_rank*.json \
+    "$artifact_dir"/*/ready_rank*.json
+find "$artifact_dir" -type d -empty -delete
+kept_bytes_after="$(du -sk "$artifact_dir" | cut -f1)"
+echo "pruned intermediates: ${kept_bytes_before}K -> ${kept_bytes_after}K"
 echo "profile complete: $artifact_dir"
