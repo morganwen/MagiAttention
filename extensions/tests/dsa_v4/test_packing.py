@@ -25,6 +25,7 @@ from magi_attn_extensions.DSA.packing import (
     make_dsa_device_rank_plan,
 )
 from magi_attn_extensions.DSA.solver import build_dsa_execution_plan
+from magi_attention.common.range_op import range_gather
 
 SOLVER = DsaStructuralLayoutConfig(chunk_size=128, min_chunks_per_rank=4)
 
@@ -236,6 +237,68 @@ def test_support_gather_keeps_the_graph_edge_when_a_rank_produces_no_block():
     gradient = torch.autograd.grad(packed.float().sum(), overlap_x, allow_unused=False)[0]
     assert gradient is not None
     assert gradient.shape == overlap_x.shape
+
+
+def test_indexer_gather_carries_its_own_prefix_sums():
+    """The prefix sums ship with the ranges so the warm path never reads back.
+
+    ``range_gather`` derives ``cu_range_sizes`` and ``total_size`` together when
+    either is missing, and deriving them from ranges that already live on the
+    device means copying them to the host to sum in Python. That blocks the
+    calling rank until its queued work drains, once per CSA layer per step. The
+    plan carries both, so the gather has nothing left to derive.
+    """
+
+    config = MagiDSAConfig(ratio=4)
+    plan = _plan(4)
+    device_plan = make_dsa_device_rank_plan(plan, 0, config, _device())
+    indexer = device_plan.indexer
+    assert indexer is not None
+    sizes = indexer.k_cu_range_sizes
+    assert sizes.dtype == torch.int64
+    assert sizes.shape == (indexer.k_gather_ranges.shape[0] + 1,)
+    lengths = indexer.k_gather_ranges[:, 1] - indexer.k_gather_ranges[:, 0]
+    expected = torch.cat(
+        (
+            torch.zeros(1, dtype=torch.int64, device=sizes.device),
+            lengths.to(torch.int64).cumsum(0),
+        )
+    )
+    assert torch.equal(sizes, expected)
+    assert int(sizes[-1]) == indexer.packed_k_rows
+
+
+def test_indexer_gather_runs_without_touching_the_host():
+    """Guard the property directly: no host sync during the gather."""
+
+    config = MagiDSAConfig(ratio=4)
+    plan = _plan(4)
+    device = _device()
+    device_plan = make_dsa_device_rank_plan(plan, 0, config, device)
+    indexer = device_plan.indexer
+    assert indexer is not None
+    source = torch.randn(
+        max(int(indexer.k_gather_ranges[:, 1].max()), 1),
+        config.indexer_head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    torch.cuda.synchronize()
+    # Any readback would have to synchronize, and a stream capture forbids that,
+    # so the capture succeeding is the assertion.
+    graph_stream = torch.cuda.Stream()
+    graph_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(graph_stream):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            range_gather(
+                source,
+                indexer.k_gather_ranges,
+                cu_range_sizes=indexer.k_cu_range_sizes,
+                total_size=indexer.packed_k_rows,
+            )
+    torch.cuda.current_stream().wait_stream(graph_stream)
+    torch.cuda.synchronize()
 
 
 def test_hca_device_plan_has_no_indexer():

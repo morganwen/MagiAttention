@@ -23,6 +23,7 @@ runs in their consumer bank, so a base and a length describe them exactly.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import accumulate
 
 import torch
 
@@ -97,6 +98,13 @@ class DsaDeviceIndexerMap:
     # One [begin, end) consumer-row run per fragment; a range gather expands the
     # unique KI bank into the grouped per-fragment prefixes cuDNN expects.
     k_gather_ranges: torch.Tensor
+    # The prefix sums of those ranges, carried alongside them. ``range_gather``
+    # derives them itself when they are missing, and doing that from a tensor
+    # already on the device costs a readback: it reads the ranges back to the
+    # host to sum them in Python, which stalls the caller until the queued work
+    # drains. Built here from the host-side list the ranges came from, the warm
+    # path never touches the host.
+    k_cu_range_sizes: torch.Tensor
     packed_k_rows: int
     ki_global_to_consumer: torch.Tensor
     max_seqlen_q: int
@@ -431,6 +439,12 @@ def _make_indexer_map(
     packed_k_rows = sum(end - begin for begin, end in ranges)
     if packed_k_rows != rank_plan.packed_indexer_k_count:
         raise ValueError("Indexer K gather rows do not match grouped cu_seqlens")
+    # A rank with no fragment still needs one well-formed range so the gather
+    # has something to describe, and the prefix sums must stay one longer.
+    gather_ranges = ranges if ranges else [[0, 0]]
+    gather_cu_range_sizes = list(
+        accumulate((end - begin for begin, end in gather_ranges), initial=0)
+    )
 
     sample_ids = local_q_sample_ids.to(torch.int64)
     sample_block_offsets = _make_device_tensor(
@@ -454,7 +468,10 @@ def _make_indexer_map(
         .contiguous(),
         seq_lens=seq_lens.contiguous(),
         k_gather_ranges=_make_device_tensor(
-            ranges if ranges else [[0, 0]], dtype=torch.int32, device=device
+            gather_ranges, dtype=torch.int32, device=device
+        ),
+        k_cu_range_sizes=_make_device_tensor(
+            gather_cu_range_sizes, dtype=torch.int64, device=device
         ),
         packed_k_rows=packed_k_rows,
         ki_global_to_consumer=compressed_ki_route.global_to_consumer,

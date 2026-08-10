@@ -439,9 +439,17 @@ class _CsaScheduler(_DsaScheduler):
                     # Each fragment's grouped-K prefix is a contiguous run of
                     # the unique KI bank, so this is a plain range gather.
                     # Indexer selection is no-grad, so it has no backward.
+                    #
+                    # Both the prefix sums and the row count come from the plan.
+                    # Passing only one of them is the same as passing neither:
+                    # range_gather derives both together, and deriving them from
+                    # ranges that already live on the device means reading them
+                    # back to sum in Python, which blocks this rank until its
+                    # queued work drains.
                     grouped_k = range_gather(
                         compressed_ki,
                         self.indexer_map.k_gather_ranges,
+                        cu_range_sizes=self.indexer_map.k_cu_range_sizes,
                         total_size=self.indexer_map.packed_k_rows,
                     )
                 with dsa_nvtx_range(
