@@ -955,17 +955,25 @@ fi
 # nothing left to read them for, and they are four times the size of everything
 # worth keeping. The nsys report and its sqlite stay, so any of it can be
 # regenerated.
+# Housekeeping runs after the verdict, so it is never allowed to change it.
+# The rank handshake directory is written by the container, and NFS maps that
+# root to nobody, which leaves it undeletable from the host by anyone. It is
+# eight kilobytes; a run that already passed must not fail over it.
+prune_artifacts() {
+    find "$artifact_dir" \
+        \( -name '*.jsonl' -o -name '*.stdout' -o -name '*.stderr' \
+           -o -name '*.log' \) -delete
+    rm -f "$artifact_dir/SHA256SUMS" "$artifact_dir/HARDWARE.txt" \
+        "$artifact_dir/ENVIRONMENT.txt" "$artifact_dir/SUBMODULES.txt" \
+        "$artifact_dir/IMAGE.json" "$artifact_dir"/*/NSYS_STATS.txt
+    rm -f "$artifact_dir"/*/capture_done_rank*.json \
+        "$artifact_dir"/*/ready_rank*.json
+    find "$artifact_dir" -type d -empty -delete
+}
 kept_bytes_before="$(du -sk "$artifact_dir" | cut -f1)"
-find "$artifact_dir" -name '*.jsonl' -delete
-find "$artifact_dir" -name '*.stdout' -delete
-find "$artifact_dir" -name '*.stderr' -delete
-find "$artifact_dir" -name '*.log' -delete
-rm -f "$artifact_dir/SHA256SUMS" "$artifact_dir/HARDWARE.txt" \
-    "$artifact_dir/ENVIRONMENT.txt" "$artifact_dir/SUBMODULES.txt" \
-    "$artifact_dir/IMAGE.json" "$artifact_dir/NSYS_STATS.txt"
-rm -rf "$artifact_dir"/*/control "$artifact_dir"/*/capture_done_rank*.json \
-    "$artifact_dir"/*/ready_rank*.json
-find "$artifact_dir" -type d -empty -delete
+if ! prune_artifacts 2>/dev/null; then
+    echo "note: some intermediates could not be removed; the result is complete" >&2
+fi
 kept_bytes_after="$(du -sk "$artifact_dir" | cut -f1)"
 echo "pruned intermediates: ${kept_bytes_before}K -> ${kept_bytes_after}K"
 echo "profile complete: $artifact_dir"
