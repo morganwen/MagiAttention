@@ -208,6 +208,7 @@ class _DsaScheduler:
         # Kept so the backward can reverse the support gather with the very
         # same index that produced it.
         self.support_rows: torch.Tensor | None = None
+        self.support_dtype: torch.dtype | None = None
         self.window_rows = 0
         self.overlap_rows = 0
         self.pending: list[DsaRouteTransfer] = []
@@ -221,20 +222,31 @@ class _DsaScheduler:
         self.indexer_lse: torch.Tensor | None = None
 
     def _scatter_support_gradient(
-        self, grad_packed: torch.Tensor, hidden_size: int, dtype, device
+        self, grad_packed: torch.Tensor | None
     ) -> torch.Tensor:
-        """Adjoint of the support gather: accumulate onto the OVERLAP_X rows."""
+        """Adjoint of the support gather: accumulate onto the OVERLAP_X rows.
+
+        A rank that produced no compressed block gets no support gradient back,
+        and it still has to launch its OVERLAP_X reverse. Whether a collective
+        runs must never depend on whether a gradient happens to exist, so a
+        missing gradient becomes zeros here rather than an early return.
+        """
 
         assert self.support_rows is not None
+        assert self.support_dtype is not None
+        hidden_size = self.config.hidden_size
         with dsa_nvtx_range(
             f"packing::{self.attention_mode}::compression_support::backward_scatter"
         ):
             grad_overlap_x = torch.zeros(
-                (self.overlap_rows, hidden_size), dtype=dtype, device=device
+                (self.overlap_rows, hidden_size),
+                dtype=self.support_dtype,
+                device=self.support_rows.device,
             )
-            grad_overlap_x.index_add_(
-                0, self.support_rows, grad_packed.reshape(-1, hidden_size)
-            )
+            if grad_packed is not None:
+                grad_overlap_x.index_add_(
+                    0, self.support_rows, grad_packed.reshape(-1, hidden_size)
+                )
         return grad_overlap_x
 
     def _split_bank_gradient(
@@ -343,6 +355,7 @@ class _CsaScheduler(_DsaScheduler):
                 config.compressor_support,
                 overlap_x.device,
             )
+            self.support_dtype = overlap_x.dtype
             with dsa_nvtx_range(
                 "packing::csa::compression_support::forward_gather",
                 enabled=overlap_x.is_cuda,
@@ -584,9 +597,7 @@ class _CsaScheduler(_DsaScheduler):
         if grad_packed_ki is not None:
             grad_packed = grad_packed + grad_packed_ki
 
-        grad_overlap_x = self._scatter_support_gradient(
-            grad_packed, grad_packed.shape[-1], grad_packed.dtype, grad_packed.device
-        )
+        grad_overlap_x = self._scatter_support_gradient(grad_packed)
         with dsa_nvtx_range(
             "attention::csa::backward_overlap::overlap_x_reverse_launch"
         ):
@@ -661,6 +672,7 @@ class _HcaScheduler(_DsaScheduler):
                 self.overlap_rows, self.compression, config.compressor_support,
                 overlap_x.device,
             )
+            self.support_dtype = overlap_x.dtype
             with dsa_nvtx_range(
                 f"packing::{mode}::compression_support::forward_gather",
                 enabled=overlap_x.is_cuda,
@@ -785,9 +797,7 @@ class _HcaScheduler(_DsaScheduler):
         ):
             (grad_packed, _, _) = self.kv_node.backward((grad_compressed_kv_local,))
 
-        grad_overlap_x = self._scatter_support_gradient(
-            grad_packed, grad_packed.shape[-1], grad_packed.dtype, grad_packed.device
-        )
+        grad_overlap_x = self._scatter_support_gradient(grad_packed)
         with dsa_nvtx_range(
             "attention::hca::backward_overlap::overlap_x_reverse_launch"
         ):
