@@ -335,6 +335,67 @@ def test_cp1_csa_natural_backward_matches_all_input_and_parameter_gradients() ->
         )
 
 
+@pytest.mark.parametrize("ratio", [4, 128])
+def test_cp1_kl_is_differentiable_only_where_there_is_an_indexer(
+    ratio: DsaRatio,
+) -> None:
+    """HCA hands back a constant KL, and a constant must not carry an edge.
+
+    HCA has no Indexer to train, so its KL is a scalar zero. If it comes back
+    attached to the graph, a caller that sums both losses silently backpropagates
+    through a layer that has nothing to learn from it.
+    """
+
+    torch.manual_seed(70 + ratio)
+    config = MagiDSAConfig(ratio=ratio)
+    tokens = 256
+    layer = MagiDSALayer(config).cuda()
+
+    def make(shape: tuple[int, ...], scale: float = 1.0) -> torch.Tensor:
+        return (
+            (torch.randn(*shape, device="cuda", dtype=torch.bfloat16) * scale)
+            .contiguous()
+            .requires_grad_(True)
+        )
+
+    meta = MagiDSAPackedMeta((0, tokens), (tokens,))
+    runtime = MagiDSARuntimeMgr(
+        config, structural_layout_config=DsaStructuralLayoutConfig()
+    )
+    handle = runtime.prepare_execution(
+        meta, torch.device("cuda"), local_token_capacity=tokens
+    )
+    result = runtime.calc_dsa(
+        layer.projections(),
+        MagiDSAInput(
+            make((tokens, config.hidden_size)),
+            make((tokens, config.q_lora_rank)),
+            make((tokens, config.num_query_heads, config.head_dim), 0.25),
+            make((tokens, config.head_dim), 0.25),
+            torch.randn(
+                config.num_query_heads,
+                device="cuda",
+                dtype=torch.float32,
+                requires_grad=True,
+            ),
+            meta,
+        ),
+        handle,
+    )
+    assert result.kl.ndim == 0
+    assert result.kl.dtype == torch.float32
+    if ratio == 4:
+        assert result.kl.requires_grad
+        assert result.kl.grad_fn is not None
+    else:
+        assert not result.kl.requires_grad
+        assert result.kl.grad_fn is None
+        assert float(result.kl) == 0.0
+    # Backward still has to run from the output alone in both cases.
+    result.output.float().square().mean().backward()
+    torch.cuda.synchronize()
+
+
 def test_cp1_csa_backward_runs_once_and_reaches_every_input_and_parameter() -> None:
     """One backward feeds every input and every model parameter.
 

@@ -175,6 +175,11 @@ def _build_csa_indices(
 class _DsaScheduler:
     """State shared by the two mode schedules and their backward passes."""
 
+    # CSA trains its Indexer against the attention distribution and returns a
+    # real KL scalar. HCA has no Indexer, so its KL is a constant and must not
+    # carry a gradient edge at all.
+    kl_is_differentiable = True
+
     def __init__(
         self,
         config: MagiDSAConfig,
@@ -627,6 +632,8 @@ class _CsaScheduler(_DsaScheduler):
 class _HcaScheduler(_DsaScheduler):
     """HCA: one Compressor and three routes, with no Indexer at all."""
 
+    kl_is_differentiable = False
+
     def forward(self, x, qr, q, latent_kv, sink):
         del qr
         config = self.config
@@ -829,7 +836,11 @@ class _DsaAttentionFunction(torch.autograd.Function):
         # tensor a Function returns. Handing back the schedule's own tensors
         # would redirect the last node's subgraph at this very node, and
         # driving that subgraph would then re-enter this backward.
-        return output.detach(), kl.detach()
+        output_alias = output.detach()
+        kl_alias = kl.detach()
+        if not scheduler.kl_is_differentiable:
+            ctx.mark_non_differentiable(kl_alias)
+        return output_alias, kl_alias
 
     @staticmethod
     def backward(ctx, grad_output, grad_kl):
