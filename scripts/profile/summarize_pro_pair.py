@@ -95,15 +95,15 @@ _ROUTE_OVERLAP_CONTRACT = {
     },
     ("csa", "backward", "COMPRESSED_KV"): {
         "classification": "overlap_capable",
-        "reason": "CSA Indexer backward is independent of the compressed-KV reverse route.",
+        "reason": "CSA Indexer Compressor backward is launched after the compressed-KV reverse and depends on no route.",
     },
     ("csa", "backward", "OVERLAP_X"): {
         "classification": "overlap_capable",
-        "reason": "CSA projection and support backward work remains independent of the support reverse route.",
+        "reason": "CSA Indexer projection backward is the last route-independent work and is scheduled after the terminal OVERLAP_X reverse starts.",
     },
     ("csa", "backward", "WINDOW_KV"): {
         "classification": "overlap_capable",
-        "reason": "CSA projection backward remains available after the late join releases Window reverse.",
+        "reason": "CSA Window reverse is launched off the KV-bank split and waited last, so every model-side backward runs under it.",
     },
     ("hca", "forward", "OVERLAP_X"): {
         "classification": "dependency_bound",
@@ -123,7 +123,7 @@ _ROUTE_OVERLAP_CONTRACT = {
     },
     ("hca", "backward", "WINDOW_KV"): {
         "classification": "overlap_capable",
-        "reason": "HCA Window reverse runs on the route stream while Main Compressor backward runs independently.",
+        "reason": "HCA Window reverse is launched off the KV-bank split and waited after the Main Compressor backward.",
     },
     ("hca", "backward", "OVERLAP_X"): {
         "classification": "dependency_bound",

@@ -271,132 +271,117 @@ def test_hca_compressor_marks_nonoverlap_assembly(monkeypatch) -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_hca_backward_branch_order_reconnects_source_gradient(monkeypatch) -> None:
-    calls: list[tuple[torch.Tensor, object, object, str]] = []
-    transfer = object()
-    route = object()
-    group = object()
-
-    @contextmanager
-    def record_range(name: str, *, enabled: bool = True) -> Iterator[None]:
-        del enabled
-        assert name == "attention::hca::backward_overlap::window_reverse_priority"
-        yield
-
-    def fake_start(grad, actual_route, actual_group, *, attention_mode):
-        calls.append((grad.clone(), actual_route, actual_group, attention_mode))
-        return transfer
-
-    monkeypatch.setattr(dist_dsa_module, "dsa_nvtx_range", record_range)
-    monkeypatch.setattr(dist_dsa_module, "start_dsa_reverse_route", fake_start)
-    monkeypatch.setattr(
-        dist_dsa_module,
-        "finish_dsa_reverse_route",
-        lambda actual_transfer: (
-            torch.full((3, 4), 7.0, device="cuda")
-            if actual_transfer is transfer
-            else None
-        ),
-    )
-
-    compressed_local = torch.randn(2, 4, device="cuda", requires_grad=True)
-    source = torch.randn(3, 4, device="cuda", requires_grad=True)
-    old_consumer = torch.randn(5, 4, device="cuda", requires_grad=True)
-    compressed, consumer = dist_dsa_module._HcaBackwardBranchOrderFunction.apply(
-        compressed_local,
-        source,
-        old_consumer,
-        route,
-        group,
-        torch.cuda.Stream(),
-        torch.cuda.current_stream(),
-    )
-    torch.autograd.backward(
-        (compressed, consumer),
-        (torch.ones_like(compressed), torch.ones_like(consumer)),
-    )
-    torch.cuda.synchronize()
-
-    assert len(calls) == 1
-    grad, actual_route, actual_group, attention_mode = calls[0]
-    torch.testing.assert_close(grad, torch.ones_like(old_consumer))
-    assert actual_route is route
-    assert actual_group is group
-    assert attention_mode == "hca"
-    torch.testing.assert_close(compressed_local.grad, torch.ones_like(compressed_local))
-    torch.testing.assert_close(source.grad, torch.full_like(source, 7.0))
-    assert old_consumer.grad is None
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_csa_backward_route_order_is_explicit_and_reconnects_sources(
-    monkeypatch,
+@pytest.mark.parametrize("ratio", [4, 128])
+def test_backward_launches_every_reverse_route_in_schedule_order(
+    ratio: DsaRatio, monkeypatch
 ) -> None:
-    events: list[tuple[str, object, str]] = []
-    overlap_route = object()
-    window_route = object()
-    group = object()
+    """The backward order is program order, so it is asserted directly.
+
+    Both modes launch WINDOW_KV and COMPRESSED_KV together off the KV-bank
+    split, wait COMPRESSED_KV to run the Main Compressor backward, and only
+    then launch the terminal OVERLAP_X reverse. COMPRESSED_KI does not appear
+    here because CSA starts and waits it inside the combined attention node.
+    """
+
+    torch.manual_seed(41 + ratio)
+    # The release backend only accepts the official dimensions, so this runs a
+    # real layer rather than a reduced stand-in.
+    config = MagiDSAConfig(ratio=ratio)
+    layer = MagiDSALayer(config).cuda()
+    tokens = 256
+    meta = MagiDSAPackedMeta((0, tokens), (tokens,))
+    runtime = MagiDSARuntimeMgr(config)
+    handle = runtime.prepare_execution(
+        meta, torch.device("cuda"), local_token_capacity=tokens
+    )
+
+    def make(shape, scale=1.0):
+        value = torch.randn(*shape, device="cuda", dtype=torch.bfloat16) * scale
+        return value.contiguous().requires_grad_(True)
+
+    dsa_input = MagiDSAInput(
+        x=make((tokens, config.hidden_size)),
+        qr=make((tokens, config.q_lora_rank)),
+        q=make((tokens, config.num_query_heads, config.head_dim), 0.25),
+        latent_kv=make((tokens, config.head_dim), 0.25),
+        sink=torch.randn(
+            config.num_query_heads,
+            device="cuda",
+            dtype=torch.float32,
+            requires_grad=True,
+        ),
+        packed_meta=meta,
+    )
+
+    events: list[str] = []
+    original_start = dist_dsa_module.start_dsa_reverse_route
+    original_finish = dist_dsa_module.finish_dsa_reverse_route
+    original_range = dist_dsa_module.dsa_nvtx_range
+
+    def record_start(grad, route, group, *, attention_mode=None):
+        events.append(f"start:{route.name}")
+        return original_start(grad, route, group, attention_mode=attention_mode)
+
+    def record_finish(transfer):
+        events.append(f"finish:{transfer.route.name}")
+        return original_finish(transfer)
 
     @contextmanager
     def record_range(name: str, *, enabled: bool = True) -> Iterator[None]:
-        del enabled
-        assert name == "attention::csa::backward_overlap::overlap_then_window_reverse"
-        yield
+        marker = "backward_overlap::"
+        if marker in name:
+            events.append(name.split(marker, 1)[1])
+        with original_range(name, enabled=enabled):
+            yield
 
-    def fake_start(grad, route, actual_group, *, attention_mode):
-        del grad
-        assert actual_group is group
-        events.append(("start", route, attention_mode))
-        return route
-
-    def fake_finish(transfer):
-        events.append(("finish", transfer, "csa"))
-        if transfer is overlap_route:
-            return torch.full((3, 4), 3.0, device="cuda")
-        if transfer is window_route:
-            return torch.full((2, 4), 5.0, device="cuda")
-        raise AssertionError("unexpected reverse transfer")
-
+    monkeypatch.setattr(dist_dsa_module, "start_dsa_reverse_route", record_start)
+    monkeypatch.setattr(dist_dsa_module, "finish_dsa_reverse_route", record_finish)
     monkeypatch.setattr(dist_dsa_module, "dsa_nvtx_range", record_range)
-    monkeypatch.setattr(dist_dsa_module, "start_dsa_reverse_route", fake_start)
-    monkeypatch.setattr(dist_dsa_module, "finish_dsa_reverse_route", fake_finish)
 
-    overlap_source = torch.randn(3, 4, device="cuda", requires_grad=True)
-    window_source = torch.randn(2, 4, device="cuda", requires_grad=True)
-    old_overlap_consumer = torch.randn(5, 4, device="cuda", requires_grad=True)
-    old_window_consumer = torch.randn(6, 4, device="cuda", requires_grad=True)
-    (
-        overlap_consumer,
-        window_consumer,
-    ) = dist_dsa_module._CsaBackwardRouteOrderFunction.apply(
-        overlap_source,
-        window_source,
-        old_overlap_consumer,
-        old_window_consumer,
-        overlap_route,
-        window_route,
-        group,
-        torch.cuda.Stream(),
-        torch.cuda.current_stream(),
-    )
-    torch.autograd.backward(
-        (overlap_consumer, window_consumer),
-        (torch.ones_like(overlap_consumer), torch.ones_like(window_consumer)),
-    )
+    result = runtime.calc_dsa(layer.projections(), dsa_input, handle)
+    (result.output.float().square().mean() + result.kl).backward()
     torch.cuda.synchronize()
 
-    assert events == [
-        ("start", overlap_route, "csa"),
-        ("start", window_route, "csa"),
-        ("finish", overlap_route, "csa"),
-        ("finish", window_route, "csa"),
+    routes = [event for event in events if ":" in event]
+    assert routes == [
+        "start:WINDOW_KV",
+        "start:COMPRESSED_KV",
+        "finish:COMPRESSED_KV",
+        "start:OVERLAP_X",
+        "finish:WINDOW_KV",
+        "finish:OVERLAP_X",
     ]
-    torch.testing.assert_close(
-        overlap_source.grad, torch.full_like(overlap_source, 3.0)
+
+    # Every source that fed a route has to come back out of its reverse.
+    for name, tensor in (
+        ("x", dsa_input.x),
+        ("q", dsa_input.q),
+        ("latent_kv", dsa_input.latent_kv),
+        ("sink", dsa_input.sink),
+    ):
+        assert tensor.grad is not None, f"{name} lost its gradient"
+        assert tensor.grad.shape == tensor.shape
+        assert torch.isfinite(tensor.grad.float()).all()
+    assert all(parameter.grad is not None for parameter in layer.parameters())
+
+    # The Main Compressor backward is the only route-independent work HCA owns,
+    # so it has to sit under the two routes launched off the bank split.
+    assert events.index("start:COMPRESSED_KV") < events.index(
+        "main_compressor_backward"
     )
-    torch.testing.assert_close(window_source.grad, torch.full_like(window_source, 5.0))
-    assert old_overlap_consumer.grad is None
-    assert old_window_consumer.grad is None
+    assert events.index("main_compressor_backward") < events.index("finish:WINDOW_KV")
+    if ratio == 4:
+        # CSA additionally hides the terminal OVERLAP_X reverse behind the
+        # Indexer projection backward, which depends on no route at all.
+        assert events.index("indexer_compressor_backward") < events.index(
+            "finish:COMPRESSED_KV"
+        )
+        assert events.index("start:OVERLAP_X") < events.index(
+            "indexer_projection_backward"
+        )
+        assert events.index("indexer_projection_backward") < events.index(
+            "finish:OVERLAP_X"
+        )
 
 
 def _phase_records(world_size: int = 2, steps: int = 2) -> list[dict[str, object]]:

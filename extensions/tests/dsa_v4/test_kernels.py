@@ -1011,7 +1011,9 @@ def test_csa_orchestration_projects_queries_between_initial_start_and_finish(
 
     events: list[str] = []
     original_start = start_dsa_tensor_route
-    original_finish = finish_dsa_tensor_route
+    # The schedule drives its own waits, so the observable wait is the transfer
+    # method rather than the autograd-attaching finish helper.
+    original_wait = dsa_comm_module.DsaRouteTransfer.wait
     original_project = layer.indexer.project_queries
 
     def record_start(source, route, group, *, attention_mode=None):
@@ -1026,9 +1028,9 @@ def test_csa_orchestration_projects_queries_between_initial_start_and_finish(
             attention_mode=attention_mode,
         )
 
-    def record_finish(transfer):
+    def record_wait(transfer):
         events.append(f"finish:{transfer.route.name}")
-        return original_finish(transfer)
+        return original_wait(transfer)
 
     def record_project(*args, **kwargs):
         events.append("project:indexer_q")
@@ -1078,7 +1080,7 @@ def test_csa_orchestration_projects_queries_between_initial_start_and_finish(
         )
 
     monkeypatch.setattr(dist_dsa_module, "start_dsa_tensor_route", record_start)
-    monkeypatch.setattr(dist_dsa_module, "finish_dsa_tensor_route", record_finish)
+    monkeypatch.setattr(dsa_comm_module.DsaRouteTransfer, "wait", record_wait)
     monkeypatch.setattr(layer.indexer, "project_queries", record_project)
     monkeypatch.setattr(dist_dsa_module, "run_grouped_dsa_indexer", fake_indexer)
     monkeypatch.setattr(

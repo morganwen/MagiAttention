@@ -335,7 +335,16 @@ def test_cp1_csa_natural_backward_matches_all_input_and_parameter_gradients() ->
         )
 
 
-def test_cp1_csa_overlap_backward_supports_retain_graph() -> None:
+def test_cp1_csa_backward_runs_once_and_reaches_every_input_and_parameter() -> None:
+    """One backward feeds every input and every model parameter.
+
+    The schedule drives each model callback's subgraph itself and frees it as
+    soon as it has read its gradients, which is what lets a reverse collective
+    be launched before the work that hides it. The cost is that there is no
+    second traversal: retain_graph has no meaning here, and asking for one has
+    to fail loudly rather than silently return stale gradients.
+    """
+
     torch.manual_seed(23)
     config = MagiDSAConfig(ratio=4)
     tokens = 128
@@ -350,57 +359,46 @@ def test_cp1_csa_overlap_backward_supports_retain_graph() -> None:
 
     x = make_input((tokens, config.hidden_size))
     qr = make_input((tokens, config.q_lora_rank))
-    q = make_input(
-        (tokens, config.num_query_heads, config.head_dim),
-        scale=0.25,
-    )
+    q = make_input((tokens, config.num_query_heads, config.head_dim), scale=0.25)
     latent_kv = make_input((tokens, config.head_dim), scale=0.25)
     sink = torch.randn(
-        config.num_query_heads,
-        device="cuda",
-        dtype=torch.float32,
-        requires_grad=True,
+        config.num_query_heads, device="cuda", dtype=torch.float32, requires_grad=True
     )
     meta = MagiDSAPackedMeta((0, tokens), (tokens,))
     runtime = MagiDSARuntimeMgr(
-        config,
-        structural_layout_config=DsaStructuralLayoutConfig(),
+        config, structural_layout_config=DsaStructuralLayoutConfig()
     )
     handle = runtime.prepare_execution(
-        meta,
-        torch.device("cuda"),
-        local_token_capacity=tokens,
+        meta, torch.device("cuda"), local_token_capacity=tokens
     )
     result = runtime.calc_dsa(
         layer.projections(),
         MagiDSAInput(x, qr, q, latent_kv, sink, meta),
         handle,
     )
-    targets = (x, qr, q, latent_kv, sink, *tuple(layer.parameters()))
-    grad_outputs = (
-        torch.randn_like(result.output),
-        torch.ones_like(result.kl),
-    )
-    first = torch.autograd.grad(
+    torch.autograd.backward(
         (result.output, result.kl),
-        targets,
-        grad_outputs,
+        (torch.randn_like(result.output), torch.ones_like(result.kl)),
         retain_graph=True,
-    )
-    second = torch.autograd.grad(
-        (result.output, result.kl),
-        targets,
-        grad_outputs,
     )
     torch.cuda.synchronize()
 
-    for first_gradient, second_gradient in zip(first, second):
-        assert torch.isfinite(first_gradient.float()).all()
-        torch.testing.assert_close(
-            first_gradient.float(),
-            second_gradient.float(),
-            atol=5e-2,
-            rtol=5e-2,
+    for name, tensor in (
+        ("x", x), ("qr", qr), ("q", q), ("latent_kv", latent_kv), ("sink", sink)
+    ):
+        assert tensor.grad is not None, f"{name} received no gradient"
+        assert tensor.grad.shape == tensor.shape
+        assert torch.isfinite(tensor.grad.float()).all(), f"{name} gradient is not finite"
+    for name, parameter in layer.named_parameters():
+        assert parameter.grad is not None, f"{name} received no gradient"
+        assert torch.isfinite(parameter.grad.float()).all()
+
+    # retain_graph was requested above, so the outer graph is still there; the
+    # schedule underneath it is not, and that has to be said plainly.
+    with pytest.raises(RuntimeError, match="retain_graph is not supported"):
+        torch.autograd.backward(
+            (result.output, result.kl),
+            (torch.randn_like(result.output), torch.ones_like(result.kl)),
         )
 
 

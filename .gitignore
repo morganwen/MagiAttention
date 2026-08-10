@@ -230,3 +230,6 @@ CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
 detect_cuda_version.cc
+
+# Upstream Sphinx documentation, not built or tracked in this fork.
+/docs/

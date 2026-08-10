@@ -546,15 +546,31 @@ def make_dsa_device_rank_plan(
     )
 
 
+def compressor_support_rows(
+    source_rows: int,
+    compression: DsaDeviceCompressionMap,
+    support: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Flat source row of every padded support slot, clamped into range."""
+
+    columns = torch.arange(support, device=device, dtype=torch.int32)
+    rows = compression.support_offset.unsqueeze(1) + columns.unsqueeze(0)
+    return rows.clamp_(0, max(source_rows - 1, 0)).reshape(-1).to(torch.int64)
+
+
 def gather_compressor_support(
     overlap_x: torch.Tensor,
     compression: DsaDeviceCompressionMap,
     support: int,
+    rows: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Gather each block's support run, keeping the gradient path differentiable.
 
     ``index_select`` already accumulates duplicate source rows in backward, so
-    the CSA overlap needs no separate CSR reduction.
+    the CSA overlap needs no separate CSR reduction. A caller that drives its
+    own backward passes in the row index it saved and reverses this with
+    ``index_add_`` on the same index.
 
     A rank that produces no compressed block still goes through ``index_select``
     with an empty index rather than returning a fresh tensor. Returning a
@@ -563,9 +579,10 @@ def gather_compressor_support(
     a rank-dependent collective count, which deadlocks the CP group.
     """
 
-    columns = torch.arange(support, device=overlap_x.device, dtype=torch.int32)
-    rows = compression.support_offset.unsqueeze(1) + columns.unsqueeze(0)
-    rows = rows.clamp_(0, max(overlap_x.shape[0] - 1, 0)).reshape(-1).to(torch.int64)
+    if rows is None:
+        rows = compressor_support_rows(
+            overlap_x.shape[0], compression, support, overlap_x.device
+        )
     return overlap_x.index_select(0, rows).view(-1, support, overlap_x.shape[-1])
 
 
@@ -575,6 +592,7 @@ __all__ = [
     "DsaDeviceIndexerMap",
     "DsaDeviceRankPlan",
     "DsaDeviceRoutePlan",
+    "compressor_support_rows",
     "gather_compressor_support",
     "make_dsa_device_rank_plan",
     "make_dsa_device_route_plan",
