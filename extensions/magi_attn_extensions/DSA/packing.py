@@ -555,13 +555,17 @@ def gather_compressor_support(
 
     ``index_select`` already accumulates duplicate source rows in backward, so
     the CSA overlap needs no separate CSR reduction.
+
+    A rank that produces no compressed block still goes through ``index_select``
+    with an empty index rather than returning a fresh tensor. Returning a
+    detached empty here would cut ``overlap_x`` out of the graph, and its
+    ``OVERLAP_X`` reverse collective would then be pruned on that rank alone --
+    a rank-dependent collective count, which deadlocks the CP group.
     """
 
-    if compression.support_offset.numel() == 0:
-        return overlap_x.new_empty((0, support, overlap_x.shape[-1]))
     columns = torch.arange(support, device=overlap_x.device, dtype=torch.int32)
     rows = compression.support_offset.unsqueeze(1) + columns.unsqueeze(0)
-    rows = rows.clamp_(0, overlap_x.shape[0] - 1).reshape(-1).to(torch.int64)
+    rows = rows.clamp_(0, max(overlap_x.shape[0] - 1, 0)).reshape(-1).to(torch.int64)
     return overlap_x.index_select(0, rows).view(-1, support, overlap_x.shape[-1])
 
 

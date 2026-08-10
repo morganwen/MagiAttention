@@ -20,6 +20,7 @@ from magi_attention.utils import nvtx
 
 DSA_MODULE_NVTX_PREFIX = "magi_dsa::module::"
 DSA_CUDNN_CALL_NVTX_PREFIX = "magi_dsa::CUDNN_CALL::"
+DSA_PHASE_NVTX_PREFIX = "magi_dsa::phase::"
 
 
 def _dsa_named_nvtx_range(
@@ -46,6 +47,21 @@ def dsa_cudnn_call_range(
     """Return a prominent NVTX range for one cuDNN frontend wrapper call."""
 
     return _dsa_named_nvtx_range(DSA_CUDNN_CALL_NVTX_PREFIX, name, enabled=enabled)
+
+
+def dsa_collective_launch_range(
+    name: str, *, enabled: bool = True
+) -> AbstractContextManager[object]:
+    """Return the phase-scoped NVTX range used to attribute one collective.
+
+    This deliberately does not use :class:`dsa_phase`. Under
+    ``MAGI_DSA_PHASE_LOG=1`` that helper brackets a phase with a device-wide
+    ``torch.cuda.synchronize()``, which is fine around a coarse phase but
+    deadlocks around an asynchronous collective launch: the launching rank
+    blocks inside the sync while its peers move on to the next collective.
+    """
+
+    return _dsa_named_nvtx_range(DSA_PHASE_NVTX_PREFIX, name, enabled=enabled)
 
 
 __all__ = [

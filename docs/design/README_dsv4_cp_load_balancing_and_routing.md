@@ -36,7 +36,7 @@ DSA 内的数据移动:
     required rows + typed All2AllV
 
 反向通信语义:
-    reverse All2AllV + local/owner CSR reduction
+    Core group-reduce back to the producer/source owner
 
 一期 solver 目标:
     平衡计算 makespan
@@ -428,7 +428,7 @@ shared Query layout 不保证 compressed row 的唯一 producer 同时持有该�
 1. planner 为每个 compressed row 指定唯一 producer；
 2. producer 缺少的 hidden support 通过 `OVERLAP_X` All2AllV 获取；
 3. forward 在 producer 上完成 sample-relative compressor；
-4. backward 使用 reverse All2AllV + CSR reduction 把 `dX` 返回原 source owner。
+4. backward 使用对偶的 Core group-reduce 把 `dX` 返回原 source owner。
 
 默认 chunk 512 同时能被 4 和 128 整除，只是减少跨 chunk support 的性能优化，不是
 correctness 前提。当前设计因此不需要靠 doc padding 修复 block 对齐。
@@ -477,31 +477,29 @@ HCA backward:
 ```
 
 每条 route 独立建图，拥有自己的 global-to-local map、unique receive、send pack 和
-reverse CSR。当前 planner 恰好为 CSA KI/KV 选择相同 compressed physical row order，
+reverse group-reduce。当前 planner 为 CSA KI/KV 选择相同 compressed range plan，
 但 ABI 不允许依赖它们相等，后续可以独立变化。
 
 ### 7.3 Group-cast / group-reduce 的准确含义
 
-这里的 group-cast/group-reduce 是通信语义，不是要求改用 native grpcoll primitive：
+group-cast/group-reduce 现在就是 Core 的同名 primitive，不再只是一种语义描述：
 
 ```text
 group-cast:
-    producer/source pack
-    -> all2all_v
+    owner ranges + consumer ranges
+    -> Core group_cast（内部 A2AV，输出按全局行升序）
     -> consumer unique bank
 
 group-reduce:
     consumer unique gradient
-    -> inverse consumer/received-order pack
-    -> reverse all2all_v
-    -> producer/source restore or owner CSR reduction
+    -> Core group_reduce（同一个 GroupCollectiveArg 的对偶参数）
+    -> producer/source owner gradient
 ```
 
-当前 production 继续使用 Magi `all2all_v` + local CSR；这与 Magi-MSA 的实际 group-reduce
-基础一致。只有可微 backend pack 产生重复 row 时，才需要在 reverse route 前先做 consumer-local
-coalesce；它不是每条 route 都固定存在的阶段。当前 grouped Indexer K pack 的 scorer 是
-`no_grad`，selected dKI 直接回到 unique KI bank，因此该 pack 的 backward CSR 次数为 0。
-`MAGI_ATTENTION_NATIVE_GRPCOLL=1` 不是目标。
+DSA 不再自己拼 `all2all_v`，也不再自己写 pack 与 CSR。只有可微 backend pack 产生重复 row
+时才需要 consumer-local coalesce；当前 grouped Indexer K pack 的 scorer 是 `no_grad`，
+selected dKI 直接回到 unique KI bank，所以该 pack 没有 backward 归约。
+`MAGI_ATTENTION_NATIVE_GRPCOLL=1` 仍不是目标，route 走 A2AV backend。
 
 当前也已经没有 full-K AllGather，所以不能把“group-cast/group-reduce 替换 AllGather”
 写成未来迁移；它已经是当前 typed-route 的语义。
@@ -543,11 +541,11 @@ backward 同样先发起可用的 reverse route，再做独立 backward，最后
 
 - required-range 去重；
 - consumer/sample 最长前缀；
-- `DsaGroupCollectiveArg`；
-- backend 可直接消费时采用 destination/owner-major buffer layout；HCA `OVERLAP_X`
-  是例外，保持 Compressor 可直接消费的 global-block order；
-- reverse CSR；
-- launch/wait 分离；stream 由 handle 持有，event/work/buffer/gate state 逐 invocation 私有。
+- 复用 Core 的 `_calc_group_collective_arg_from_ranges` 做 route lowering；
+- consumer bank 由 Core group-cast 直接给出全局行升序，两侧都不需要 permute；
+- reverse 是同一个 `GroupCollectiveArg` 的 group-reduce；
+- launch/wait 分离；stream 由 handle 持有，event/work/buffer/gate state 逐 invocation 私有；
+- 参数不属于 runtime，通过 `DsaProjections` callback 由模型侧提供。
 
 DSA 不能直接照搬的是 MSA 的 shared physical prefix ABI：固定 cuDNN grouped Indexer
 仍要求 per-fragment contiguous K pack。
@@ -575,7 +573,7 @@ CSA backward 的意图是：
 flowchart LR
     KLS["scale saved unit Indexer gradients"] --> KIS["start COMPRESSED_KI reverse"]
     KIS -.->|并行| SAB["cuDNN sparse-attention backward"]
-    KIS --> KIF["finish KI reverse + owner CSR"]
+    KIS --> KIF["finish KI reverse group-reduce"]
     KIF --> ICB["Indexer Compressor backward"]
     SAB --> KVB["start COMPRESSED_KV reverse"]
     KVB --> MCB["wait CKV -> Main Compressor backward"]
@@ -640,7 +638,7 @@ mean coverage =
     arithmetic mean of 40 rank-step fractions
 ```
 
-non-route compute 显式排除 NCCL、`DsaRowCopy`、`DsaRowCsrReduce` 和 collective scope。
+non-route compute 显式排除 NCCL、Core `range_gather`/`range_sum_reduce` 和 collective scope。
 “未覆盖”只表示未被同 mode compute 覆盖的 route kernel 时间，不能直接等同端到端 GPU bubble。
 
 | Route | 分类 | 正 overlap | 平均 route ms | 平均 overlap ms | 平均未覆盖 ms | 平均覆盖率 |
@@ -897,7 +895,7 @@ installed-wheel image:
 | doc pad 到 16 | 删除；使用 sample-relative compression block + `OVERLAP_X` |
 | CTA 不跨 doc | 删除；correctness 与 CTA 边界解耦 |
 | AG/RS 暴露分析 | 替换成当前 `4F+4B / 3F+3B` route trace |
-| group-cast/group-reduce 替换 AllGather | 改成当前已有的 All2AllV + CSR 通信语义 |
+| group-cast/group-reduce 替换 AllGather | 已经是当前实现，直接调用 Core group_cast/group_reduce |
 | “通信先放低优先级” | 改成“不进入一期 objective，但必须完整测量与归因” |
 
 最终判断：第一份 structural balancing README 的 cost/dispatch 方向足以作为当前一期方案，

@@ -25,13 +25,10 @@ _STRUCTURAL_CONFIG = {
     "min_chunks_per_rank": 16,
     "uneven_shard": True,
 }
+# One planner, and the main stack is CSA plus HCA only.
 _CP8_PLAN_POLICIES = {
-    "csa_balanced": "indexer_balanced",
-    "csa_sequential": "sequential",
     "csa_structural": "structural_balanced",
-    "hca": "sequential",
     "hca_structural": "structural_balanced",
-    "window": "sequential",
 }
 
 
@@ -165,9 +162,7 @@ def _validate_cp8_structural_results(
             raise ValueError(f"rank {rank} CP8 plan evidence is incomplete")
         validated: dict[str, dict[str, object]] = {}
         for label, policy in _CP8_PLAN_POLICIES.items():
-            ratio = (
-                4 if label.startswith("csa_") else 128 if label.startswith("hca") else 0
-            )
+            ratio = 4 if label.startswith("csa_") else 128
             plan = _validate_plan_evidence(
                 evidence_by_label[label],
                 field=f"rank {rank}.{label}",

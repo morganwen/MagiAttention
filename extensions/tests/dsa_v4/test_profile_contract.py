@@ -77,30 +77,6 @@ from scripts.profile.extract_nsys import (
     extract_profile_records,
 )
 from scripts.profile.summarize_5step import compute_rank_ranges, validate_phase_records
-from scripts.profile.summarize_attention_suite import (
-    _validate_attention_suite_resource_signatures,
-    _validate_clock_control,
-    _validate_shared_layout_metadata,
-    compute_attention_suite_communication_overlap,
-    compute_attention_suite_rank_ranges,
-    compute_attention_suite_step_kernel_spans,
-    compute_csa_communication_overlap,
-    validate_attention_suite_core_kernels,
-    validate_attention_suite_records,
-    validate_attention_suite_sendrecv,
-)
-from scripts.profile.summarize_dispatch_ablation import (
-    _hca_forward_breakdown,
-    _validate_pass_trajectory,
-)
-from scripts.profile.summarize_forward_backward import (
-    compute_csa_backward_route_overlap,
-    compute_forward_backward_rank_ranges,
-    count_model_projection_nvtx_ranges,
-    count_scalar_loss_nvtx_ranges,
-    count_token_layout_nvtx_ranges,
-    validate_forward_backward_records,
-)
 from scripts.profile.summarize_pro_pair import (
     _validate_pro_runtime_bundle_payload,
     compute_compressor_timings,
@@ -1792,85 +1768,6 @@ def test_nsys_sqlite_extracts_exact_logical_grid(tmp_path: Path) -> None:
     assert all(record["gpu_time_ms"] == 0.0005 for record in records)
 
 
-def test_nsys_sqlite_extracts_forward_backward_grid(tmp_path: Path) -> None:
-    sqlite_path = tmp_path / "forward_backward.sqlite"
-    report_path = tmp_path / "forward_backward.nsys-rep"
-    report_path.write_bytes(b"fixture")
-    _create_nsys_fixture(
-        sqlite_path,
-        "balanced",
-        world_size=2,
-        steps=2,
-        step_mode="forward-backward",
-    )
-    connection = sqlite3.connect(sqlite_path)
-    global_pid = 1000 << 24
-    worker_tid = global_pid + 456
-    connection.execute(
-        "INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME(start, end, globalTid, correlationId) "
-        "VALUES(?, ?, ?, ?)",
-        (1_700, 1_800, worker_tid, 10_000),
-    )
-    connection.execute(
-        "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL"
-        "(start, end, correlationId, globalPid, shortName) "
-        "VALUES(?, ?, ?, ?, 1)",
-        (1_900, 2_200, 10_000, global_pid),
-    )
-    connection.commit()
-    connection.close()
-    records, summary = extract_profile_records(
-        sqlite_path,
-        report_path,
-        "balanced",
-        world_size=2,
-        steps=2,
-        step_mode="forward-backward",
-    )
-    assert len(validate_forward_backward_records(records, 2, 2)) == 20
-    assert len(compute_forward_backward_rank_ranges(records, 2, 2)) == 10
-    assert summary["logical_phase_records"] == 20
-    assert summary["step_mode"] == "forward-backward"
-    backward = next(
-        record
-        for record in records
-        if record["rank"] == 0 and record["step"] == 0 and record["phase"] == "backward"
-    )
-    assert backward["kernel_launch_count"] == 2
-    assert backward["gpu_time_ms"] == 0.0008
-    assert backward["same_thread_kernel_launch_count"] == 1
-    assert backward["process_temporal_kernel_launch_count"] == 1
-
-
-def test_nsys_sqlite_extracts_attention_suite_grid(tmp_path: Path) -> None:
-    sqlite_path = tmp_path / "attention_suite.sqlite"
-    report_path = tmp_path / "attention_suite.nsys-rep"
-    report_path.write_bytes(b"fixture")
-    _create_nsys_fixture(
-        sqlite_path,
-        "balanced",
-        world_size=2,
-        steps=2,
-        step_mode="attention-suite",
-    )
-    records, summary = extract_profile_records(
-        sqlite_path,
-        report_path,
-        "balanced",
-        world_size=2,
-        steps=2,
-        step_mode="attention-suite",
-    )
-    assert len(validate_attention_suite_records(records, 2, 2)) == 44
-    assert len(compute_attention_suite_rank_ranges(records, 2, 2)) == 22
-    assert summary["logical_phase_records"] == 44
-    assert summary["step_mode"] == "attention-suite"
-    names = {record["phase"]: record["nvtx_name"] for record in records}
-    assert names["w_forward"] == "magi_dsa::attention_suite::w::forward"
-    assert names["csa_backward"] == "magi_dsa::attention_suite::csa::backward"
-    assert names["hca_forward"] == "magi_dsa::attention_suite::hca::forward"
-
-
 def test_nsys_sqlite_extracts_pro_pair_grid(tmp_path: Path) -> None:
     sqlite_path = tmp_path / "pro_pair.sqlite"
     report_path = tmp_path / "pro_pair.nsys-rep"
@@ -2249,44 +2146,44 @@ def test_pro_pair_reports_routes_serialization_and_support_overheads() -> None:
         (
             "csa",
             "forward",
-            "kernel_DsaRowCopy",
+            "range_gather_per_range_kernel",
             "magi_dsa::module::packing::csa::indexer_key_support::forward_copy",
         ),
         (
             "csa",
             "forward",
-            "kernel_DsaRowCopy",
+            "range_gather_per_range_kernel",
             "magi_dsa::module::route::attention::csa::WINDOW_KV::forward::send_pack",
         ),
         (
             "csa",
             "backward",
-            "kernel_DsaRowCsrReduce",
-            "magi_dsa::module::route::attention::csa::WINDOW_KV::backward::owner_csr_reduce",
+            "range_sum_reduce_deter_kernel",
+            "magi_dsa::module::route::attention::csa::WINDOW_KV::backward::owner_reduce",
         ),
         (
             "hca",
             "forward",
-            "kernel_DsaRowCopy",
+            "range_gather_per_range_kernel",
             "magi_dsa::module::route::attention::hca::WINDOW_KV::forward::send_pack",
         ),
         (
             "hca",
             "backward",
-            "kernel_DsaRowCsrReduce",
-            "magi_dsa::module::route::attention::hca::WINDOW_KV::backward::owner_csr_reduce",
+            "range_sum_reduce_deter_kernel",
+            "magi_dsa::module::route::attention::hca::WINDOW_KV::backward::owner_reduce",
         ),
         (
             "csa",
             "forward",
             "CatArrayBatchedCopy_vectorized",
-            "magi_dsa::module::attention::kv_bank_assembly",
+            "magi_dsa::module::attention::csa::kv_bank_assembly",
         ),
         (
             "hca",
             "forward",
             "CatArrayBatchedCopy_vectorized",
-            "magi_dsa::module::attention::kv_bank_assembly",
+            "magi_dsa::module::attention::hca::kv_bank_assembly",
         ),
     )
     phase_offsets = {pair: index * 10_000 for index, pair in enumerate(serial_order)}
@@ -2531,7 +2428,7 @@ def test_pro_pair_reports_routes_serialization_and_support_overheads() -> None:
             "runtime_start_ns": runtime_start + 2,
         },
     ]
-    with pytest.raises(ValueError, match="DsaRowCopy count differs"):
+    with pytest.raises(ValueError, match="range_gather count differs"):
         compute_support_overhead_timings(
             duplicate_grouped_k_pack,
             [
@@ -2571,19 +2468,19 @@ def test_pro_pair_reports_routes_serialization_and_support_overheads() -> None:
                 {"name": "magi_dsa::pro_pair::csa::backward"},
                 {
                     "name": "magi_dsa::module::packing::csa::"
-                    "indexer_key_support::backward_csr_reduce"
+                    "indexer_key_support::backward_reduce"
                 },
             ],
             "gpu_time_ms": 0.0001,
             "kernel_end_ns": 31_100,
-            "kernel_name": "kernel_DsaRowCsrReduce",
+            "kernel_name": "range_sum_reduce_deter_kernel",
             "kernel_start_ns": 31_000,
             "rank": 0,
             "runtime_start_ns": runtime_start,
             "step": 0,
         },
     ]
-    with pytest.raises(ValueError, match="unexpectedly ran backward CSR"):
+    with pytest.raises(ValueError, match="unexpectedly ran a backward reduction"):
         compute_support_overhead_timings(
             unexpected,
             [
@@ -2601,706 +2498,6 @@ def test_pro_pair_reports_routes_serialization_and_support_overheads() -> None:
             world_size=1,
             steps=1,
         )
-
-
-def test_attention_suite_validates_shared_layout_metadata(tmp_path: Path) -> None:
-    solver = {
-        "candidate_evaluations": 123,
-        "cost_model_version": "b300_sm103_structural_proxy_v1",
-        "improvement_steps": 4,
-        "solver_scheme": "deterministic_greedy_local_improve_v1",
-        "stop_reason": "pass_limit",
-    }
-    shared_config = {
-        "ki_memory_budget_bytes": 1 << 30,
-        "ki_workspace_reserve_bytes": 256 << 20,
-        "local_improvement_passes": 4,
-    }
-    layout_key = [107, 207, 36, 8]
-    for rank in range(8):
-        rank_cost = {
-            "fragment_count": 1,
-            "hca_cost": 200 + rank,
-            "indexer_cost": 100 + rank,
-            "modeled_ki_bytes": (300 << 20) + rank,
-            "rank": rank,
-            "token_layout_remote_rows": rank + 1,
-        }
-        attention_modes = {
-            mode: {
-                "final_query_tokens": 16384,
-                "layout_key": layout_key,
-                "layout_rank_cost": rank_cost,
-                "layout_solver": solver,
-                "policy": "shared_greedy",
-                "prepare_seconds": 1.0 + 0.1 * mode_index,
-                "query_layout_hash": "shared-layout-hash",
-                "token_layout_forward_ms": 0.1 + 0.01 * rank + 0.001 * mode_index,
-            }
-            for mode_index, mode in enumerate(("w", "csa", "hca"))
-        }
-        (tmp_path / f"metadata_rank{rank}.json").write_text(
-            json.dumps(
-                {
-                    "attention_modes": attention_modes,
-                    "layout_policy": "shared-greedy",
-                    "shared_layout_config": shared_config,
-                }
-            ),
-            encoding="utf-8",
-        )
-
-    summary = _validate_shared_layout_metadata(
-        tmp_path,
-        8,
-        {"layout_policy": "shared-greedy"},
-    )
-    assert summary["layout_key"] == layout_key
-    assert summary["query_layout_hash"] == "shared-layout-hash"
-    assert summary["query_token_counts"] == [16384] * 8
-    assert summary["token_layout_remote_rows"] == 36
-    assert summary["modeled_ki_bytes"]["max"] == (300 << 20) + 7
-    assert summary["token_layout_forward_ms"]["w"]["min"] == pytest.approx(0.1)
-    assert summary["prepare_seconds"]["w"]["min"] == pytest.approx(1.0)
-
-    broken = json.loads((tmp_path / "metadata_rank7.json").read_text())
-    broken["attention_modes"]["hca"]["query_layout_hash"] = "different"
-    (tmp_path / "metadata_rank7.json").write_text(
-        json.dumps(broken),
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="Query layout hash differs"):
-        _validate_shared_layout_metadata(
-            tmp_path,
-            8,
-            {"layout_policy": "shared-greedy"},
-        )
-
-
-def test_attention_suite_validates_fixed_clock_audit(tmp_path: Path) -> None:
-    (tmp_path / "CLOCK_CONTROL.txt").write_text(
-        "\n".join(
-            (
-                "mode=nvml_lock_gpu_clocks",
-                "requested_graphics_clock_mhz=1800",
-                "gpu_count=8",
-                "verified=true",
-                "reset_required=true",
-                "reset_verified=true",
-            )
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    before = "\n".join(f"{rank}, GPU-{rank}, 120, 2032" for rank in range(8))
-    locked = "\n".join(f"{rank}, GPU-{rank}, 1800, 2032" for rank in range(8))
-    reset = "\n".join(f"{rank}, GPU-{rank}, 120, 2032" for rank in range(8))
-    (tmp_path / "CLOCKS_BEFORE_LOCK.csv").write_text(before + "\n", encoding="utf-8")
-    (tmp_path / "CLOCKS_LOCKED.csv").write_text(locked + "\n", encoding="utf-8")
-    (tmp_path / "CLOCKS_AFTER_RESET.csv").write_text(reset + "\n", encoding="utf-8")
-
-    result = _validate_clock_control(tmp_path, {"gpu_clock_lock_mhz": 1800})
-    assert result == {
-        "mode": "nvml_lock_gpu_clocks",
-        "requested_graphics_clock_mhz": 1800,
-        "reset_verified": True,
-        "verified_gpu_count": 8,
-    }
-
-    (tmp_path / "CLOCKS_LOCKED.csv").write_text(
-        locked.replace("1800", "1799", 1) + "\n",
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="verification records differ"):
-        _validate_clock_control(tmp_path, {"gpu_clock_lock_mhz": 1800})
-
-    (tmp_path / "CLOCKS_LOCKED.csv").write_text(locked + "\n", encoding="utf-8")
-    (tmp_path / "CLOCKS_AFTER_RESET.csv").write_text(
-        reset.replace("120", "1800", 1) + "\n",
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="verification records differ"):
-        _validate_clock_control(tmp_path, {"gpu_clock_lock_mhz": 1800})
-
-
-def test_dispatch_ablation_decomposes_hca_forward(tmp_path: Path) -> None:
-    records = []
-    for step in range(5):
-        for rank in range(8):
-            durations = (1_000_000 + rank, 200_000 + step, 300_000)
-            records.append(
-                {
-                    "gpu_time_ms": sum(durations) / 1_000_000.0,
-                    "kernels": [
-                        {
-                            "duration_ns": durations[0],
-                            "name": "sparse_attn_fwd_for_small_topk_kernel",
-                        },
-                        {
-                            "duration_ns": durations[1],
-                            "name": "ncclDevKernel_SendRecv",
-                        },
-                        {"duration_ns": durations[2], "name": "other_kernel"},
-                    ],
-                    "phase": "hca_forward",
-                    "rank": rank,
-                    "step": step,
-                }
-            )
-    (tmp_path / "profile_attention_suite.jsonl").write_text(
-        "".join(json.dumps(record) + "\n" for record in records),
-        encoding="utf-8",
-    )
-    summary = _hca_forward_breakdown(tmp_path)
-    assert summary["sparse_attention"]["per_step"][0]["min"] == 1.0
-    assert summary["nccl"]["per_step"][4]["mean"] == pytest.approx(0.200004)
-    assert summary["total"]["steady_steps_1_to_4"][
-        "mean_rank_time_ms"
-    ] == pytest.approx(1.500006)
-
-
-def test_dispatch_ablation_validates_monotonic_pass_trajectory() -> None:
-    records = [
-        {
-            "layout_key": [100 - passes, 200, 300, 400],
-            "local_improvement_passes": passes,
-            "query_layout_hash": f"hash-{passes}",
-        }
-        for passes in (0, 1, 4, 8)
-    ]
-    records.append(dict(records[2]))
-    trajectory = _validate_pass_trajectory(records)
-    assert trajectory["complete_pass_matrix"] is True
-    assert trajectory["present_passes"] == [0, 1, 4, 8]
-    assert trajectory["pass4_to_pass8_indexer_relative_improvement"] == pytest.approx(
-        4 / 96
-    )
-
-    records[-2]["layout_key"] = [101, 200, 300, 400]
-    with pytest.raises(ValueError, match="worsened"):
-        _validate_pass_trajectory(records)
-
-
-def test_attention_suite_sendrecv_contract_is_mode_specific() -> None:
-    expected = {
-        "backward": 8,
-        "csa_backward": 4,
-        "csa_forward": 4,
-        "forward": 8,
-        "hca_backward": 3,
-        "hca_forward": 3,
-        "w_backward": 1,
-        "w_forward": 1,
-    }
-    records = [
-        {
-            "kernel_name_counts": {"ncclDevKernel_SendRecv": count},
-            "phase": phase,
-            "rank": 0,
-            "step": 0,
-        }
-        for phase, count in expected.items()
-    ]
-    validate_attention_suite_sendrecv(records)
-    records[0]["kernel_name_counts"] = {"ncclDevKernel_SendRecv": 7}
-    with pytest.raises(ValueError, match="SendRecv count differs"):
-        validate_attention_suite_sendrecv(records)
-
-
-def test_attention_suite_audits_csa_communication_compute_overlap() -> None:
-    def record(
-        kernel_name: str,
-        runtime_start_ns: int,
-        kernel_start_ns: int,
-        kernel_end_ns: int,
-        *scopes: str,
-    ) -> dict[str, object]:
-        return {
-            "attribution_path": [{"name": scope} for scope in scopes],
-            "kernel_end_ns": kernel_end_ns,
-            "kernel_name": kernel_name,
-            "kernel_start_ns": kernel_start_ns,
-            "rank": 0,
-            "runtime_end_ns": runtime_start_ns + 1,
-            "runtime_start_ns": runtime_start_ns,
-            "step": 0,
-        }
-
-    csa_forward = "magi_dsa::attention_suite::csa::forward"
-    csa_backward = "magi_dsa::attention_suite::csa::backward"
-    ki_forward = (
-        "magi_dsa::phase::collective_all2all_v::"
-        "attention::csa::COMPRESSED_KI.forward"
-    )
-    ki_backward = (
-        "magi_dsa::phase::collective_all2all_v::"
-        "attention::csa::COMPRESSED_KI.backward"
-    )
-    main_compressor = "magi_dsa::module::compressor::main"
-    sparse_backward = (
-        "magi_dsa::module::attention::csa::sparse_attention::cudnn_backward"
-    )
-    records = [
-        record(
-            "ncclDevKernel_SendRecv",
-            10,
-            100,
-            200,
-            csa_forward,
-            ki_forward,
-        ),
-        record(
-            "main_compressor_kernel",
-            20,
-            150,
-            260,
-            csa_forward,
-            main_compressor,
-        ),
-        record(
-            "ncclDevKernel_SendRecv",
-            30,
-            300,
-            450,
-            csa_backward,
-            ki_backward,
-        ),
-        record(
-            "sparse_backward_kernel",
-            40,
-            400,
-            500,
-            csa_backward,
-            sparse_backward,
-        ),
-    ]
-
-    audit = compute_csa_communication_overlap(records, world_size=1, steps=1)
-    assert audit["result"] == "PASS"
-    assert audit["forward"]["ki_before_compute_launch"]
-    assert audit["forward"]["overlap_us"]["mean"] == pytest.approx(0.05)
-    assert audit["backward"]["ki_before_compute_launch"]
-    assert audit["backward"]["overlap_us"]["mean"] == pytest.approx(0.05)
-
-    records[0]["runtime_start_ns"] = 25
-    with pytest.raises(ValueError, match="not launched before compute"):
-        compute_csa_communication_overlap(records, world_size=1, steps=1)
-
-
-def test_attention_suite_audits_every_route_order_and_gpu_overlap() -> None:
-    route_orders = {
-        ("w", "forward"): ("WINDOW_KV",),
-        ("w", "backward"): ("WINDOW_KV",),
-        ("csa", "forward"): (
-            "WINDOW_KV",
-            "OVERLAP_X",
-            "COMPRESSED_KI",
-            "COMPRESSED_KV",
-        ),
-        ("csa", "backward"): (
-            "COMPRESSED_KI",
-            "COMPRESSED_KV",
-            "OVERLAP_X",
-            "WINDOW_KV",
-        ),
-        ("hca", "forward"): ("OVERLAP_X", "WINDOW_KV", "COMPRESSED_KV"),
-        ("hca", "backward"): ("COMPRESSED_KV", "WINDOW_KV", "OVERLAP_X"),
-    }
-    mode_serial_order = (
-        ("w", "forward"),
-        ("csa", "forward"),
-        ("hca", "forward"),
-        ("hca", "backward"),
-        ("csa", "backward"),
-        ("w", "backward"),
-    )
-    records: list[dict[str, object]] = []
-    runtime_start = 10
-    for phase_index, (mode, direction) in enumerate(mode_serial_order):
-        phase_start = phase_index * 2_000
-        phase_scope = f"magi_dsa::attention_suite::{mode}::{direction}"
-        records.append(
-            {
-                "attribution_name": phase_scope,
-                "attribution_path": [{"name": phase_scope}],
-                "kernel_end_ns": phase_start + 1_100,
-                "kernel_name": f"{mode}_{direction}_compute_kernel",
-                "kernel_start_ns": phase_start + 100,
-                "rank": 0,
-                "runtime_start_ns": runtime_start,
-                "step": 0,
-            }
-        )
-        runtime_start += 10
-        phase_routes = route_orders[(mode, direction)]
-        for route in phase_routes:
-            route_index = phase_routes.index(route)
-            kernel_start = phase_start + 200 + route_index * 200
-            route_scope = (
-                "magi_dsa::phase::collective_all2all_v::"
-                f"attention::{mode}::{route}.{direction}"
-            )
-            records.append(
-                {
-                    "attribution_name": route_scope,
-                    "attribution_path": [
-                        {"name": phase_scope},
-                        {"name": route_scope},
-                    ],
-                    "kernel_end_ns": kernel_start + 100,
-                    "kernel_name": "ncclDevKernel_SendRecv",
-                    "kernel_start_ns": kernel_start,
-                    "rank": 0,
-                    "runtime_start_ns": runtime_start,
-                    "step": 0,
-                }
-            )
-            runtime_start += 10
-
-    audit = compute_attention_suite_communication_overlap(
-        records,
-        world_size=1,
-        steps=1,
-    )
-    assert audit["result"] == "PASS"
-    assert audit["route_launch_order_is_hard_gate"]
-    for mode, directions in audit["routes"].items():
-        for direction, route_metrics_by_name in directions.items():
-            for route, metrics in route_metrics_by_name.items():
-                assert mode and direction and route
-                assert metrics["positive_gpu_overlap_records"] == 1
-                assert metrics["overlap_fraction"]["mean"] == 1.0
-                assert metrics["foreign_compute_overlap_us"]["mean"] == 0.0
-    assert audit["mode_serialization_is_hard_gate"]
-    assert audit["cross_mode_gpu_overlap_is_hard_gate"]
-    assert audit["foreign_compute_overlap_records"] == 0
-
-    spans = compute_attention_suite_step_kernel_spans(
-        records,
-        world_size=1,
-        steps=1,
-    )
-    assert spans["step_span_ms"]["mean"] == pytest.approx(0.011)
-    foreign_records = [
-        {
-            **record,
-            "attribution_path": [
-                dict(scope)
-                for scope in cast(
-                    list[dict[str, object]], record.get("attribution_path", [])
-                )
-                if isinstance(scope, dict)
-            ],
-        }
-        for record in records
-    ]
-    csa_forward = "magi_dsa::attention_suite::csa::forward"
-    foreign_records.append(
-        {
-            "attribution_name": csa_forward,
-            "attribution_path": [{"name": csa_forward}],
-            "kernel_end_ns": 280,
-            "kernel_name": "csa_foreign_compute_kernel",
-            "kernel_start_ns": 220,
-            "rank": 0,
-            "runtime_start_ns": 5,
-            "step": 0,
-        }
-    )
-    with pytest.raises(ValueError, match="cross-mode GPU execution overlap"):
-        compute_attention_suite_communication_overlap(
-            foreign_records,
-            world_size=1,
-            steps=1,
-        )
-    no_w_self_overlap_records = [
-        {
-            **record,
-            "attribution_path": [
-                dict(scope)
-                for scope in cast(
-                    list[dict[str, object]], record.get("attribution_path", [])
-                )
-                if isinstance(scope, dict)
-            ],
-        }
-        for record in records
-    ]
-    for record in no_w_self_overlap_records:
-        if record.get("attribution_name") == "magi_dsa::attention_suite::w::forward":
-            record["kernel_start_ns"] = 400
-            record["kernel_end_ns"] = 500
-            break
-    no_w_self_overlap = compute_attention_suite_communication_overlap(
-        no_w_self_overlap_records,
-        world_size=1,
-        steps=1,
-    )
-    w_forward_metrics = no_w_self_overlap["routes"]["w"]["forward"]["WINDOW_KV"]
-    assert w_forward_metrics["positive_gpu_overlap_records"] == 0
-    assert w_forward_metrics["dependency"]["candidate"] is False
-    assert (
-        w_forward_metrics["dependency"]["reason_code"]
-        == "no_independent_w_forward_compute"
-    )
-    hca_forward = [
-        record
-        for record in records
-        if str(record["attribution_name"]).endswith(
-            ("hca::OVERLAP_X.forward", "hca::WINDOW_KV.forward")
-        )
-    ]
-    hca_forward[0]["runtime_start_ns"], hca_forward[1]["runtime_start_ns"] = (
-        hca_forward[1]["runtime_start_ns"],
-        hca_forward[0]["runtime_start_ns"],
-    )
-    with pytest.raises(ValueError, match="route launch order differs"):
-        compute_attention_suite_communication_overlap(
-            records,
-            world_size=1,
-            steps=1,
-        )
-
-
-def test_forward_backward_audits_every_csa_reverse_compute_overlap() -> None:
-    backward_scope = "magi_dsa::backward"
-    records: list[dict[str, object]] = [
-        {
-            "attribution_path": [{"name": backward_scope}],
-            "kernel_end_ns": 1_000,
-            "kernel_name": "projection_backward_kernel",
-            "kernel_start_ns": 100,
-            "rank": 0,
-            "step": 0,
-        }
-    ]
-    for index, route in enumerate(
-        ("COMPRESSED_KI", "COMPRESSED_KV", "OVERLAP_X", "WINDOW_KV")
-    ):
-        start = 200 + index * 150
-        route_scope = (
-            "magi_dsa::phase::collective_all2all_v::"
-            f"attention::csa::{route}.backward"
-        )
-        records.append(
-            {
-                "attribution_path": [
-                    {"name": backward_scope},
-                    {"name": route_scope},
-                ],
-                "kernel_end_ns": start + 100,
-                "kernel_name": "ncclDevKernel_SendRecv",
-                "kernel_start_ns": start,
-                "rank": 0,
-                "step": 0,
-            }
-        )
-
-    audit = compute_csa_backward_route_overlap(records, world_size=1, steps=1)
-    assert audit["result"] == "PASS"
-    for route in ("COMPRESSED_KI", "COMPRESSED_KV", "OVERLAP_X", "WINDOW_KV"):
-        result = audit["routes"][route]
-        assert result["positive_gpu_overlap_records"] == 1
-        assert result["overlap_fraction"]["mean"] == 1.0
-
-    records[-1]["kernel_start_ns"] = 1_100
-    records[-1]["kernel_end_ns"] = 1_200
-    with pytest.raises(ValueError, match="has no GPU compute overlap"):
-        compute_csa_backward_route_overlap(records, world_size=1, steps=1)
-
-
-def test_attention_suite_core_kernel_contract_is_shared_and_sparse() -> None:
-    backward_names = {
-        "kernel_cutlass_bwd_cudnn_sparse_attention_backward": 1,
-        "kernel_cutlass_convert_cudnn_sparse_attention_backward": 1,
-        "kernel_cutlass_sum_OdO_cudnn_sparse_attention_backward": 1,
-        "kernel_cutlass_sum_dSink_cudnn_sparse_attention_backward": 1,
-    }
-    records = []
-    for mode in ("w", "csa", "hca"):
-        forward_names = {"sparse_attn_fwd_for_small_topk_kernel": 1}
-        if mode == "csa":
-            forward_names["kernel_cutlass_kernel_gemm_cudnn_indexer_backward_sm100"] = 1
-        records.extend(
-            [
-                {
-                    "kernel_launch_count": sum(forward_names.values()),
-                    "kernel_name_counts": forward_names,
-                    "phase": f"{mode}_forward",
-                    "rank": 0,
-                    "step": 0,
-                },
-                {
-                    "kernel_launch_count": sum(backward_names.values()),
-                    "kernel_name_counts": backward_names,
-                    "phase": f"{mode}_backward",
-                    "rank": 0,
-                    "step": 0,
-                },
-            ]
-        )
-
-    audit = validate_attention_suite_core_kernels(records)
-    assert audit["core_kernel_names"]["flashmla_forward"] == (
-        "sparse_attn_fwd_for_small_topk_kernel"
-    )
-    assert audit["pairwise_exact_kernel_name_sets"]["w_hca_backward"] == {
-        "intersection": 4,
-        "left_only": 0,
-        "right_only": 0,
-    }
-
-    csa_forward = next(record for record in records if record["phase"] == "csa_forward")
-    csa_forward["kernel_name_counts"] = {
-        "sparse_attn_fwd_for_small_topk_kernel": 1,
-        "kernel_cutlass_kernel_gemm_dense_indexer_backward_sm100": 1,
-    }
-    with pytest.raises(ValueError, match="dense Indexer backward"):
-        validate_attention_suite_core_kernels(records)
-
-
-def test_attention_suite_resource_contract_allows_only_csa_register_specialization() -> (
-    None
-):
-    flashmla_three_output = (
-        "sparse_attn_fwd_for_small_topk_kernel",
-        126,
-        384,
-        1,
-        1,
-        0,
-        230656,
-    )
-    flashmla_dual_lse = (
-        "sparse_attn_fwd_for_small_topk_kernel",
-        128,
-        384,
-        1,
-        1,
-        0,
-        230656,
-    )
-    backward_signature = (
-        "kernel_cutlass_bwd_cudnn_sparse_attention_backward",
-        96,
-        640,
-        1,
-        1,
-        0,
-        215040,
-    )
-    signatures = {
-        "flashmla_forward": {
-            "w": {flashmla_three_output},
-            "csa": {flashmla_dual_lse},
-            "hca": {flashmla_three_output},
-        },
-        **{
-            core: {
-                "w": {backward_signature},
-                "csa": {backward_signature},
-                "hca": {backward_signature},
-            }
-            for core in ("main", "convert", "sum_odo", "sum_dsink")
-        },
-    }
-
-    contract = _validate_attention_suite_resource_signatures(signatures)
-    assert not contract["exact_resource_signature_across_modes"]
-    assert contract["flashmla_forward_name_block_shared_memory_across_modes"]
-    assert contract["flashmla_forward_w_hca_exact_resource_signature"]
-    assert contract["cudnn_backward_exact_resource_signature_across_modes"]
-    assert contract["csa_dual_lse_specialization"]["registers_per_thread"] == {
-        "w": 126,
-        "csa": 128,
-        "hca": 126,
-    }
-
-    signatures["flashmla_forward"]["csa"] = {
-        (
-            "sparse_attn_fwd_for_small_topk_kernel",
-            128,
-            256,
-            1,
-            1,
-            0,
-            230656,
-        )
-    }
-    with pytest.raises(ValueError, match="name/block/shared-memory"):
-        _validate_attention_suite_resource_signatures(signatures)
-
-
-def test_dsa_only_profile_detects_token_layout_nvtx(tmp_path: Path) -> None:
-    sqlite_path = tmp_path / "token_layout.sqlite"
-    report_path = tmp_path / "token_layout.nsys-rep"
-    report_path.write_bytes(b"fixture")
-    _create_nsys_fixture(
-        sqlite_path,
-        "balanced",
-        world_size=1,
-        steps=1,
-        step_mode="forward-backward",
-    )
-    assert count_token_layout_nvtx_ranges(sqlite_path) == 0
-    connection = sqlite3.connect(sqlite_path)
-    connection.execute(
-        "INSERT INTO NVTX_EVENTS(start, end, text, globalTid, textId) "
-        "VALUES(?, ?, ?, ?, NULL)",
-        (1_100, 1_200, "magi_dsa::layout::TOKEN_LAYOUT", (1000 << 24) + 123),
-    )
-    connection.commit()
-    connection.close()
-    assert count_token_layout_nvtx_ranges(sqlite_path) == 1
-
-
-def test_dsa_core_profile_detects_model_projection_nvtx(tmp_path: Path) -> None:
-    sqlite_path = tmp_path / "model_projection.sqlite"
-    report_path = tmp_path / "model_projection.nsys-rep"
-    report_path.write_bytes(b"fixture")
-    _create_nsys_fixture(
-        sqlite_path,
-        "balanced",
-        world_size=1,
-        steps=1,
-        step_mode="forward-backward",
-    )
-    assert count_model_projection_nvtx_ranges(sqlite_path) == 0
-    connection = sqlite3.connect(sqlite_path)
-    connection.execute(
-        "INSERT INTO NVTX_EVENTS(start, end, text, globalTid, textId) "
-        "VALUES(?, ?, ?, ?, NULL)",
-        (
-            1_100,
-            1_200,
-            "magi_dsa::module::model_projection::profile_q",
-            (1000 << 24) + 123,
-        ),
-    )
-    connection.commit()
-    connection.close()
-    assert count_model_projection_nvtx_ranges(sqlite_path) == 1
-
-
-def test_dsa_core_profile_rejects_scalar_loss_nvtx(tmp_path: Path) -> None:
-    sqlite_path = tmp_path / "scalar_loss.sqlite"
-    _create_nsys_fixture(
-        sqlite_path,
-        "balanced",
-        world_size=1,
-        steps=1,
-        step_mode="forward-backward",
-    )
-    assert count_scalar_loss_nvtx_ranges(sqlite_path) == 0
-    connection = sqlite3.connect(sqlite_path)
-    connection.execute(
-        "INSERT INTO NVTX_EVENTS(start, end, text, globalTid, textId) "
-        "VALUES(?, ?, ?, ?, NULL)",
-        (1_100, 1_200, "magi_dsa::loss", (1000 << 24) + 123),
-    )
-    connection.commit()
-    connection.close()
-    assert count_scalar_loss_nvtx_ranges(sqlite_path) == 1
 
 
 def test_nsys_sqlite_attributes_all_step_kernels_and_cross_thread_fallback(

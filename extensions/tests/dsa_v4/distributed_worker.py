@@ -348,8 +348,10 @@ def _cp2_backend_config() -> MagiDSAConfig:
 def _run_route_smoke(rank: int, world_size: int) -> dict[str, object]:
     if world_size != 2:
         raise ValueError("the CP2 smoke case requires exactly two ranks")
-    local_count = 0 if rank == 0 else 31
-    meta = MagiDSAPackedMeta((0, 7, 31), (local_count,))
+    # rank 0 owns no source rows; it still receives Query rows after the layout.
+    smoke_counts = (0, 31)
+    local_count = smoke_counts[rank]
+    meta = MagiDSAPackedMeta((0, 7, 31), smoke_counts)
     runtime = MagiDSARuntimeMgr(
         _small_config(), dist.group.WORLD
     )
@@ -550,7 +552,9 @@ def _owner_source(
     )
     source_x = global_x[begin:end].clone().contiguous().requires_grad_(requires_grad)
     sink = global_sink.clone().contiguous().requires_grad_(requires_grad)
-    meta = MagiDSAPackedMeta(cu_seqlens, end - begin)
+    # The planner is told the whole source split, so every rank derives the
+    # same plan locally without an owner-layout collective.
+    meta = MagiDSAPackedMeta(cu_seqlens, tuple(local_counts))
     return source_x, sink, meta
 
 
@@ -635,15 +639,9 @@ def _plan_evidence(handle: DsaExecutionHandle) -> dict[str, object]:
     plan = handle.plan
     rank_plan = plan.rank_plans[handle.rank]
     rank_layout_payload = {
-        "local_q_positions": rank_plan.local_q_positions,
-        "local_q_sample_ids": rank_plan.local_q_sample_ids,
         "local_query_global_rows": rank_plan.local_query_global_rows,
         "query_fragments": [asdict(fragment) for fragment in rank_plan.query_fragments],
-        "token_layout_route": (
-            None
-            if rank_plan.token_layout_route is None
-            else asdict(rank_plan.token_layout_route)
-        ),
+        "token_layout_route": asdict(plan.token_layout_route),
     }
     rank_layout_signature = hashlib.sha256(
         json.dumps(
@@ -886,7 +884,7 @@ def _run_csa_natural(rank: int, world_size: int) -> dict[str, object]:
         "case": "csa-natural",
         "indexer_lse_max_abs": _max_abs(balanced.indexer_lse, sequential.indexer_lse),
         "kl_abs": _max_abs(balanced.kl, sequential.kl),
-        "local_rows": packed_meta.local_token_count,
+        "local_rows": packed_meta.local_token_count(rank),
         "output_max_abs": _max_abs(balanced.output, sequential.output),
         "rank": rank,
         "sequential_warm_calls": sequential_runtime.counters.warm_invocations,
@@ -1544,7 +1542,7 @@ def _run_csa_natural_backward(
         "balanced_warm_calls": balanced_runtime.counters.warm_invocations,
         "case": "csa-natural-backward",
         "execution_seconds": execution_seconds,
-        "local_rows": sequential_input.packed_meta.local_token_count,
+        "local_rows": sequential_input.packed_meta.local_token_count(rank),
         "plan_alignment": plan_metrics,
         "parameter_gradients": len(parameter_names),
         "rank": rank,
@@ -2198,25 +2196,11 @@ def _run_cp8_natural_backward(rank: int, world_size: int) -> dict[str, object]:
     _cp2_record("verification_begin", case="cp8-natural-backward")
     compare_parameter_values = rank == 0
     metrics: dict[str, dict[str, object]] = {}
-    metrics["csa_plan_alignment"], csa_parameters = _compare_natural_snapshots(
-        actual["csa_balanced"],
-        actual["csa_sequential"],
-        label="CP8 balanced vs sequential",
-        compare_parameter_values=compare_parameter_values,
-    )
-    _cp2_record(
-        "verification_checkpoint",
-        case="cp8-natural-backward",
-        checkpoint="csa_plan_alignment",
-    )
-    metrics["csa_structural_plan_alignment"], _ = _compare_natural_snapshots(
-        actual["csa_structural"],
-        actual["csa_sequential"],
-        label="CP8 structural vs sequential CSA",
-        compare_parameter_values=compare_parameter_values,
-    )
-    for label in ("csa_sequential", "csa_balanced", "csa_structural"):
-        metrics[f"{label}_reference"], _ = _compare_natural_snapshots(
+    # One planner remains, so there is no cross-plan alignment to check: the
+    # CP8 contract is that each structural plan matches the CP1 reference.
+    csa_parameters: tuple[str, ...] = ()
+    for label in ("csa_structural",):
+        metrics[f"{label}_reference"], csa_parameters = _compare_natural_snapshots(
             actual[label],
             references["csa"],
             label=f"CP8 {label} vs reference",
@@ -2229,8 +2213,6 @@ def _run_cp8_natural_backward(rank: int, world_size: int) -> dict[str, object]:
             checkpoint=f"{label}_reference",
         )
     non_csa_cases: tuple[tuple[str, str, DsaRatio], ...] = (
-        ("window", "window", 0),
-        ("hca", "hca", 128),
         ("hca_structural", "hca", 128),
     )
     for label, reference_label, ratio in non_csa_cases:

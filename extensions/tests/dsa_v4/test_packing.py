@@ -20,6 +20,7 @@ import pytest
 import torch
 from magi_attn_extensions.DSA.config import DsaStructuralLayoutConfig, MagiDSAConfig
 from magi_attn_extensions.DSA.packing import (
+    DsaDeviceCompressionMap,
     gather_compressor_support,
     make_dsa_device_rank_plan,
 )
@@ -203,6 +204,38 @@ def test_indexer_gather_ranges_cover_the_grouped_prefixes():
         assert end - begin == fragment.q_end // config.ratio
         total += end - begin
     assert total == indexer.packed_k_rows == rank_plan.packed_indexer_k_count
+
+
+def test_support_gather_keeps_the_graph_edge_when_a_rank_produces_no_block():
+    """A rank with no compressed block must still hold OVERLAP_X in its graph.
+
+    If this gather returns a detached tensor, ``overlap_x`` loses its only
+    consumer and autograd prunes that rank's OVERLAP_X and TOKEN_LAYOUT reverse
+    collectives. The peers still run them, and the CP group deadlocks. The
+    number of collectives a rank issues must not depend on its local data.
+    """
+
+    device = _device()
+    config = MagiDSAConfig(ratio=4)
+    empty = DsaDeviceCompressionMap(
+        support_offset=torch.empty((0,), dtype=torch.int32, device=device),
+        valid_rows=torch.empty(
+            (0, config.compressor_support), dtype=torch.bool, device=device
+        ),
+        block_positions=torch.empty((0,), dtype=torch.int32, device=device),
+    )
+    overlap_x = torch.randn(
+        7, config.hidden_size, dtype=torch.bfloat16, device=device, requires_grad=True
+    )
+    packed = gather_compressor_support(
+        overlap_x, empty, config.compressor_support
+    )
+    assert packed.shape == (0, config.compressor_support, config.hidden_size)
+    assert packed.grad_fn is not None, "empty support gather detached overlap_x"
+    # The producer must still receive a gradient, even if it is all zeros.
+    gradient = torch.autograd.grad(packed.float().sum(), overlap_x, allow_unused=False)[0]
+    assert gradient is not None
+    assert gradient.shape == overlap_x.shape
 
 
 def test_hca_device_plan_has_no_indexer():

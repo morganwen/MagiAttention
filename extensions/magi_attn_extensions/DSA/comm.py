@@ -33,9 +33,8 @@ from magi_attention.comm.work import WorkWithPostProcessFn
 from magi_attention.common.enum import GrpCollBufferName
 from magi_attention.common.range_op import range_gather, range_reduce
 
-from .nvtx import dsa_nvtx_range
+from .nvtx import dsa_collective_launch_range, dsa_nvtx_range
 from .packing import DsaDeviceRoutePlan
-from .phase import dsa_phase
 
 
 def _validate_route_tensor(source: torch.Tensor, expected_rows: int, name: str) -> None:
@@ -159,7 +158,14 @@ def _launch_group_cast(
         dtype=source.dtype,
         device=source.device,
     )
-    with dsa_phase(f"collective_group_cast::{phase_name}"):
+    # Core packs the send buffer inside group_cast, so the launch has to sit in
+    # this route's module range or its range_gather would attribute to no route.
+    with (
+        dsa_nvtx_range(f"route::{phase_name}::launch", enabled=source.is_cuda),
+        dsa_collective_launch_range(
+            f"collective_all2all_v::{phase_name}", enabled=source.is_cuda
+        ),
+    ):
         work = group_cast(
             input=source,
             output=output,
@@ -187,7 +193,14 @@ def _launch_group_reduce(
         dtype=consumer_grad.dtype,
         device=consumer_grad.device,
     )
-    with dsa_phase(f"collective_group_reduce::{phase_name}"):
+    with (
+        dsa_nvtx_range(
+            f"route::{phase_name}::launch", enabled=consumer_grad.is_cuda
+        ),
+        dsa_collective_launch_range(
+            f"collective_all2all_v::{phase_name}", enabled=consumer_grad.is_cuda
+        ),
+    ):
         work = group_reduce(
             input=consumer_grad,
             output=owner_grad,

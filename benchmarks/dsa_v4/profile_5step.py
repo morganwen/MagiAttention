@@ -1363,10 +1363,10 @@ def _rank_metadata(
     indexer_packing: dict[str, object] | None = None
     if runtime.config.ratio == 4:
         packed_rows = rank_plan.packed_indexer_k_count
-        route = rank_plan.compressed_ki_route
+        route = handle.plan.compressed_ki_route
         if route is None:
             raise AssertionError("CSA profile plan is missing COMPRESSED_KI metadata")
-        unique_rows = len(route.consumer_global_rows)
+        unique_rows = route.consumer_row_count(rank)
         duplicate_rows = packed_rows - unique_rows
         if duplicate_rows < 0:
             raise AssertionError("CSA packed Indexer rows are smaller than unique rows")
@@ -1394,8 +1394,6 @@ def _rank_metadata(
         "plan": plan,
         "plan_hash": handle.plan_hash,
         "policy": "structural_balanced",
-        "predicted_score_cost": rank_plan.predicted_score_cost,
-        "predicted_topk_cost": rank_plan.predicted_topk_cost,
         "query_fragments": len(rank_plan.query_fragments),
         "source_tokens": rank_plan.source_token_count,
     }

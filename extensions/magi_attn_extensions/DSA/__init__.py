@@ -18,13 +18,15 @@ The dependency direction is one-way: ``magi_attn_extensions.DSA`` imports
 MagiAttention Core, never the other way round. The Core capabilities this
 extension relies on are:
 
-- ``magi_attention.common.AttnRanges``
-- ``magi_attention.common.enum.AttnMaskType``
-- ``magi_attention.comm.primitive.all2all_v``
-- ``magi_attention.comm.work.GeneralWork``
+- ``magi_attention.common.AttnRanges`` and ``common.enum.AttnMaskType``
+- ``magi_attention.common.range_op`` range gather and reduce
+- ``magi_attention.comm.primitive.grpcoll`` group cast and group reduce
+- ``magi_attention.comm.work.WorkWithPostProcessFn``
+- ``magi_attention.meta.collection.comm_meta`` group-collective args
+- ``magi_attention.meta.solver.dynamic_attn_solver`` range lowering
 - ``magi_attention.meta.solver.dispatch_solver`` dispatch types and algorithms
-- ``magi_attention.utils.nvtx``
-- ``magi_attention.meta._make_dispatch_meta.make_dispatch_meta_from_qk_ranges``
+- ``magi_attention.utils.general._make_device_tensor`` and ``utils.nvtx``
+- ``magi_attention.meta._make_dispatch_meta`` dispatch meta and buckets
   (the only private path; guarded below)
 """
 

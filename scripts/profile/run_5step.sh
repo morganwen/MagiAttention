@@ -16,7 +16,7 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: $0 --world-size 8 --cp-size 8 --case {dsv4-flash-128k|dsv4-pro-128k} --plans {sequential,balanced|balanced} --steps 5 [--step-mode {forward|forward-backward|attention-suite|pro-pair}] [--layout-policy {legacy|shared-greedy|structural-balanced}] [--local-improvement-passes {0|1|4|8}] [--profiler-attach-warmup-steps N] [--lock-gpu-clock-mhz MHZ] [--skip-smoke] [--image IMAGE]" >&2
+    echo "Usage: $0 --world-size 8 --cp-size 8 --case dsv4-pro-128k --plans balanced --steps 5 --step-mode pro-pair --layout-policy structural-balanced [--profiler-attach-warmup-steps N] [--skip-smoke] [--image IMAGE]" >&2
 }
 
 world_size=""
@@ -96,32 +96,16 @@ if [[ "$steps" != "5" ]]; then
     usage
     exit 2
 fi
-if [[ "$step_mode" == "forward" && "$plans" != "sequential,balanced" ]]; then
+if [[ "$step_mode" != "pro-pair" ]]; then
+    echo "only the Pro pair capture remains; the Flash-Base modes were retired" >&2
+    exit 2
+fi
+if [[ "$case_name" != "dsv4-pro-128k" || "$plans" != "balanced" ]]; then
     usage
     exit 2
 fi
-if [[ "$step_mode" != "forward" && "$plans" != "balanced" ]]; then
-    usage
-    exit 2
-fi
-if [[ "$step_mode" != "forward" && "$step_mode" != "forward-backward" && "$step_mode" != "attention-suite" && "$step_mode" != "pro-pair" ]]; then
-    usage
-    exit 2
-fi
-if [[ "$step_mode" == "pro-pair" && "$case_name" != "dsv4-pro-128k" ]]; then
-    usage
-    exit 2
-fi
-if [[ "$step_mode" != "pro-pair" && "$case_name" != "dsv4-flash-128k" ]]; then
-    usage
-    exit 2
-fi
-if [[ "$layout_policy" != "legacy" && "$layout_policy" != "shared-greedy" && "$layout_policy" != "structural-balanced" ]]; then
-    usage
-    exit 2
-fi
-if [[ ! "$local_improvement_passes" =~ ^(0|1|4|8)$ ]]; then
-    usage
+if [[ "$layout_policy" != "structural-balanced" ]]; then
+    echo "structural-balanced is the only layout policy" >&2
     exit 2
 fi
 if [[ ! "$profiler_attach_warmup_steps" =~ ^[0-8]$ ]]; then
@@ -132,30 +116,8 @@ if [[ -n "$lock_gpu_clock_mhz" && ! "$lock_gpu_clock_mhz" =~ ^[1-9][0-9]*$ ]]; t
     usage
     exit 2
 fi
-if [[ "$step_mode" != "pro-pair" && "$layout_policy" != "shared-greedy" && \
-      ( "$local_improvement_passes" != "4" || \
-        "$profiler_attach_warmup_steps" != "0" || \
-        -n "$lock_gpu_clock_mhz" ) ]]; then
-    echo "dispatch-ablation controls require shared-greedy" >&2
-    exit 2
-fi
-if [[ "$step_mode" == "pro-pair" && "$layout_policy" != "structural-balanced" ]]; then
-    echo "the Pro pair requires structural-balanced layout" >&2
-    exit 2
-fi
-if [[ "$step_mode" == "pro-pair" && \
-      ( "$local_improvement_passes" != "4" || \
-        "$profiler_attach_warmup_steps" != "0" || \
-        -n "$lock_gpu_clock_mhz" ) ]]; then
-    echo "the formal Pro pair does not enable dispatch ablation or a clock override" >&2
-    exit 2
-fi
-if [[ "$step_mode" != "pro-pair" && "$layout_policy" == "structural-balanced" ]]; then
-    echo "structural-balanced layout profiling is only defined for pro-pair" >&2
-    exit 2
-fi
-if [[ "$layout_policy" == "shared-greedy" && "$step_mode" != "attention-suite" ]]; then
-    echo "shared-greedy layout profiling is only defined for attention-suite" >&2
+if [[ "$profiler_attach_warmup_steps" != "0" || -n "$lock_gpu_clock_mhz" ]]; then
+    echo "the formal Pro pair does not enable an attach warmup or a clock override" >&2
     exit 2
 fi
 
@@ -974,15 +936,7 @@ if [[ -n "$lock_gpu_clock_mhz" ]]; then
 fi
 
 set +e
-if [[ "$step_mode" == "forward-backward" ]]; then
-    summary_script="$repo_root/scripts/profile/summarize_forward_backward.py"
-elif [[ "$step_mode" == "attention-suite" ]]; then
-    summary_script="$repo_root/scripts/profile/summarize_attention_suite.py"
-elif [[ "$step_mode" == "pro-pair" ]]; then
-    summary_script="$repo_root/scripts/profile/summarize_pro_pair.py"
-else
-    summary_script="$repo_root/scripts/profile/summarize_5step.py"
-fi
+summary_script="$repo_root/scripts/profile/summarize_pro_pair.py"
 timeout --signal=TERM --kill-after=5s 600s python3 \
     "$summary_script" \
     --artifact-dir "$artifact_dir" \

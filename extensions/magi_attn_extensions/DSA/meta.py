@@ -174,6 +174,8 @@ class DsaRankPlan:
     rank: int
     source_token_count: int
     local_token_count: int
+    source_global_begin: int
+    source_global_end: int
     query_fragments: tuple[DsaQueryFragment, ...]
     # Global compressed-block ids this rank produces, ascending, which is also
     # its Compressor output-buffer order.
@@ -199,6 +201,21 @@ class DsaRankPlan:
     @property
     def produced_block_count(self) -> int:
         return sum(end - begin for begin, end in self.produced_block_ranges)
+
+    @property
+    def local_query_global_rows(self) -> tuple[int, ...]:
+        """Global row of each local Query row, expanded on demand.
+
+        This is O(tokens) and is only used by diagnostics that reorder a local
+        tensor into global order. It is derived rather than stored so the plan
+        itself stays sized by fragments.
+        """
+
+        return tuple(
+            row
+            for fragment in self.query_fragments
+            for row in range(fragment.global_begin, fragment.global_end)
+        )
 
 
 @dataclass(frozen=True)

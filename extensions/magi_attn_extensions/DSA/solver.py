@@ -647,6 +647,8 @@ def build_dsa_execution_plan(
                 rank=rank,
                 source_token_count=source_counts[rank],
                 local_token_count=query_counts[rank],
+                source_global_begin=source_offsets[rank],
+                source_global_end=source_offsets[rank + 1],
                 query_fragments=fragments,
                 produced_block_ranges=owned_block_ranges[rank],
                 sample_block_offsets=sample_block_offsets,

@@ -219,10 +219,12 @@ _CUDNN_D2D_SCOPES = {
     "selected_indexer_backward": "magi_dsa::CUDNN_CALL::indexer_backward",
     "selected_indexer_recompute": ("magi_dsa::CUDNN_CALL::selected_indexer_recompute"),
 }
+# Route staging is Core range ops now, not the retired DSA pack kernels.
 _NON_COMPUTE_KERNEL_TOKENS = (
     "ncclDevKernel_SendRecv",
-    "DsaRowCopy",
-    "DsaRowCsrReduce",
+    "range_gather",
+    "range_sum_reduce",
+    "range_avg_reduce",
 )
 
 
@@ -689,24 +691,24 @@ def compute_support_overhead_timings(
             return (
                 "magi_dsa::module::packing::csa::indexer_key_support::forward_copy"
                 in scopes
-                and "dsarowcopy" in kernel_name
+                and "range_gather" in kernel_name
             )
         if group.endswith("_route_stage_copy"):
             mode = group.split("_", 1)[0]
-            return "dsarowcopy" in kernel_name and any(
+            return "range_gather" in kernel_name and any(
                 scope.startswith(f"magi_dsa::module::route::attention::{mode}::")
                 for scope in scopes
             )
         if group.endswith("_route_stage_csr_reduce"):
             mode = group.split("_", 1)[0]
-            return "dsarowcsrreduce" in kernel_name and any(
+            return "range_sum_reduce" in kernel_name and any(
                 scope.startswith(f"magi_dsa::module::route::attention::{mode}::")
                 for scope in scopes
             )
         if group.endswith("_kv_bank_catarray"):
             mode = group.split("_", 1)[0]
             return (
-                "magi_dsa::module::attention::kv_bank_assembly" in scopes
+                f"magi_dsa::module::attention::{mode}::kv_bank_assembly" in scopes
                 and "catarray" in kernel_name
                 and in_mode(record, mode)
             )
@@ -728,11 +730,11 @@ def compute_support_overhead_timings(
         if any(
             scope.startswith(grouped_k_scope_prefix) for scope in _scope_names(record)
         )
-        and "dsarowcsrreduce" in str(record.get("kernel_name", "")).lower()
+        and "range_sum_reduce" in str(record.get("kernel_name", "")).lower()
     ]
     if unexpected_grouped_k_backward:
         raise ValueError(
-            "Pro pair grouped Indexer K unexpectedly ran backward CSR reduction"
+            "Pro pair grouped Indexer K unexpectedly ran a backward reduction"
         )
     packing_by_rank: dict[int, dict[str, Any]] = {}
     for packing in indexer_k_packing:
@@ -770,7 +772,7 @@ def compute_support_overhead_timings(
                         )
                     if len(matching) != 1:
                         raise ValueError(
-                            "Pro grouped Indexer K pack DsaRowCopy count differs: "
+                            "Pro grouped Indexer K pack range_gather count differs: "
                             f"rank={rank}, step={step}, count={len(matching)}"
                         )
                     module_rowid = next(iter(module_rowids))
