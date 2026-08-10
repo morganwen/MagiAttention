@@ -321,14 +321,7 @@ def test_cp8_summary_requires_actual_structural_plan_evidence() -> None:
     for rank in range(8):
         plans = {
             label: _cp8_plan_evidence(label, rank)
-            for label in (
-                "csa_balanced",
-                "csa_sequential",
-                "csa_structural",
-                "hca",
-                "hca_structural",
-                "window",
-            )
+            for label in ("csa_structural", "hca_structural")
         }
         results.append(
             {
@@ -345,7 +338,7 @@ def test_cp8_summary_requires_actual_structural_plan_evidence() -> None:
     assert isinstance(final_plans, dict)
     csa = final_plans["csa_structural"]
     assert isinstance(csa, dict)
-    csa["policy"] = "indexer_balanced"
+    csa["policy"] = "not_structural_balanced"
     with pytest.raises(ValueError, match="did not execute structural_balanced"):
         _validate_cp8_structural_results(results)
 

@@ -198,7 +198,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--layout-policy",
         choices=("structural-balanced",),
-        default="legacy",
+        default="structural-balanced",
     )
     parser.add_argument("--local-improvement-passes", type=int, default=4)
     parser.add_argument("--profiler-attach-warmup-steps", type=int, default=0)
@@ -655,7 +655,7 @@ def _prewarm(
             artifact_dir,
             "prewarm_begin",
             rank,
-            attention_mode="csa_sequential_shadow",
+            attention_mode="csa_shadow",
             iteration=iteration,
             step_mode=_CAPTURE_SPEC.step_mode,
         )
@@ -679,7 +679,7 @@ def _prewarm(
             artifact_dir,
             "prewarm_end",
             rank,
-            attention_mode="csa_sequential_shadow",
+            attention_mode="csa_shadow",
             iteration=iteration,
             step_mode=_CAPTURE_SPEC.step_mode,
         )
@@ -1184,7 +1184,7 @@ def _run_profile(
     finite_comparison.update(
         {
             "rank": rank,
-            "shadow_plan": "sequential",
+            "shadow_plan": "structural_balanced",
             "target_plan": "balanced",
         }
     )
@@ -1263,7 +1263,7 @@ def _run_profile(
             else None
         ),
         "result": "PASS",
-        "shadow_plan": "csa_sequential",
+        "shadow_plan": "csa_shadow",
         "step_mode": _CAPTURE_SPEC.step_mode,
         "token_layout_capture": "pre_capture_once_per_attention",
         "layout_policy": args.layout_policy,
@@ -1469,10 +1469,10 @@ def main() -> None:
         shadow_runtime, shadow_handle, shadow_prepare_seconds = _prepare_runtime(
             configs["csa"],
             sources["csa"],
-            "sequential",
             args.artifact_dir,
             rank,
-            "csa_sequential_shadow",
+            "csa_shadow",
+            structural_layout_config=structural_layout_config,
         )
         global_dout, dout_scale = _make_global_dout(
             configs["csa"],
@@ -1537,7 +1537,7 @@ def main() -> None:
             _pro_bundle_contract(cases) if _CAPTURE_SPEC is _PRO_PAIR_SPEC else {}
         )
         csa_shadow = _AttentionProfileCase(
-            name="csa_sequential_shadow",
+            name="csa_shadow",
             layer=layers["csa"],
             source=sources["csa"],
             runtime=shadow_runtime,
