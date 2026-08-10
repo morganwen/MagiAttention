@@ -233,3 +233,6 @@ detect_cuda_version.cc
 
 # Upstream Sphinx documentation, not built or tracked in this fork.
 /docs/
+
+# DSA design notes stay local.
+/extensions/magi_attn_extensions/DSA/docs/
