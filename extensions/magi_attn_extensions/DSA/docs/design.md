@@ -29,9 +29,9 @@
 `DsaGroupCollectiveArg` 与 `DsaTypedRoutePlan` 两层中间结构。
 
 2026-08-06 以前本文中的 Flash-Base `4096/1024/64/512`、compressed Top-K 512
-以及 `shared_greedy` 记录，只能作为历史实现/profile 审计证据。它们不得覆盖本文
-当前 Pro 尺寸、`structural_balanced` 共享 Query layout、官方 backend ABI 和
-代表性 Pro-pair 验收合同。
+以及 `shared_greedy` 相关章节已整体删除。若要追溯，`artifacts/profile/20260803T*`
+仍保留当时的原始产物。本文只描述当前 Pro 尺寸、`structural_balanced` 共享 Query
+layout、官方 backend ABI 与代表性 Pro-pair 验收合同。
 
 ## 1. 一句话结论
 
@@ -204,7 +204,7 @@ flowchart TB
 ### 4.1 一期 cost：原生 causal area + MinHeap
 
 `structural_balanced` 是唯一的 layout policy，`sequential`、`indexer_balanced` 和
-`shared_greedy` 已从代码里删除，只在 4.5 节保留历史记录。
+`shared_greedy` 及其实验入口已从代码和本文中删除。
 
 planner 不用 CSA 或 HCA 的专用经验权重，也不自己切 chunk。它把 packed sample 交给
 native `make_dispatch_meta_from_qk_ranges` 加 `MinHeapDispatchAlg` 做 chunk 分配，再从
@@ -316,80 +316,6 @@ All2AllV。route mapping 可以被多个张量复用，但每次调用 collectiv
 
 这是 All2AllV，不是 AllGather。如果 route 由 autograd function 包装，其 backward 也是一次逆向
 All2AllV。这条 route 属于 DSA 输入边界，不计入下文“DSA 内部 collective”数量。
-
-### 4.5 历史：2026-08-03 Base `shared_greedy` 实验
-
-> 本节只是历史记录。`shared_greedy` 的实现、`DsaSharedLayoutConfig`、B300 proxy 权重、
-> 128-token band 和 local improvement 循环都已从代码中删除，`--local-improvement-passes`
-> 入口也一并删除。下面的描述仅用于解释 `artifacts/profile/20260803T*` 那几份产物是怎么
-> 得到的，不得作为当前合同，也不能据此重新引入第二个 policy。
-
-`shared_greedy` 实现 `README_cp_dispatch_balancing.md` 的唯一选型“确定性贪心 + 4 轮局部改善上限
-（无改善时提前收敛）”，并冻结以下
-实验合同：
-
-- `DsaSharedLayoutConfig` 必须显式给出 `ki_memory_budget_bytes`、
-  `ki_workspace_reserve_bytes` 和有界 `local_improvement_passes`；reserve 必须非负且严格小于 budget；
-- 每个 sample 默认切成 128-token band，按独立 CSA Indexer cost 从重到轻确定性放置；候选依次按
-  全局最大 Indexer cost、最大 KI modeled bytes、fragment 总数、目标 rank Indexer cost 和 rank id
-  比较；
-- 完整解按 `(I,H,R,F)` 严格词典序优化。局部改善只检查瓶颈 rank 的单 band move 和每个目标 rank
-  最多 4 个近似等重 band swap；默认最多 4 个 improvement step；
-- v1 Indexer 整数代理为 `8*S + K + 32*U`；HCA 整数代理为
-  `256*Q_H + 2048*(send_rows+recv_rows) + 4096*max_peer_rows`；模型版本固定为
-  `b300_sm103_structural_proxy_v1`，tick 不得解释为 GPU ns；
-- KI modeled bytes 精确包含 BF16 grouped-K、`DsaDeviceIndexerMap` 中随 layout 变化的 int32 map，
-  再加显式 workspace reserve。其逐项公式与版本说明见
-  `README_cp_dispatch_balancing.md` §4.3；grouped Indexer selection 是 `no_grad`，不计算不存在的
-  grouped-K backward gradient；
-- W/CSA/HCA 必须分别构建 ratio-specific compression block 和 typed route；三份 plan 的
-  `query_layout_hash`、`query_token_counts` 和 layout metrics 必须逐项相同。三种 ratio 都在 DSA
-  外执行 `TOKEN_LAYOUT` forward/reverse，DSA 内 collective 顺序和数量保持各自原合同；
-- cold solver 结果允许按完整输入/config 做有界进程内缓存；warm execution handle 仍不得运行 solver、
-  object collective 或 host layout 构建；
-- plan 必须记录 solver/cost-model 版本、候选评估数、实际 improvement step、停止原因、最终 key、
-  逐 rank cost/显存/fragment 和 Query layout hash。构造失败只能报告 search
-  failure，不能声称已证明 infeasible。
-
-冻结 128K 实验入口使用 1 GiB KI budget、256 MiB workspace reserve 和 4 个 improvement step。
-CP8 natural correctness 与正式 B300 attention-suite 对比 Profile 已于 2026-08-03 通过；证据和
-裁决见 §8.5 及 `README_cp_dispatch_balancing.md` §8。该 policy 仍保持 opt-in：当前 capture 排除
-`TOKEN_LAYOUT`，HCA forward 虽明显更均衡但绝对时间上升，最终 run 的首 step CSA Indexer score
-也存在超过 5% 的离群。在端到端边界开销和绝对时间 non-regression 门槛通过独立评审前，
-它不能替换当时 Base release 默认的 `sequential/indexer_balanced`。
-
-2026-08-03 的补充消融把 8 张 B300 graphics clock 锁定为 1800 MHz，并在 `nsys start` 后、正式
-五步外运行一个等价 attention-suite warmup；passes=0/1/4/8 各运行一次，passes=4 重复三次。六个
-run 的输入、参数、seed、镜像和逐 rank config identity 全等，全部通过 natural shadow、8F+8B、
-attribution coverage=1.0、锁频/恢复和 artifact manifest 审计。4→8 轮使 cold-solver 微基准从
-24.577 秒增至 45.971 秒，最大 Indexer proxy 只改善 0.0294%；passes=8 的 HCA sparse-forward
-steady rank range 为 0.78%，落在三次 passes=4 的 0.69%--0.81% 内，完整 HCA forward 的残差由
-NCCL/到达时序主导。因此该历史 `shared_greedy` 的算法选型当时固定为 4 轮，
-0 轮只用于低冷启动诊断，8 轮不采用。完整结构
-负载与消融表分别见讨论稿 §8.3 和 §8.7，汇总产物为：
-
-```text
-artifacts/profile/20260803T054958Z-dsv4-shared-greedy-dispatch-ablation/
-```
-
-该消融当时不改变 Base release profile 默认行为。`--local-improvement-passes`、
-`--profiler-attach-warmup-steps` 和 `--lock-gpu-clock-mhz` 只允许用于 shared-greedy attention-suite
-诊断；默认仍为 4/0/unlocked。attach warmup 必须有独立 NVTX 和 runtime-counter delta，不能进入正式
-training-step 记录；锁频必须逐卡记录锁定前/锁定后/恢复后状态，任一 GPU 不能精确锁定或不能恢复都使
-run 失败。
-
-同日的一次性 KI 显存排序消融只从 greedy key 删除 `max_rank_modeled_ki_bytes`。该 plan 仍满足
-correctness，但 modeled KI max 增加 3.174 MiB、rank relative range 从 0.773% 增至 1.615%，cold
-candidates/time 增加 15.38%/19.42%，且五步 DSA-core+gradient-AR 无收益。因此该历史
-`shared_greedy` solver 固定保留
-显存第二排序项；实验入口已删除，只保留原始证据：
-
-```text
-artifacts/profile/20260803T094307Z-dsv4-flash-128k-attention-suite-shared-greedy-passes4-kimemhardonly-clock1800-attachwarm1-precomputed-dout/
-```
-
-简要解释见 `README_cp_dispatch_balancing.md` §8.8。该消融当时不改变 Base release
-默认行为，也不影响当前 Pro 合同。
 
 ## 5. Forward
 
@@ -910,38 +836,6 @@ Window consumer 梯度直接接回其 source route，保证 Window reverse 先�
 hook、不截断 trunk，也不增加 collective。所有 event、route buffer 和 gate state 都是逐 invocation
 私有状态，不能写入 handle 形成跨调用共享 activation。
 
-> 以下 W/CSA/HCA attention-suite 只是 2026-07 至 2026-08-03 的 Base 历史诊断合同；
-> 当前 Pro 正式入口是 8.0 节的 CSA+HCA Pro-pair。历史证据仍用于约束
-> “只用同 mode 计算声称 overlap”这条归因原则。
-
-attention-suite 的 W/CSA/HCA 虽是三张独立 autograd graph，但通信遮挡只能使用本 mode、本
-forward/backward 阶段的计算。profile driver 仍为三种模式各建一条 execution stream，caller-thread
-严格按 `W F → CSA F → HCA F → HCA B → CSA B → W B` 调用；同时在
-`W F → CSA F`、`CSA F → HCA F`、`HCA B → CSA B`、`CSA B → W B` 四个边界插入 CUDA event
-happens-before。后一 mode 可以提前在 CPU 侧提交，但其任何 GPU kernel 都不能早于前一 mode 的
-completion event。三次 backward completion event 仍在
-`magi_dsa::module::attention_suite::stream_overlap::gradient_join`
-汇合后才执行统一 parameter/sink AllReduce。capture 内禁止跨 mode GPU kernel overlap。
-
-正式 attention-suite 汇总必须对 W/CSA/HCA 全部 16 个 route-direction 硬校验单次
-`ncclDevKernel_SendRecv` 和上述 runtime launch 顺序，并写出
-`ATTENTION_SUITE_COMMUNICATION_OVERLAP.json`：每条记录包含完整
-`magi_dsa::phase::collective_all2all_v::attention::<mode>::<route>.<direction>` path、
-通信时长、与同 rank/step、同 mode、同 direction 非 route GPU kernel 的交集及覆盖比例；NCCL、
-`DsaRowCopy` 和 `DsaRowCsrReduce` 都不能充当计算。汇总还必须按实际 CUPTI kernel interval 硬校验
-六个 mode phase 完全按上述顺序串行，并证明任一 route 与其他 mode compute 的交集为 0。mode-local
-overlap 只报告、不设最低比例；无法遮挡的 route 必须记录依赖原因。另以
-`STEP_KERNEL_SPANS_ATTENTION_SUITE.json` 报告逐 rank/step 首末 attributed kernel span，避免用
-kernel duration 求和代替 wall-time。
-
-当前 DAG 的 mode-local 可遮挡边界是：W forward/backward 均没有独立计算；CSA 继续使用自身的
-Indexer projection、Main Compressor、grouped Indexer 和 backward late-join；HCA 只有
-`WINDOW_KV.forward` 可与 Main Compressor 并行，`WINDOW_KV.backward` 可与 Main Compressor
-backward 并行。HCA `OVERLAP_X.forward` 是 Main Compressor 的前置依赖，
-`COMPRESSED_KV.forward` 是 sparse attention 的前置依赖，
-`COMPRESSED_KV.backward` 是 Main Compressor backward 的前置依赖，
-`OVERLAP_X.backward` 又是末端 support route；这四条不能借用 CSA/W 计算制造遮挡。
-
 ## 7. 复用边界
 
 | 来源 | 直接复用 | 不照搬的部分 |
@@ -1061,198 +955,69 @@ bash scripts/profile/run_5step.sh --world-size 8 --cp-size 8 \
 `INDEXER_D2D_PRO_PAIR.json` 和 `REPORT_PRO_PAIR.md`。当前这是已实现的 profile/汇总合同；
 在冻结 release 镜像的 8×B300 capture 真正完成前，本文不预告 Pro 性能 PASS。
 
-### 8.1 历史 Base 证据来源
+#### 8.0.1 Core 复用重构后的实测（2026-08-10）
 
-> 本节中 2026-07-21 至 2026-08-03 的 artifact、Flash-Base 尺寸、W/CSA/HCA
-> attention-suite 和 `shared_greedy` 数值只作为历史实现与归因工具证据。它们不是
-> 当前 Pro `structural_balanced` 的正确性或性能证据。
-
-最早的历史 kernel 归因来自：
+产物：
 
 ```text
-artifacts/profile/20260721T020104Z-dsv4-flash-128k-forward-backward/
-  balanced/balanced_5steps_forward_backward.nsys-rep
-  balanced/balanced_5steps_forward_backward.sqlite
+artifacts/profile/20260810T021215Z-dsv4-pro-128k-pro-pair-structural-balanced-precomputed-dout/
 ```
 
-该 capture 可用于 kernel 名称与 op 归因；其 post-capture shadow 有 NaN，不作为数值正确性
-基线。下表中“目标”指完成本文改造后的预期。
+结构合同全部符合：`result=PASS`、kernel 与 memcpy attribution coverage 均为 1.0、
+每 step `CSA 4F+4B + HCA 3F+3B = 7F+7B`、`TOKEN_LAYOUT` 只在 capture 外发生一次、
+grouped-K 无 backward 归约、runtime 不发起参数梯度通信。
 
-2026-07-22 对该 aggregate SQLite 执行了新的全 kernel 只读归因自检：40 个 rank-step
-共解析 15,400 条 runtime-correlated kernel，其中 600 条归到显式 cuDNN call、8,200 条归到
-module range、6,600 条归到逻辑 phase，未归因为 0。其中 6,160 条 runtime launch 来自同一
-worker 的 autograd 线程，需用同进程的正式 phase 时间窗回退归因。这些数字只验证提取
-契约并作为旧 Query-worker 架构的 launch 基线，不是新架构的性能证据。
+逐条 route 的通信时长与同 mode 计算遮挡（8 rank 5 step 均值）：
 
-上一版 MSA 式 post-projection DSA-core 证据为：
+| mode | 方向 | route | 通信 ms | 遮挡 ms | 遮挡率 | 分类 |
+| --- | --- | --- | ---: | ---: | ---: | --- |
+| csa | backward | COMPRESSED_KI | 0.074 | 0.069 | 92.6% | overlap_capable |
+| csa | backward | COMPRESSED_KV | 0.265 | 0.000 | 0.0% | overlap_capable |
+| csa | backward | OVERLAP_X | 0.357 | 0.001 | 0.2% | overlap_capable |
+| csa | backward | WINDOW_KV | 0.133 | 0.007 | 5.5% | overlap_capable |
+| csa | forward | COMPRESSED_KI | 0.075 | 0.050 | 66.8% | overlap_capable |
+| csa | forward | COMPRESSED_KV | 0.348 | 0.186 | 53.3% | overlap_capable |
+| csa | forward | OVERLAP_X | 0.366 | 0.049 | 13.4% | overlap_capable |
+| csa | forward | WINDOW_KV | 0.133 | 0.090 | 67.9% | overlap_capable |
+| hca | backward | COMPRESSED_KV | 0.232 | 0.000 | 0.0% | dependency_bound |
+| hca | backward | OVERLAP_X | 0.329 | 0.000 | 0.0% | dependency_bound |
+| hca | backward | WINDOW_KV | 0.093 | 0.083 | 88.8% | overlap_capable |
+| hca | forward | COMPRESSED_KV | 0.106 | 0.000 | 0.0% | dependency_bound |
+| hca | forward | OVERLAP_X | 0.329 | 0.000 | 0.0% | dependency_bound |
+| hca | forward | WINDOW_KV | 0.143 | 0.065 | 45.2% | overlap_capable |
 
-```text
-artifacts/profile/20260722T083239Z-dsv4-flash-128k-forward-backward-dsa-core/
-  balanced/balanced_5steps_forward_backward.nsys-rep
-  balanced/balanced_5steps_forward_backward.sqlite
-```
+可以直接读出两件事。一是拆分与否决定遮挡：CSA 反向唯一显式做了
+`start -> sparse backward -> finish` 的 `COMPRESSED_KI` 遮挡 92%，而在同一次 backward 里
+launch 与 wait 相邻的 `COMPRESSED_KV` 遮挡为 0。二是 HCA 的 `OVERLAP_X` 与
+`COMPRESSED_KV` 被判为 `dependency_bound`：它们的结果立刻要喂给 Compressor 或 attention，
+没有独立计算可填，对它们做异步拆分不会有收益。
 
-该 run 使用 installed wheel 和 8×B300，8 ranks 全部 PASS；capture 内 TOKEN_LAYOUT 与 model-side
-profile projection NVTX/kernel 均为零，40 个 rank-step 分别满足精确 4F+4B。5,040 个 kernels 的
-runtime-correlation 归因 coverage 为 1.0、未归因数为 0。相邻 step 的 CPU NVTX 间隙为
-`1.624–5.440 us`，实际 GPU kernel 间隙为 `0.800–1.280 us`；对照 Magi-MSA 原始 report 的
-`3.758–6.119 us` 与 `6.464–9.152 us`，已消除旧 harness 的毫秒级 CPU range 空洞。post-capture
-sequential shadow 中非 tie output max-abs 为 `9.765625e-4`，全部 DSA 输入/参数 gradient max-abs 为
-`4.9173832e-7`，loss abs 与 `latent_kv` mismatch ratio 均为零。该 run 仍构造 scalar loss；用户于
-2026-07-22 要求后续版本在 capture 外预计算 global `dout` 与 unit `dkl` 并直接 backward，因此本 run
-只保留为上一版连续提交证据。
+#### 8.0.2 两个 mode 的遮挡账与各自的上限
 
-当时的 loss-free、预计算 backward-seed DSA-core 证据为：
+| mode | 通信 ms/step | 已遮挡 | 未遮挡 | 其中结构受限 |
+| --- | ---: | ---: | ---: | ---: |
+| CSA | 1.752 | 0.452 (26%) | 1.300 | 0 |
+| HCA | 1.232 | 0.147 (12%) | 1.084 | 0.996 |
 
-```text
-artifacts/profile/20260722T091353Z-dsv4-flash-128k-forward-backward-dsa-core-precomputed-dout/
-  balanced/balanced_5steps_forward_backward.nsys-rep
-  balanced/balanced_5steps_forward_backward.sqlite
-```
+两者的上限不同，原因是结构而不是调度质量。
 
-该 run 在 capture 外生成 source-order global BF16 random `dout`，以 `2^-32` 缩放并按 plan-local Query
-顺序排列，`dkl` 为 FP32 one；capture 内没有 scalar loss。8 ranks 全部 PASS，aggregate trace 中
-`magi_dsa::loss`、TOKEN_LAYOUT 和 model projection 均为零，40 个 forward 与 40 个 backward 各自精确
-包含 4 个 `ncclDevKernel_SendRecv`。共 4,640 个 runtime-correlated kernels，归因 coverage 为 1.0、
-未归因为零；相对上一版恰好减少 400 个、即每 rank/step 10 个 loss forward/backward kernel。五步平均
-forward/backward/parameter-gradient-allreduce 分别为 `46.411299/16.576867/0.350376 ms`；Indexer score
-和 Top-K 平均为 `5.096503/0.621644 ms`，最大 relative rank range 为 `0.007336/0.009363`。相邻 step
-CPU NVTX 间隙为 `1.928–11.880 us`，实际 GPU kernel 间隙为 `0.800–1.344 us`。sequential shadow 的
-8 个 exact-cutoff canonical-set mismatch 行只豁免 output，非 tie output max-abs 为 `9.765625e-4`；
-全部 DSA 输入/参数 gradient 仍按原门槛通过，max-abs 为 `4.6519563e-7`。
+CSA 有一段与 route 无关的计算可以填：Indexer 的 query/weights projection、grouped
+score 与 Top-K，以及独立 stream 上的 sparse-attention backward。所以它的四条 route
+原则上都能遮挡，当前 26% 只反映编排做到哪一步，不是上限。同一次 backward 里
+`COMPRESSED_KI` 做了 `start -> sparse backward -> finish` 拆分，遮挡 92%；相邻
+`launch/wait` 的 `COMPRESSED_KV` 遮挡 0。差别完全来自拆没拆。
 
-2026-07-23 用户另行批准过 W+CSA+HCA 三 Attention 合并五步历史诊断。该诊断不替代
-当前 Pro profile，也
-不表示三层 Transformer 的 activation 串联；每个 captured step 合并三张独立 autograd graph，
-forward 固定按 `W(ratio=0) → CSA(ratio=4) → HCA(ratio=128)`，backward 固定按
-`HCA → CSA → W`。三种 Attention 均在 capture 前独立完成静态 layout/profile projection，把
-`MagiDSAInput.x/qr/q/latent_kv` detach 为 leaf，并从同一 source-order global BF16 random `dout`
-取得各自的 plan-local view；`dout` 仍按 `1/global_output_elements=2^-32` 缩放，只有 CSA 额外使用
-FP32 unit `dkl`。capture 内不运行 TOKEN_LAYOUT、model projection、scalar loss、optimizer 或跨 step
-梯度累积；每 step 开头一次性清空三组 gradient，三种 backward 完成后将三层各自的 replicated
-parameter/sink gradient 放入统一 deterministic FP32 bucket，只发起一次模型侧 AllReduce。
+HCA 没有 Indexer，整层就是 Compressor 加 attention，两者都直接依赖 route 结果：
+`OVERLAP_X` 要先到才能 pack 和压缩，`COMPRESSED_KV` 由 Compressor 产出且之后
+kv-bank 与 attention 全链依赖它，反向亦然。因此 HCA 1.232 ms 里有 0.996 ms 在单层
+DSA-core 范围内无计算可填，只有 `WINDOW_KV` 是可遮挡的，实测正向 40%、反向 89%。
 
-W/CSA/HCA 各自保留独立 execution stream，HCA execution stream 使用高优先级，HCA 内部另按
-6.4 节使用 route/main 私有 stream；但四个跨 mode 边界必须用 CUDA event 串行。caller-thread 的
-六段 mode NVTX 和调用顺序不变，GPU 上严格保持
-`W F → CSA F → HCA F → HCA B → CSA B → W B`，gradient bucket 只能在三张图的 completion
-events 全部 join 后发起。该调度不改变 tensor 数学、collective 条数或模式内 communicator 顺序，
-也不允许用另一张 graph 的计算遮挡本 mode 通信。
+要动 HCA 那 0.996 ms 只有两条路，都在本文范围之外：把 HCA 的通信交给相邻 CSA 层的
+计算遮挡，这需要层间流水，而代表性 profile 刻意用 CUDA event 串行化两个 mode，正是
+为了禁止用跨 mode 计算伪造遮挡；或者只做通信与通信的并发，压总墙钟而不产生遮挡。
 
-该诊断外层 NVTX 为 `$Magi_DSA/capture_five_attention_suite_steps`，step 仍为
-`balanced/rank_<rank>/training_step_<step>`；总 `magi_dsa::forward/backward` 内分别嵌套
-`magi_dsa::attention_suite::<w|csa|hca>::<forward|backward>`。逐 rank/step 必须验证 W 为
-`1F+1B`、CSA 为 `4F+4B`、HCA 为 `3F+3B`，总账为 `8F+8B`；Indexer score/top-k 只能在 CSA
-forward 各出现一次。capture 停止后只对 CSA 运行 sequential shadow 并沿用 Q16、tie-aware output
-和既有 gradient 门槛；W/HCA 验证各自 ratio-specific post-projection gradient schema 与 finite。
-
-三种模式的“共用实现”只指 sparse-attention backend 主干，不表示完整 DAG 相同：
-
-| 模式 | 共用 attention core | ratio-specific 路径 |
-| --- | --- | --- |
-| W (`ratio=0`) | direct FlashMLA sparse forward + cuDNN sparse backward | 只有 `WINDOW_KV`，无 Compressor、Indexer 和 KL |
-| CSA (`ratio=4`) | 同一 FlashMLA/cuDNN sparse-attention kernel family | `WINDOW_KV + OVERLAP_X + COMPRESSED_KI + COMPRESSED_KV`；overlap Compressor、Indexer/Top-K、dual-LSE、selected KL 和 sparse Indexer backward |
-| HCA (`ratio=128`) | 同一 FlashMLA/cuDNN sparse-attention kernel family | `OVERLAP_X + WINDOW_KV + COMPRESSED_KV`；route/main 双 stream，无 Indexer/KL |
-
-正式汇总不能只比较模糊 kernel family。固定 Pro H128/D512、sparse width `<=1280` 会由
-`b7643bd...` dispatch 到 `Fwd_Sm100_Head128_Small_TopK_Impl`；每个 mode/step/rank 必须各有一次
-exact `sparse_attn_fwd_for_small_topk_kernel`，且 W/CSA/HCA 名称一致。不得用
-`sparse_attn_fwd` substring 接受 generic variant。backward 必须各有一次 cuDNN DSA 的
-`sum_OdO/main/convert/sum_dSink` 四个 core kernel。W/HCA 都使用 FlashMLA 三输出 ABI，二者必须具有
-完全相同的 `kernel name + block dimensions + registers/thread + static/dynamic shared memory`
-资源签名；CSA 使用同次 forward 返回 compressed-prefix LSE 的 dual-LSE ABI，因此允许编译器只在
-`registers/thread` 上生成专用化，但 kernel 名称、block dimensions 和 static/dynamic shared memory
-必须与 W/HCA 相同。cuDNN backward 四个 core kernel 的完整资源签名必须在三种模式间相同。grid
-可以随有效 bank 行数变化，完整 kernel 集合也应因 ratio-specific DAG 不同而不同。该区别意味着
-“同一 backend kernel family 与 attention 数学主干”，不意味着 CSA dual-LSE 与三输出 forward 是
-bit-identical cubin。
-汇总将这些证据写入 `KERNEL_OVERLAP_ATTENTION_SUITE.json`。
-全部 W/CSA/HCA route 的 mode-local 通信覆盖、固定发起顺序和真实 step kernel span 分别写入
-`ATTENTION_SUITE_COMMUNICATION_OVERLAP.json` 与
-`STEP_KERNEL_SPANS_ATTENTION_SUITE.json`。前者只认可同 mode、同 direction 的非 route compute，
-并硬校验跨 mode GPU overlap 为 0；无法自身遮挡的 route 同时记录依赖原因。
-推荐命令为：
-
-```bash
-bash scripts/profile/run_5step.sh --world-size 8 --cp-size 8 --case dsv4-flash-128k \
-  --plans balanced --steps 5 --step-mode attention-suite --skip-smoke
-```
-
-当前 mode-local 合同的通过证据为：
-
-```text
-artifacts/profile/20260724T050521Z-dsv4-flash-128k-attention-suite-precomputed-dout/
-  balanced/balanced_5steps_attention_suite.nsys-rep
-  balanced/balanced_5steps_attention_suite.sqlite
-  ATTENTION_SUITE_COMMUNICATION_OVERLAP.json
-  STEP_KERNEL_SPANS_ATTENTION_SUITE.json
-  REPORT_ATTENTION_SUITE.md
-```
-
-该 trace 在 8 ranks × 5 steps 上保持精确 `8F+8B` 和冻结的逐 mode route 顺序；7,730 个 kernel
-的 attribution coverage 为 1.0、unattributed 为 0，六个 mode phase 的跨 mode kernel overlap
-以及全部 16 条 route 与 foreign-mode compute 的交集均为 0。HCA `WINDOW_KV.forward/backward`
-分别在 `40/40` 个 rank-step 中由 HCA 自身 Main Compressor forward/backward 遮挡，平均覆盖比例为
-`0.989/0.847`；CSA 八条 route 的平均覆盖比例为 `0.692–0.999`。W 不具备独立
-Compressor/Indexer，`WINDOW_KV.forward` 仅观察到边界 housekeeping 的 `0.012`，不能视为有效遮挡，
-`WINDOW_KV.backward` 为 0。逐 step 实际 attributed GPU kernel span mean 为 `52.295603 ms`。
-对应 installed-wheel CP2/CP8 correctness 证据分别为
-`artifacts/correctness/20260724T050839Z-cp2-csa-natural-backward-installed-wheel/` 和
-`artifacts/correctness/20260724T051004Z-cp8-cp8-natural-backward-installed-wheel/`，均通过。
-
-4 轮 `shared_greedy` 的历史通过证据为：
-
-```text
-artifacts/correctness/20260803T024904Z-cp8-cp8-natural-backward/
-artifacts/profile/20260803T031828Z-dsv4-flash-128k-attention-suite-shared-greedy-precomputed-dout/
-artifacts/profile/20260803T025307Z-dsv4-flash-128k-attention-suite-shared-greedy-precomputed-dout/
-artifacts/profile/20260803T054958Z-dsv4-shared-greedy-dispatch-ablation/
-artifacts/profile/20260803T094307Z-dsv4-flash-128k-attention-suite-shared-greedy-passes4-kimemhardonly-clock1800-attachwarm1-precomputed-dout/
-```
-
-最终 Profile 的 W/CSA/HCA 全局 Query layout hash 均为
-`56c222034fd9960d36d74ad363182ad22e4fd53a7cb2d330d1ff22effe763e46`，8 个 rank 各持有 16,384
-Query，最终 key 为 `(2485300480,48707584,114560,898)`，modeled KI 为
-`713.831--719.367 MiB/rank`。summarizer 已从逐 rank ledger 重算 key，并硬校验三种 ratio、全部 rank
-的 hash/config/solver metadata 一致。trace 保持精确 8F+8B，8,000 个 kernel attribution coverage
-为 1.0，capture 内 TOKEN_LAYOUT/projection/loss 均为零。相对 legacy，HCA backward 五步平均时间从
-`12.867 ms` 降为 `8.297 ms`，mean relative rank range 从 `13.52%` 降为 `0.245%`；HCA forward
-mean relative range 从 `61.48%` 降为 `17.52%`，但平均绝对时间从 `2.882 ms` 增至 `3.338 ms`。
-最终 run 的 Indexer score step 0 relative range 为 `12.19%`，steps 1--4 max 为 `2.24%`；另一份
-同口径 run 五步 max 为 `3.29%`。因此证据支持“方案一显著修复 HCA backward、改善但未完全修复
-HCA forward”，当时不支持把 shared policy 直接升级为 Base release 默认。完整逐 phase
-对比、首 step 诊断、
-capture 外 `TOKEN_LAYOUT.forward` 一次性计时和显存差值见讨论稿 §8。
-
-以下是 2026-07-24 mode-local 裁决前的跨模式 overlap 历史证据，不满足当前“跨 mode GPU overlap
-必须为 0”的合同，不能作为当前 PASS：
-
-```text
-artifacts/profile/20260723T090409Z-dsv4-flash-128k-attention-suite-precomputed-dout/
-  balanced/balanced_5steps_attention_suite.nsys-rep
-  balanced/balanced_5steps_attention_suite.sqlite
-  KERNEL_OVERLAP_ATTENTION_SUITE.json
-  SUMMARY_ATTENTION_SUITE.json
-  REPORT_ATTENTION_SUITE.md
-```
-
-8 ranks、5 steps 共得到 440 条完整 logical phase records 和 7,730 个 runtime-correlated kernels；
-attribution coverage 为 1.0、未归因为零。每个 rank/step 的 W/CSA/HCA forward 与 backward 均精确
-包含 `1/4/3` 个 `ncclDevKernel_SendRecv`，总 forward/backward 均为 8；统一
-parameter-gradient-allreduce 每步只关联 1 个 NCCL AllReduce kernel。trace 中 TOKEN_LAYOUT、model
-projection 和 scalar loss 均为零，详细 NVTX 共 21,778 个 ranges、363 个名称；对 SQLite 中全部
-40 个 rank-step 的 caller-thread range 逐一按 start/end 检查，实际顺序均为
-`W F → CSA F → HCA F → HCA B → CSA B → W B → gradient AllReduce`。五步/八 rank 平均的
-W、CSA、HCA forward 分别为 `0.915349/18.201462/2.777467 ms`，backward 分别为
-`2.364288/16.104871/12.924724 ms`；总 forward/backward 与统一梯度 AllReduce 分别为
-`21.894278/31.393884/0.426551 ms`。相邻 step 的 CPU NVTX gap 为 `1.722–4.429 us`，GPU kernel
-gap 为 `0.800–1.152 us`。CSA sequential shadow 有 3 个 Q16 exact-cutoff canonical-set mismatch
-output-exempt rows；其余 131,069 行的 output max-abs 为 `9.765625e-4`，全部 CSA 输入/参数 gradient
-通过原门槛，max-abs 为 `5.5471901e-8`、`latent_kv` mismatch ratio 为 0。W 的 3 项、HCA 的 8 项和
-CSA 的 15 项 ratio-specific input/parameter gradient tensor 在全部 ranks 上均 finite。
-`KERNEL_OVERLAP_ATTENTION_SUITE.json` 证明 W/HCA 三输出 FlashMLA 资源签名完全相同，CSA dual-LSE
-只在 registers/thread 上由 126 专用化为 128，三种 cuDNN backward 四个 core 的完整资源签名相同。
-artifact 的 117 项 SHA-256 manifest 已全量校验。
+`summarize_pro_pair.py` 的 `_ROUTE_OVERLAP_CONTRACT` 是人工断言表而非测量结论，
+修改任何一条 route 的调度时必须同时复核对应断言，否则分类会与实现脱节。
 
 ### 8.2 Packing 和 collective
 

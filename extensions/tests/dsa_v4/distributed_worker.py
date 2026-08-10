@@ -75,7 +75,7 @@ from magi_attn_extensions.DSA.config import (  # noqa: E402
     MagiDSAConfig,
 )
 from magi_attn_extensions.DSA.modeling import MagiDSALayer  # noqa: E402
-from magi_attn_extensions.DSA.model_adapter import (  # noqa: E402
+from magi_attn_extensions.DSA.projection import (  # noqa: E402
     layout_and_project_dsa_input,
 )
 from magi_attn_extensions.DSA.nvtx import dsa_nvtx_range  # noqa: E402

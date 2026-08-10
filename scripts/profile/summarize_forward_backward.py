@@ -15,6 +15,12 @@
 from __future__ import annotations
 
 import argparse
+"""Shared profile-artifact helpers.
+
+The Flash-Base forward-backward capture mode is retired; what remains here are
+the JSON/JSONL and NVTX readers the Pro-pair summarizer imports.
+"""
+
 import json
 import math
 import sqlite3
@@ -74,13 +80,7 @@ def read_nvtx_range_counts(sqlite_path: Path) -> dict[str, int]:
     connection = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
     try:
         rows = connection.execute(
-            """Shared profile-artifact helpers.
-
-The Flash-Base forward-backward capture mode is retired; what remains here are
-the JSON/JSONL and NVTX readers the Pro-pair summarizer imports.
-"""
-
-"""
+            """
             SELECT COALESCE(ranges.text, strings.value), COUNT(*)
             FROM NVTX_EVENTS AS ranges
             LEFT JOIN StringIds AS strings ON strings.id = ranges.textId

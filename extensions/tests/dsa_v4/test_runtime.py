@@ -22,7 +22,7 @@ import pytest
 import torch
 from magi_attn_extensions.DSA.config import DsaRatio, MagiDSAConfig, MagiDSAProModelSpec
 from magi_attn_extensions.DSA.modeling import MagiDSALayer, MagiDSAProLayerStack
-from magi_attn_extensions.DSA.model_adapter import (
+from magi_attn_extensions.DSA.projection import (
     layout_and_project_dsa_input,
     layout_source_hidden_once,
     project_local_dsa_input,

@@ -1097,6 +1097,8 @@ def _fake_attention_suite_case(
 
     layer = torch.nn.Module()
     layer.config = config
+    # The harness now hands the runtime a projection bundle, not the module.
+    layer.projections = lambda: SimpleNamespace()
     runtime = SimpleNamespace(config=config, calc_dsa=calc_dsa)
     handle = SimpleNamespace(
         device_plan=SimpleNamespace(

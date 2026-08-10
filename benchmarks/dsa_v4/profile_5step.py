@@ -32,7 +32,7 @@ import torch.distributed as dist
 from magi_attn_extensions.DSA.comm import unlayout_dsa_query_tensor
 from magi_attn_extensions.DSA.config import MagiDSAConfig
 from magi_attn_extensions.DSA.modeling import MagiDSALayer
-from magi_attn_extensions.DSA.model_adapter import layout_and_project_dsa_input
+from magi_attn_extensions.DSA.projection import layout_and_project_dsa_input
 from magi_attn_extensions.DSA.nvtx import dsa_nvtx_range
 from magi_attn_extensions.DSA.runtime import MagiDSARuntimeMgr
 from magi_attn_extensions.DSA.types import (

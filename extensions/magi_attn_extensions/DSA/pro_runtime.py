@@ -25,7 +25,7 @@ from .runtime import DsaExecutionHandle, DsaRuntimeCounters, MagiDSARuntimeMgr
 from .types import MagiDSAForwardResult, MagiDSAInput, MagiDSAPackedMeta
 
 if TYPE_CHECKING:
-    from .model_adapter import MagiDSAProjector
+    from .projection import MagiDSAProjector
 
 
 @dataclass(frozen=True, eq=False)
@@ -219,7 +219,7 @@ class MagiDSAProRuntimeMgr:
             self.model_spec.make_layer_config(layer_id).ratio
         )
         handle = self.handle_for_layer(layer_id, bundle)
-        from .model_adapter import project_local_dsa_input
+        from .projection import project_local_dsa_input
 
         return project_local_dsa_input(
             local_x,

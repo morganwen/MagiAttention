@@ -23,6 +23,12 @@ from typing import Literal
 import torch
 
 _LOG_PHASES = os.environ.get("MAGI_DSA_PHASE_LOG", "0") == "1"
+# Bracketing a phase with a device-wide synchronize makes its wall-clock record
+# exact, but it also serializes everything the phase overlaps and turns any
+# collective-count mismatch into a hang inside the synchronize rather than
+# inside the collective, which is far harder to diagnose. Recording stays on by
+# default; the synchronize is opt-in.
+_SYNC_PHASES = os.environ.get("MAGI_DSA_PHASE_SYNC", "0") == "1"
 
 
 def _phase_record(name: str, event: str, error: str | None = None) -> None:
@@ -42,7 +48,13 @@ def _phase_record(name: str, event: str, error: str | None = None) -> None:
 
 
 class dsa_phase:
-    """Emit an NVTX range and optional synchronized per-rank boundary records."""
+    """Emit an NVTX range and optional per-rank phase boundary records.
+
+    Never wrap an asynchronous collective launch in this. Even with the
+    synchronize off, a phase is meant to bracket a coarse stage; with it on, the
+    synchronize inside an in-flight collective deadlocks the launching rank
+    against peers that have already moved on.
+    """
 
     def __init__(self, name: str):
         self.name = name
@@ -51,7 +63,8 @@ class dsa_phase:
     def __enter__(self) -> dsa_phase:
         if _LOG_PHASES:
             _phase_record(self.name, "begin")
-            torch.cuda.synchronize()
+            if _SYNC_PHASES:
+                torch.cuda.synchronize()
         torch.cuda.nvtx.range_push(f"magi_dsa::phase::{self.name}")
         self._range_pushed = True
         return self
@@ -64,7 +77,7 @@ class dsa_phase:
     ) -> Literal[False]:
         del traceback
         sync_error: BaseException | None = None
-        if _LOG_PHASES and exc_type is None:
+        if _LOG_PHASES and _SYNC_PHASES and exc_type is None:
             try:
                 torch.cuda.synchronize()
             except (
